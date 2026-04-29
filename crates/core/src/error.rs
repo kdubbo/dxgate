@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum KgateError {
+pub enum DxgateError {
     #[error("invalid runtime config: {0}")]
     InvalidConfig(String),
 
@@ -18,4 +18,4 @@ pub enum KgateError {
     Io(#[from] std::io::Error),
 }
 
-pub type Result<T> = std::result::Result<T, KgateError>;
+pub type Result<T> = std::result::Result<T, DxgateError>;

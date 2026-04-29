@@ -1,5 +1,5 @@
 [package]
-name = "kgate-admin"
+name = "dxgate-admin"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-kgate-core = { path = "../core" }
-kgate-proxy = { path = "../proxy" }
+dxgate-core = { path = "../core" }
+dxgate-proxy = { path = "../proxy" }
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

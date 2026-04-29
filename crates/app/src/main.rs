@@ -1,8 +1,8 @@
 use clap::Parser;
-use kgate_admin::AdminServer;
-use kgate_core::{RouterIdentity, RuntimeConfig, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
-use kgate_proxy::{ProxyServer, ProxyState};
-use kgate_xds::{RuntimeConfigSource, StaticConfigFile, XdsClient, XdsClientConfig};
+use dxgate_admin::AdminServer;
+use dxgate_core::{RouterIdentity, RuntimeConfig, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
+use dxgate_proxy::{ProxyServer, ProxyState};
+use dxgate_xds::{RuntimeConfigSource, StaticConfigFile, XdsClient, XdsClientConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,26 +10,26 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
-#[command(name = "kgate")]
+#[command(name = "dxgate")]
 #[command(about = "Pure Rust north-south proxy for Dubbo Gateway API traffic")]
 struct Args {
     #[arg(
         long,
-        env = "KGATE_XDS_ADDRESS",
+        env = "DXGATE_XDS_ADDRESS",
         default_value = "http://dubbod.dubbo-system.svc:15012"
     )]
     xds_address: String,
 
-    #[arg(long, env = "KGATE_HTTP_ADDR", default_value = "0.0.0.0:80")]
+    #[arg(long, env = "DXGATE_HTTP_ADDR", default_value = "0.0.0.0:80")]
     http_addr: SocketAddr,
 
-    #[arg(long, env = "KGATE_ADMIN_ADDR", default_value = "0.0.0.0:15021")]
+    #[arg(long, env = "DXGATE_ADMIN_ADDR", default_value = "0.0.0.0:15021")]
     admin_addr: SocketAddr,
 
-    #[arg(long, env = "KGATE_STATIC_CONFIG")]
+    #[arg(long, env = "DXGATE_STATIC_CONFIG")]
     static_config: Option<PathBuf>,
 
-    #[arg(long, env = "POD_NAME", default_value = "kgate")]
+    #[arg(long, env = "POD_NAME", default_value = "dxgate")]
     pod_name: String,
 
     #[arg(long, env = "POD_NAMESPACE", default_value = "dubbo-system")]
@@ -64,7 +64,7 @@ async fn main() -> std::io::Result<()> {
         dns_domain: args.dns_domain,
     };
 
-    info!(node_id = %identity.node_id(), "starting kgate router proxy");
+    info!(node_id = %identity.node_id(), "starting dxgate router proxy");
 
     let initial = RuntimeConfig::empty("bootstrap");
     let state = ProxyState::new(initial.clone());

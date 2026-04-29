@@ -3,13 +3,13 @@
 use axum::http::Uri;
 use axum::routing::any;
 use axum::Router;
-use hyper::body;
-use hyper::Client;
-use kgate_core::{
+use dxgate_core::{
     Cluster, Endpoint, Listener, ListenerProtocol, PathMatch, Route, RouteMatch, RuntimeConfig,
     VirtualHost, WeightedCluster,
 };
-use kgate_proxy::{ProxyServer, ProxyState};
+use dxgate_proxy::{ProxyServer, ProxyState};
+use hyper::body;
+use hyper::Client;
 use std::net::{SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -102,7 +102,7 @@ fn spawn_backend(addr: SocketAddr) -> JoinHandle<()> {
         .route("/health", any(|| async { "ok" }))
         .fallback(any(|uri: Uri| async move {
             let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-            format!("kgate example backend path={path}")
+            format!("dxgate example backend path={path}")
         }));
 
     tokio::spawn(async move {

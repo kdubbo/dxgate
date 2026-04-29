@@ -1,5 +1,5 @@
 [package]
-name = "kgate-xds"
+name = "dxgate-xds"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-kgate-core = { path = "../core" }
+dxgate-core = { path = "../core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

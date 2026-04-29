@@ -1,4 +1,4 @@
-use kgate_core::{RouterIdentity, RuntimeConfig};
+use dxgate_core::{RouterIdentity, RuntimeConfig};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -60,12 +60,12 @@ impl XdsClient {
             info!(
                 node_id = %self.cfg.identity.node_id(),
                 endpoint = %self.cfg.endpoint,
-                "connected kgate router to dubbod xDS endpoint"
+                "connected dxgate router to dubbod xDS endpoint"
             );
 
             // The concrete ADS generated client is intentionally isolated here. The next
             // step is wiring kdubbo xDS protobufs without allowing Kubernetes controller
-            // code into kgate.
+            // code into dxgate.
             drop(channel);
             debug!(version = %config_tx.borrow().version, "retaining current runtime config");
             time::sleep(self.cfg.reconnect_delay).await;

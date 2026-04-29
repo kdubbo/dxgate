@@ -6,8 +6,8 @@ use std::time::Instant;
 #[ignore = "run manually because throughput depends on the local machine"]
 async fn local_proxy_sustains_minimum_throughput() {
     let topology = support::spawn_topology().await;
-    let requests = support::env_usize("KGATE_PERF_REQUESTS", 200);
-    let minimum_rps = support::env_usize("KGATE_PERF_MIN_RPS", 500);
+    let requests = support::env_usize("DXGATE_PERF_REQUESTS", 200);
+    let minimum_rps = support::env_usize("DXGATE_PERF_MIN_RPS", 500);
 
     let started = Instant::now();
     let mut latencies = support::run_concurrent_requests(topology.proxy_addr, requests).await;

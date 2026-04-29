@@ -1,4 +1,4 @@
-use kgate_core::{ConfigConflict, Endpoint, KgateError, Result, RuntimeConfig, WeightedCluster};
+use dxgate_core::{ConfigConflict, DxgateError, Endpoint, Result, RuntimeConfig, WeightedCluster};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -89,7 +89,7 @@ impl ProxyState {
     ) -> Result<&'a Endpoint> {
         let healthy: Vec<&Endpoint> = endpoints.iter().filter(|ep| ep.healthy).collect();
         if healthy.is_empty() {
-            return Err(KgateError::NoHealthyEndpoints(cluster_name.to_string()));
+            return Err(DxgateError::NoHealthyEndpoints(cluster_name.to_string()));
         }
         let idx =
             self.inner.picker_counter.fetch_add(1, Ordering::Relaxed) as usize % healthy.len();
@@ -100,7 +100,7 @@ impl ProxyState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kgate_core::{
+    use dxgate_core::{
         Cluster, Listener, ListenerProtocol, PathMatch, Route, RouteMatch, VirtualHost,
     };
 

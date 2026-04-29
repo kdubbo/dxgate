@@ -24,7 +24,7 @@ impl RouterIdentity {
 
     pub fn metadata(&self) -> RouterMetadata {
         RouterMetadata {
-            generator: "kgate".to_string(),
+            generator: "dxgate".to_string(),
             cluster_id: self.cluster_id.clone(),
             namespace: self.namespace.clone(),
             node_name: self.node_name.clone(),
@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn builds_dubbo_router_node_id() {
         let id = RouterIdentity {
-            pod_name: "kgate-abc".into(),
+            pod_name: "dxgate-abc".into(),
             namespace: "dubbo-system".into(),
             pod_ip: "10.0.0.10".into(),
             node_name: Some("node-a".into()),
@@ -61,7 +61,7 @@ mod tests {
 
         assert_eq!(
             id.node_id(),
-            "router~10.0.0.10~kgate-abc.dubbo-system~dubbo-system.svc.cluster.local"
+            "router~10.0.0.10~dxgate-abc.dubbo-system~dubbo-system.svc.cluster.local"
         );
     }
 }

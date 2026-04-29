@@ -9,5 +9,5 @@ async fn proxy_forwards_http_request_to_configured_backend() {
     let (status, body) = support::get_text(topology.proxy_addr, "/orders/42?debug=true").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "kgate example backend path=/orders/42?debug=true");
+    assert_eq!(body, "dxgate example backend path=/orders/42?debug=true");
 }

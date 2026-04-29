@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kgate-example-backend
+  name: dxgate-example-backend
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate-example-backend
+    app.kubernetes.io/name: dxgate-example-backend
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: kgate-example-backend
+      app.kubernetes.io/name: dxgate-example-backend
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: kgate-example-backend
+        app.kubernetes.io/name: dxgate-example-backend
     spec:
       containers:
         - name: http-echo
@@ -21,7 +21,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - -listen=:8080
-            - -text=kgate example backend
+            - -text=dxgate example backend
           ports:
             - name: http
               containerPort: 8080
@@ -41,14 +41,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: kgate-example-backend
+  name: dxgate-example-backend
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate-example-backend
+    app.kubernetes.io/name: dxgate-example-backend
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: kgate-example-backend
+    app.kubernetes.io/name: dxgate-example-backend
   ports:
     - name: http
       port: 8080

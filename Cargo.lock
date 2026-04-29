@@ -220,6 +220,69 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "dxgate-admin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dxgate-core",
+ "dxgate-proxy",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dxgate-app"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dxgate-admin",
+ "dxgate-core",
+ "dxgate-proxy",
+ "dxgate-xds",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dxgate-core"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "dxgate-proxy"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dxgate-core",
+ "http",
+ "hyper",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dxgate-xds"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dxgate-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -438,69 +501,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "kgate-admin"
-version = "0.1.0"
-dependencies = [
- "axum",
- "kgate-core",
- "kgate-proxy",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "kgate-app"
-version = "0.1.0"
-dependencies = [
- "clap",
- "kgate-admin",
- "kgate-core",
- "kgate-proxy",
- "kgate-xds",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "kgate-core"
-version = "0.1.0"
-dependencies = [
- "http",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "kgate-proxy"
-version = "0.1.0"
-dependencies = [
- "axum",
- "http",
- "hyper",
- "kgate-core",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kgate-xds"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "kgate-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror",
- "tokio",
- "tonic",
- "tracing",
-]
 
 [[package]]
 name = "lazy_static"

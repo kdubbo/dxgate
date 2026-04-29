@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 #[ignore = "run manually because latency budgets depend on the local machine"]
 async fn local_proxy_p95_latency_stays_within_sla_budget() {
     let topology = support::spawn_topology().await;
-    let requests = support::env_usize("KGATE_SLA_REQUESTS", 100);
-    let p95_budget_ms = support::env_usize("KGATE_SLA_P95_MS", 100);
+    let requests = support::env_usize("DXGATE_SLA_REQUESTS", 100);
+    let p95_budget_ms = support::env_usize("DXGATE_SLA_P95_MS", 100);
     let mut latencies = Vec::with_capacity(requests);
 
     for i in 0..requests {

@@ -1,4 +1,4 @@
-use crate::{ConfigConflict, KgateError, MatchInput, Result};
+use crate::{ConfigConflict, DxgateError, MatchInput, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -113,7 +113,7 @@ impl RuntimeConfig {
     pub fn route_for<'a>(&'a self, port: u16, input: &MatchInput<'_>) -> Result<&'a Route> {
         let listener = self
             .listener_by_port(port)
-            .ok_or_else(|| KgateError::RouteNotFound {
+            .ok_or_else(|| DxgateError::RouteNotFound {
                 host: input.host.to_string(),
                 path: input.path.to_string(),
             })?;
@@ -124,7 +124,7 @@ impl RuntimeConfig {
             .filter(|vh| vh.matches_host(input.host))
             .flat_map(|vh| vh.routes.iter())
             .find(|route| route.matches(input))
-            .ok_or_else(|| KgateError::RouteNotFound {
+            .ok_or_else(|| DxgateError::RouteNotFound {
                 host: input.host.to_string(),
                 path: input.path.to_string(),
             })

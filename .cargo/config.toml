@@ -2,4 +2,4 @@
 rustflags = ["-Dwarnings"]
 
 [env]
-RUST_LOG = { value = "kgate=info,tower_http=info", force = false }
+RUST_LOG = { value = "dxgate=info,tower_http=info", force = false }

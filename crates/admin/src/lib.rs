@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use kgate_proxy::ProxyState;
+use dxgate_proxy::ProxyState;
 use serde::Serialize;
 use std::net::SocketAddr;
 
@@ -24,7 +24,7 @@ impl AdminServer {
         Self {
             state,
             build: BuildInfo {
-                name: "kgate",
+                name: "dxgate",
                 version: env!("CARGO_PKG_VERSION"),
             },
         }
@@ -64,13 +64,13 @@ async fn readyz(State(admin): State<AdminServer>) -> Response {
 async fn metrics(State(admin): State<AdminServer>) -> String {
     let readiness = admin.state.readiness().await;
     format!(
-        "# HELP kgate_ready Whether kgate has accepted runtime config\n# TYPE kgate_ready gauge\nkgate_ready {}\n# HELP kgate_config_conflicts Current rejected config conflicts\n# TYPE kgate_config_conflicts gauge\nkgate_config_conflicts {}\n",
+        "# HELP dxgate_ready Whether dxgate has accepted runtime config\n# TYPE dxgate_ready gauge\ndxgate_ready {}\n# HELP dxgate_config_conflicts Current rejected config conflicts\n# TYPE dxgate_config_conflicts gauge\ndxgate_config_conflicts {}\n",
         if readiness.ready { 1 } else { 0 },
         readiness.conflicts.len()
     )
 }
 
-async fn debug_config(State(admin): State<AdminServer>) -> Json<kgate_core::RuntimeConfig> {
+async fn debug_config(State(admin): State<AdminServer>) -> Json<dxgate_core::RuntimeConfig> {
     Json(admin.state.config().await)
 }
 

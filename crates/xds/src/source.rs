@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use kgate_core::{Result, RuntimeConfig};
+use dxgate_core::{Result, RuntimeConfig};
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -25,10 +25,10 @@ impl RuntimeConfigSource for StaticConfigFile {
         let raw = fs::read_to_string(&self.path).await?;
         let cfg = if self.path.extension().and_then(|e| e.to_str()) == Some("json") {
             serde_json::from_str(&raw)
-                .map_err(|e| kgate_core::KgateError::InvalidConfig(e.to_string()))?
+                .map_err(|e| dxgate_core::DxgateError::InvalidConfig(e.to_string()))?
         } else {
             serde_yaml::from_str(&raw)
-                .map_err(|e| kgate_core::KgateError::InvalidConfig(e.to_string()))?
+                .map_err(|e| dxgate_core::DxgateError::InvalidConfig(e.to_string()))?
         };
         Ok(Some(cfg))
     }

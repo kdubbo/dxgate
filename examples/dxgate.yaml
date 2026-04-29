@@ -6,10 +6,10 @@ metadata:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: kgate-runtime
+  name: dxgate-runtime
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
 data:
   runtime.yaml: |
     version: k8s-example
@@ -32,7 +32,7 @@ data:
     clusters:
       - name: example-backend
         endpoints:
-          - address: kgate-example-backend.dubbo-system.svc.cluster.local
+          - address: dxgate-example-backend.dubbo-system.svc.cluster.local
             port: 8080
             healthy: true
     secrets: []
@@ -40,42 +40,42 @@ data:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: kgate
+  name: dxgate
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
 automountServiceAccountToken: false
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kgate
+  name: dxgate
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: kgate
+      app.kubernetes.io/name: dxgate
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: kgate
+        app.kubernetes.io/name: dxgate
     spec:
-      serviceAccountName: kgate
+      serviceAccountName: dxgate
       containers:
-        - name: kgate
-          image: kdubbo/kgate:latest
+        - name: dxgate
+          image: kdubbo/dxgate:latest
           imagePullPolicy: IfNotPresent
           env:
-            - name: KGATE_STATIC_CONFIG
-              value: /etc/kgate/runtime.yaml
-            - name: KGATE_XDS_ADDRESS
+            - name: DXGATE_STATIC_CONFIG
+              value: /etc/dxgate/runtime.yaml
+            - name: DXGATE_XDS_ADDRESS
               value: http://dubbod.dubbo-system.svc:15012
-            - name: KGATE_HTTP_ADDR
+            - name: DXGATE_HTTP_ADDR
               value: 0.0.0.0:8080
-            - name: KGATE_ADMIN_ADDR
+            - name: DXGATE_ADMIN_ADDR
               value: 0.0.0.0:15021
             - name: POD_NAME
               valueFrom:
@@ -112,7 +112,7 @@ spec:
             periodSeconds: 10
           volumeMounts:
             - name: runtime
-              mountPath: /etc/kgate
+              mountPath: /etc/dxgate
               readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
@@ -132,7 +132,7 @@ spec:
       volumes:
         - name: runtime
           configMap:
-            name: kgate-runtime
+            name: dxgate-runtime
             items:
               - key: runtime.yaml
                 path: runtime.yaml
@@ -140,14 +140,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: kgate
+  name: dxgate
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
 spec:
   type: LoadBalancer
   selector:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
   ports:
     - name: http
       port: 80
@@ -156,14 +156,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: kgate-admin
+  name: dxgate-admin
   namespace: dubbo-system
   labels:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: kgate
+    app.kubernetes.io/name: dxgate
   ports:
     - name: admin
       port: 15021
