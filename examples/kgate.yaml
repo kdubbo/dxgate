@@ -1,0 +1,170 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dubbo-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kgate-runtime
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: kgate
+data:
+  runtime.yaml: |
+    version: k8s-example
+    listeners:
+      - name: http-80
+        bind: "0.0.0.0:80"
+        protocol: http
+        virtual_hosts:
+          - name: wildcard
+            domains: ["*"]
+            routes:
+              - name: default
+                matches:
+                  - path:
+                      type: prefix
+                      value: /
+                weighted_clusters:
+                  - name: example-backend
+                    weight: 100
+    clusters:
+      - name: example-backend
+        endpoints:
+          - address: kgate-example-backend.dubbo-system.svc.cluster.local
+            port: 8080
+            healthy: true
+    secrets: []
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kgate
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: kgate
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kgate
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: kgate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kgate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kgate
+    spec:
+      serviceAccountName: kgate
+      containers:
+        - name: kgate
+          image: kdubbo/kgate:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: KGATE_STATIC_CONFIG
+              value: /etc/kgate/runtime.yaml
+            - name: KGATE_XDS_ADDRESS
+              value: http://dubbod.dubbo-system.svc:15012
+            - name: KGATE_HTTP_ADDR
+              value: 0.0.0.0:8080
+            - name: KGATE_ADMIN_ADDR
+              value: 0.0.0.0:15021
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INSTANCE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 15021
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: runtime
+              mountPath: /etc/kgate
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: runtime
+          configMap:
+            name: kgate-runtime
+            items:
+              - key: runtime.yaml
+                path: runtime.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kgate
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: kgate
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: kgate
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kgate-admin
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: kgate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kgate
+  ports:
+    - name: admin
+      port: 15021
+      targetPort: admin

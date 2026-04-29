@@ -1,0 +1,21 @@
+[package]
+name = "kgate-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kgate"
+path = "src/main.rs"
+
+[dependencies]
+kgate-admin = { path = "../admin" }
+kgate-core = { path = "../core" }
+kgate-proxy = { path = "../proxy" }
+kgate-xds = { path = "../xds" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

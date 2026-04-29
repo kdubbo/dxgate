@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/admin",
+    "crates/app",
+    "crates/core",
+    "crates/proxy",
+    "crates/xds",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/kdubbo/kgate"
+rust-version = "1.76"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = "0.6"
+clap = { version = "4.5", features = ["derive", "env"] }
+http = "0.2"
+hyper = { version = "0.14", features = ["client", "http1", "http2", "server", "tcp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = { version = "0.11", features = ["transport"] }
+tower = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
