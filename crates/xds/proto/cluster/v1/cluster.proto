@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package cluster.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "core/v1/health_check.proto";
+import "core/v1/base.proto";
+import "core/v1/config_source.proto";
+import "endpoint/v1/endpoint.proto";
+
+option go_package = "github.com/kdubbo/xds-api/cluster/v1;clusterv1";
+
+message Cluster {
+
+  message EdsClusterConfig {
+    core.v1.ConfigSource eds_config = 1;
+    string service_name = 2;
+  }
+
+  message CommonLbConfig {
+    core.v1.HealthStatusSet override_host_status = 8;
+  }
+
+  message CustomClusterType {
+    string name = 1;
+    google.protobuf.Any typed_config = 2;
+  }
+
+  enum DiscoveryType {
+    STATIC = 0;
+    STRICT_DNS = 1;
+    LOGICAL_DNS = 2;
+    EDS = 3;
+  }
+  enum LbPolicy {
+    ROUND_ROBIN = 0;
+    LEAST_REQUEST = 1;
+    RING_HASH = 2;
+    RANDOM = 3;
+  }
+
+  string name = 1;
+  string alt_stat_name = 28;
+  oneof cluster_discovery_type {
+    DiscoveryType type = 2;
+    CustomClusterType cluster_type = 38;
+  }
+
+  EdsClusterConfig eds_cluster_config = 3;
+  google.protobuf.Duration connect_timeout = 4;
+  google.protobuf.UInt32Value per_connection_buffer_limit_bytes = 5;
+  LbPolicy lb_policy = 6;
+  repeated core.v1.HealthCheck health_checks = 7;
+  endpoint.v1.ClusterLoadAssignment load_assignment = 33;
+  CommonLbConfig common_lb_config = 27;
+  core.v1.TransportSocket transport_socket = 24;
+}

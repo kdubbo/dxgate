@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package extensions.transport_sockets.tls.v1;
+
+import "google/protobuf/wrappers.proto";
+
+option go_package = "github.com/kdubbo/xds-api/extensions/transport_sockets/tls/v1;tlsv1";
+
+message CertificateValidationContext {
+  repeated string match_subject_alt_names = 1;
+}
+
+message UpstreamTlsContext {
+  CommonTlsContext common_tls_context = 1;
+  string sni = 2;
+}
+
+message DownstreamTlsContext {
+  CommonTlsContext common_tls_context = 1;
+  google.protobuf.BoolValue require_client_certificate = 2;
+}
+
+message CommonTlsContext {
+  message CertificateProviderInstance {
+    string instance_name = 1;
+    string certificate_name = 2;
+  }
+
+  message CombinedCertificateValidationContext {
+    CertificateProviderInstance validation_context_certificate_provider_instance = 2;
+    CertificateValidationContext default_validation_context = 3;
+  }
+
+  CertificateProviderInstance tls_certificate_certificate_provider_instance = 9;
+  repeated string alpn_protocols = 4;
+
+  oneof validation_context_type {
+    CombinedCertificateValidationContext combined_validation_context = 8;
+  }
+  reserved 5;
+}

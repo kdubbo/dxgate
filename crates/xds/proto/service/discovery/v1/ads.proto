@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package service.discovery.v1;
+
+import "service/discovery/v1/discovery.proto";
+
+option go_package = "github.com/kdubbo/xds-api/service/discovery/v1;discoveryv1";
+
+// Workaround for protobuf issue with importing services
+// https://github.com/google/protobuf/issues/4221
+message AdsDummy {}
+
+service AggregatedDiscoveryService {
+  rpc StreamAggregatedResources(stream DiscoveryRequest)
+      returns (stream DiscoveryResponse);
+
+  rpc DeltaAggregatedResources(stream DeltaDiscoveryRequest)
+      returns (stream DeltaDiscoveryResponse);
+}

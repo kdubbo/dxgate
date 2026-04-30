@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package endpoint.v1;
+
+import "google/protobuf/wrappers.proto";
+import "core/v1/base.proto";
+import "core/v1/address.proto";
+import "core/v1/health_check.proto";
+
+option go_package = "github.com/kdubbo/xds-api/endpoint/v1;endpointv1";
+
+message Endpoint {
+  core.v1.Address address = 1;
+}
+
+message LbEndpoint {
+
+  oneof host_identifier {
+    Endpoint endpoint = 1;
+    string endpoint_name = 5;
+  }
+  core.v1.HealthStatus health_status = 2;
+  core.v1.Metadata metadata = 3;
+  google.protobuf.UInt32Value load_balancing_weight = 4;
+}
+
+message LocalityLbEndpoints {
+  message LbEndpointList {
+    repeated LbEndpoint lb_endpoints = 1;
+  }
+  core.v1.Locality locality = 1;
+  repeated LbEndpoint lb_endpoints = 2;
+
+  google.protobuf.UInt32Value load_balancing_weight = 3;
+  uint32 priority = 5;
+  google.protobuf.UInt32Value proximity = 6;
+}

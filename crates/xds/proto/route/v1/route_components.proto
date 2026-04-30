@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package route.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+import "type/matcher/v1/regex.proto";
+
+option go_package = "github.com/kdubbo/xds-api/route/v1;routev1";
+
+message VirtualHost {
+  string name = 1;
+  repeated string domains = 2;
+  repeated Route routes = 3;
+}
+
+message Route {
+  string name = 1;
+  RouteMatch match = 2;
+  oneof action {
+    RouteAction route = 3;
+    NonForwardingAction non_forwarding_action = 7;
+  }
+}
+
+message NonForwardingAction {}
+
+message WeightedCluster {
+  message ClusterWeight {
+    string name = 1;
+    google.protobuf.UInt32Value weight = 2;
+    string cluster_header = 12;
+  }
+  repeated ClusterWeight clusters = 1;
+  google.protobuf.UInt32Value total_weight = 2;
+}
+
+message RouteMatch {
+  oneof path_specifier {
+    string prefix = 1;
+    string path = 2;
+    type.matcher.v1.RegexMatcher safe_regex = 10;
+  }
+  repeated HeaderMatcher headers = 6;
+}
+
+message HeaderMatcher {
+  string name = 1;
+  oneof header_match_specifier {
+    string exact_match = 4;
+    type.matcher.v1.RegexMatcher safe_regex_match = 11;
+  }
+}
+
+message RouteAction {
+  oneof cluster_specifier {
+    string cluster = 1;
+    WeightedCluster weighted_clusters = 3;
+  }
+}

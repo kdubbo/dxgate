@@ -23,9 +23,13 @@ hyper = { version = "0.14", features = ["client", "http1", "http2", "server", "t
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+prost = "0.12"
+prost-types = "0.12"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
 tonic = { version = "0.11", features = ["transport"] }
+tonic-build = "0.11"
 tower = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

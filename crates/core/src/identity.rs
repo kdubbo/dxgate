@@ -24,7 +24,7 @@ impl RouterIdentity {
 
     pub fn metadata(&self) -> RouterMetadata {
         RouterMetadata {
-            generator: "dxgate".to_string(),
+            generator: "grpc".to_string(),
             cluster_id: self.cluster_id.clone(),
             namespace: self.namespace.clone(),
             node_name: self.node_name.clone(),

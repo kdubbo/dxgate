@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package endpoint.v1;
+
+import "google/protobuf/wrappers.proto";
+import "endpoint/v1/endpoint_components.proto";
+
+option go_package = "github.com/kdubbo/xds-api/endpoint/v1;endpointv1";
+
+message ClusterLoadAssignment {
+  string cluster_name = 1;
+  repeated LocalityLbEndpoints endpoints = 2;
+}

@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package core.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = "github.com/kdubbo/xds-api/core/v1;corev1";
+
+enum ApiVersion {
+  AUTO = 0;
+}
+
+message AggregatedConfigSource {}
+
+message ApiConfigSource {
+  enum ApiType {
+    REST = 0;
+    GRPC = 1;
+    DELTA_GRPC = 2;
+    AGGREGATED_GRPC = 3;
+    AGGREGATED_DELTA_GRPC = 4;
+  }
+}
+
+message ConfigSource {
+  oneof config_source_specifier {
+    ApiConfigSource api_config_source = 2;
+    AggregatedConfigSource ads = 3;
+  }
+}

@@ -11,6 +11,13 @@ metadata:
   labels:
     app.kubernetes.io/name: dxgate
 data:
+  bootstrap.json: |
+    {
+      "xds_address": "http://dubbod.dubbo-system.svc:15012",
+      "listener_names": ["dxgate.dubbo-system.svc.cluster.local:80"],
+      "cluster_id": "Kubernetes",
+      "dns_domain": "cluster.local"
+    }
   runtime.yaml: |
     version: k8s-example
     listeners:
@@ -69,10 +76,10 @@ spec:
           image: kdubbo/dxgate:latest
           imagePullPolicy: IfNotPresent
           env:
+            - name: DXGATE_BOOTSTRAP
+              value: /etc/dxgate/bootstrap.json
             - name: DXGATE_STATIC_CONFIG
               value: /etc/dxgate/runtime.yaml
-            - name: DXGATE_XDS_ADDRESS
-              value: http://dubbod.dubbo-system.svc:15012
             - name: DXGATE_HTTP_ADDR
               value: 0.0.0.0:8080
             - name: DXGATE_ADMIN_ADDR
@@ -134,6 +141,8 @@ spec:
           configMap:
             name: dxgate-runtime
             items:
+              - key: bootstrap.json
+                path: bootstrap.json
               - key: runtime.yaml
                 path: runtime.yaml
 ---

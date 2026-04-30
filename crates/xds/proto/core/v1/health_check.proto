@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package core.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = "github.com/kdubbo/xds-api/core/v1;corev1";
+
+enum HealthStatus {
+  UNKNOWN = 0;
+  HEALTHY = 1;
+  UNHEALTHY = 2;
+  DRAINING = 3;
+  TIMEOUT = 4;
+  DEGRADED = 5;
+}
+
+message HealthStatusSet {
+  repeated HealthStatus statuses = 1;
+}
+
+message HealthCheck {
+  google.protobuf.Duration timeout = 1;
+  google.protobuf.Duration interval = 2;
+
+  google.protobuf.UInt32Value unhealthy_threshold = 3;
+  google.protobuf.UInt32Value healthy_threshold = 4;
+}
