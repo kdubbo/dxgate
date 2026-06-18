@@ -219,13 +219,15 @@ const ADMIN_HTML: &str = r#"<!doctype html>
     .brand {
       display: flex;
       align-items: center;
-      padding: 3px 4px 18px;
+      justify-content: center;
+      padding: 12px 0 24px;
       border-bottom: 1px solid var(--line);
-      margin-bottom: 14px;
+      margin-bottom: 18px;
     }
     .brand-logo {
       display: block;
-      width: 126px;
+      width: 150px;
+      max-width: calc(100% - 16px);
       height: auto;
     }
     .nav button {
@@ -256,19 +258,6 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       margin-bottom: 18px;
     }
     h1 { font-size: 22px; margin: 0; font-weight: 760; }
-    .statusline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .pill {
-      border: 1px solid var(--line);
-      background: var(--panel);
-      border-radius: 999px;
-      padding: 5px 9px;
-      font-size: 12px;
-      color: #344054;
-      white-space: nowrap;
-    }
-    .pill.ok { border-color: #a4d1c4; color: #065f46; background: #eefaf6; }
-    .pill.bad { border-color: #f2b8b5; color: var(--red); background: #fff1f0; }
-    .actions { display: flex; gap: 8px; align-items: center; }
     .btn {
       border: 1px solid #bac2cf;
       border-radius: 6px;
@@ -384,12 +373,6 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       <div class="topbar">
         <div>
           <h1 id="title">Overview</h1>
-          <div class="statusline" id="statusline"></div>
-          <div class="muted source-line" id="source-line">loading runtime data</div>
-        </div>
-        <div class="actions">
-          <button class="btn" id="copy-config">Copy config</button>
-          <button class="btn primary" id="refresh">Refresh</button>
         </div>
       </div>
       <div id="error" class="error hidden"></div>
@@ -443,7 +426,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
   </div>
   <script>
     const proxyPort = __DXGATE_PROXY_PORT__;
-    const state = { ready: null, config: null, metrics: '', loadedAt: null };
+    const state = { ready: null, config: null, metrics: '' };
     const $ = (id) => document.getElementById(id);
 
     function proxyBase() {
@@ -473,7 +456,6 @@ const ADMIN_HTML: &str = r#"<!doctype html>
         state.ready = ready;
         state.config = config;
         state.metrics = metrics;
-        state.loadedAt = new Date();
         render();
       } catch (err) {
         showError(err.message);
@@ -541,12 +523,6 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       $('metric-denies').textContent = metric('dxgate_policy_denied_total');
       $('config-json').textContent = JSON.stringify(state.config, null, 2);
       syncPlaygroundFromRuntime();
-      $('source-line').textContent = 'source: /debug/config + /readyz + /metrics' + (state.loadedAt ? ' · loaded ' + state.loadedAt.toLocaleTimeString() : '');
-      $('statusline').innerHTML = [
-        '<span class="pill ' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'ready' : 'not ready') + '</span>',
-        '<span class="pill">version ' + esc(state.ready?.version || state.config?.version || '-') + '</span>',
-        '<span class="pill">' + esc((state.ready?.conflicts || []).length) + ' conflicts</span>'
-      ].join('');
       table('traffic-table', [
         { label: 'Protocol', value: (r) => tags([r.protocol], r.protocol) },
         { label: 'Route', value: (r) => esc(r.route) },
@@ -608,8 +584,6 @@ const ADMIN_HTML: &str = r#"<!doctype html>
     document.querySelectorAll('.nav button').forEach((button) => {
       button.addEventListener('click', () => setTab(button.dataset.tab));
     });
-    $('refresh').addEventListener('click', refresh);
-    $('copy-config').addEventListener('click', () => navigator.clipboard?.writeText(JSON.stringify(state.config, null, 2)));
     $('mcp-base').value = proxyBase();
     $('mcp-path').addEventListener('input', () => $('mcp-path').dataset.touched = 'true');
     $('mcp-send').addEventListener('click', async () => {
@@ -652,6 +626,14 @@ mod tests {
         assert!(!html.contains("class=\"mark\""));
         assert!(!html.contains("<strong>dxgate</strong>"));
         assert!(!html.contains("<span>admin</span>"));
+        assert!(!html.contains("id=\"statusline\""));
+        assert!(!html.contains("id=\"source-line\""));
+        assert!(!html.contains("class=\"pill"));
+        assert!(!html.contains("loading runtime data"));
+        assert!(!html.contains("id=\"copy-config\""));
+        assert!(!html.contains("id=\"refresh\""));
+        assert!(!html.contains("Copy config"));
+        assert!(!html.contains(">Refresh</button>"));
         assert!(!html.contains("getJson('/debug/backends')"));
         assert!(!html.contains("getJson('/debug/policies')"));
         assert!(!html.contains("getJson('/debug/routes')"));
