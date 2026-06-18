@@ -1,5 +1,5 @@
 [package]
-name = "dxgate-proxy"
+name = "dxgate-controller"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,18 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 dxgate-core = { path = "../core" }
-axum.workspace = true
-http.workspace = true
-hyper.workspace = true
-hyper-rustls.workspace = true
-jsonwebtoken.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-rcgen = "0.12"
-tokio-rustls = "0.24"

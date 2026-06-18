@@ -74,7 +74,8 @@ impl BootstrapConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::BootstrapConfig;
+    use super::{BootstrapConfig, RuntimeConfigSource, StaticConfigFile};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::fs;
 
@@ -134,5 +135,18 @@ mod tests {
             Some("http://dubbod.dubbo-system.svc:15012")
         );
         assert_eq!(cfg.http_addr.unwrap().port(), 8080);
+    }
+
+    #[tokio::test]
+    async fn static_config_loads_agent_runtime_example() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/agent-runtime.yaml");
+        let cfg = StaticConfigFile::new(path).load().await.unwrap().unwrap();
+
+        cfg.validate().unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.backends.len(), 4);
+        assert_eq!(cfg.routes.len(), 3);
+        assert_eq!(cfg.policies.len(), 1);
     }
 }

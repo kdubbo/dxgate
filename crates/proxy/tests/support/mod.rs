@@ -175,6 +175,10 @@ fn runtime_config(backend_addr: SocketAddr) -> RuntimeConfig {
             tls: None,
         }],
         secrets: vec![],
+        providers: vec![],
+        backends: vec![],
+        routes: vec![],
+        policies: vec![],
     }
 }
 

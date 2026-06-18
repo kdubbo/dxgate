@@ -1,0 +1,88 @@
+version: agent-example
+listeners: []
+clusters: []
+secrets: []
+providers:
+  - name: openai
+    kind: open-ai-compatible
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_API_KEY
+backends:
+  - name: gpt
+    type: llm
+    provider: openai
+    models: ["gpt-4o-mini"]
+  - name: tools-search
+    type: mcp
+    endpoint: http://search-tools.default.svc.cluster.local:8080
+    tools: ["search"]
+  - name: tools-calendar
+    type: mcp
+    endpoint: http://calendar-tools.default.svc.cluster.local:8080
+    tools: ["calendar"]
+  - name: planner-agent
+    type: a2a
+    endpoint: http://planner-agent.default.svc.cluster.local:8080
+    agent: planner
+routes:
+  - name: chat
+    protocol: llm
+    matches:
+      - path:
+          type: exact
+          value: /v1/chat/completions
+        method: POST
+        model: gpt-4o-mini
+    weighted_backends:
+      - name: gpt
+        weight: 100
+    policies: ["public-agent-policy"]
+  - name: mcp
+    protocol: mcp
+    matches:
+      - path:
+          type: exact
+          value: /mcp
+        method: POST
+    weighted_backends:
+      - name: tools-search
+        weight: 100
+      - name: tools-calendar
+        weight: 100
+    policies: ["public-agent-policy"]
+  - name: agent-card
+    protocol: a2a
+    matches:
+      - path:
+          type: exact
+          value: /.well-known/agent-card.json
+        method: GET
+    weighted_backends:
+      - name: planner-agent
+        weight: 100
+policies:
+  - name: public-agent-policy
+    action: allow
+    auth:
+      type: api-key
+      header: authorization
+      values: ["Bearer local-dev"]
+    rate_limit:
+      requests: 60
+      window_seconds: 60
+      key: route
+    timeout_ms: 30000
+    retry:
+      attempts: 2
+      statuses: [502, 503, 504]
+    max_body_bytes: 1048576
+    request_headers:
+      add:
+        - name: x-dxgate-agent
+          value: "true"
+      remove: []
+    response_headers:
+      add:
+        - name: x-dxgate
+          value: agent
+      remove: []

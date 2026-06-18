@@ -1,33 +1,46 @@
 use crate::ProxyState;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, Response, StatusCode, Uri};
+use axum::http::{
+    HeaderMap, HeaderName, HeaderValue as HttpHeaderValue, Method, Request, Response, StatusCode,
+    Uri,
+};
 use axum::routing::any;
 use axum::Router;
-use dxgate_core::{Cluster, Endpoint, MatchInput, UpstreamTls, HTTP_LISTENER_PORT};
+use dxgate_core::{
+    AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, BackendKind, Cluster,
+    Endpoint, HeaderTransform, MatchInput, PolicyAction, Provider, RateLimitKey, RetryPolicy,
+    UpstreamTls, WeightedBackend, HTTP_LISTENER_PORT,
+};
+use hyper::body::{self, Bytes};
 use hyper::client::HttpConnector;
 use hyper::Client;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use rustls::client::{ServerCertVerified, ServerCertVerifier, WebPkiVerifier};
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
 use serde::Deserialize;
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::time;
 use tracing::{debug, info, warn};
 
 type PlainClient = Client<HttpConnector, Body>;
+type WebClient = Client<HttpsConnector<HttpConnector>, Body>;
 type MtlsClient = Client<HttpsConnector<HttpConnector>, Body>;
 
 #[derive(Clone)]
 pub struct ProxyServer {
     state: ProxyState,
     clients: UpstreamClients,
+    policy_default: PolicyDefault,
 }
 
 impl ProxyServer {
@@ -35,6 +48,7 @@ impl ProxyServer {
         Self {
             state,
             clients: UpstreamClients::from_env(),
+            policy_default: PolicyDefault::from_env(),
         }
     }
 
@@ -65,6 +79,32 @@ async fn forward(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let cfg = server.state.config().await;
+    let protocol = detect_agent_protocol(req.uri().path()).or_else(|| {
+        cfg.routes
+            .iter()
+            .any(|route| route.protocol == AgentProtocol::Http)
+            .then_some(AgentProtocol::Http)
+    });
+    if let Some(protocol) = protocol {
+        let (parts, body) = req.into_parts();
+        let body_bytes = body::to_bytes(body)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("read request body: {e}")))?;
+        let context = AgentRequestContext::new(protocol, &parts, &body_bytes);
+        if let Some(route) = cfg.agent_route_for(&context.input()).cloned() {
+            return forward_agent(server, cfg, parts, body_bytes, context, route).await;
+        }
+        req = Request::from_parts(parts, Body::from(body_bytes));
+    }
+
+    forward_http(server, cfg, req).await
+}
+
+async fn forward_http(
+    server: ProxyServer,
+    cfg: dxgate_core::RuntimeConfig,
+    mut req: Request<Body>,
+) -> Result<Response<Body>, (StatusCode, String)> {
     let host = host_header(req.headers()).unwrap_or("*");
     let path = req
         .uri()
@@ -139,6 +179,704 @@ async fn forward(
     server.clients.request_plain(req).await
 }
 
+async fn forward_agent(
+    server: ProxyServer,
+    cfg: dxgate_core::RuntimeConfig,
+    parts: http::request::Parts,
+    body: Bytes,
+    context: AgentRequestContext,
+    route: AgentRoute,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let eligible = route
+        .weighted_backends
+        .iter()
+        .filter_map(|weighted| {
+            let backend = cfg.backend(&weighted.name)?;
+            if backend_matches_protocol(backend, context.protocol)
+                && backend.supports_model(context.model.as_deref())
+                && backend.supports_tool(context.tool.as_deref())
+            {
+                Some(weighted.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if eligible.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("agent route {} has no eligible backends", route.name),
+        ));
+    }
+
+    let primary = server
+        .state
+        .pick_backend(&eligible)
+        .await
+        .cloned()
+        .unwrap_or_else(|| eligible[0].clone());
+    let mut ordered = vec![primary.clone()];
+    ordered.extend(eligible.into_iter().filter(|b| b.name != primary.name));
+
+    let primary_backend = cfg.backend(&primary.name).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("backend {} not found", primary.name),
+        )
+    })?;
+    let policy_runtime =
+        evaluate_policies(&server, &cfg, &route, primary_backend, &context, body.len())?;
+
+    if context.protocol == AgentProtocol::Mcp
+        && context.mcp_method.as_deref() == Some("tools/list")
+        && ordered.len() > 1
+    {
+        return federate_mcp_tools(
+            &server,
+            &cfg,
+            &route,
+            &ordered,
+            &parts,
+            &body,
+            &context,
+            &policy_runtime,
+        )
+        .await;
+    }
+
+    request_agent_with_failover(
+        &server,
+        &cfg,
+        &route,
+        &ordered,
+        &parts,
+        &body,
+        &context,
+        &policy_runtime,
+    )
+    .await
+}
+
+async fn request_agent_with_failover(
+    server: &ProxyServer,
+    cfg: &dxgate_core::RuntimeConfig,
+    route: &AgentRoute,
+    ordered: &[WeightedBackend],
+    parts: &http::request::Parts,
+    body: &Bytes,
+    context: &AgentRequestContext,
+    policy_runtime: &PolicyRuntime,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let retry = policy_runtime.retry.clone().unwrap_or(RetryPolicy {
+        attempts: 1,
+        statuses: vec![502, 503, 504],
+    });
+    let attempts = retry.attempts.max(1) as usize;
+    let mut last_error = None;
+
+    for attempt in 0..attempts {
+        for weighted in ordered {
+            let Some(backend) = cfg.backend(&weighted.name) else {
+                continue;
+            };
+            let started = Instant::now();
+            match request_agent_backend(server, cfg, backend, parts, body, context, policy_runtime)
+                .await
+            {
+                Ok(mut response) => {
+                    let status = response.status();
+                    server.state.record_agent_request(
+                        protocol_name(context.protocol),
+                        &route.name,
+                        &backend.name,
+                        status.as_u16(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                    apply_response_headers(
+                        response.headers_mut(),
+                        &policy_runtime.response_headers,
+                    );
+                    if attempt + 1 < attempts && retry.statuses.contains(&status.as_u16()) {
+                        last_error = Some((
+                            status,
+                            format!("upstream {} returned {}", backend.name, status),
+                        ));
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(err) => {
+                    server.state.record_agent_request(
+                        protocol_name(context.protocol),
+                        &route.name,
+                        &backend.name,
+                        err.0.as_u16(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("agent route {} had no reachable backends", route.name),
+        )
+    }))
+}
+
+async fn request_agent_backend(
+    server: &ProxyServer,
+    cfg: &dxgate_core::RuntimeConfig,
+    backend: &Backend,
+    parts: &http::request::Parts,
+    body: &Bytes,
+    context: &AgentRequestContext,
+    policy_runtime: &PolicyRuntime,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let provider = backend_provider(cfg, backend);
+    let endpoint = backend.endpoint(provider).ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("backend {} has no endpoint", backend.name),
+        )
+    })?;
+    let uri = compose_upstream_uri(endpoint, &context.path_and_query)?;
+    let mut headers = parts.headers.clone();
+    apply_request_headers(&mut headers, &policy_runtime.request_headers);
+    apply_provider_headers(&mut headers, provider);
+    headers.remove(http::header::HOST);
+
+    let mut builder = Request::builder()
+        .method(parts.method.clone())
+        .uri(uri)
+        .version(parts.version);
+    *builder.headers_mut().unwrap() = headers;
+    let request = builder.body(Body::from(body.clone())).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("build upstream request: {e}"),
+        )
+    })?;
+
+    let fut = server.clients.request_web(request);
+    if let Some(timeout) = policy_runtime.timeout {
+        return time::timeout(timeout, fut).await.map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("backend {} timed out", backend.name),
+            )
+        })?;
+    }
+    fut.await
+}
+
+async fn federate_mcp_tools(
+    server: &ProxyServer,
+    cfg: &dxgate_core::RuntimeConfig,
+    route: &AgentRoute,
+    ordered: &[WeightedBackend],
+    parts: &http::request::Parts,
+    body: &Bytes,
+    context: &AgentRequestContext,
+    policy_runtime: &PolicyRuntime,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let mut tools = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut failures = Vec::new();
+
+    for weighted in ordered {
+        let Some(backend) = cfg.backend(&weighted.name) else {
+            continue;
+        };
+        let started = Instant::now();
+        match request_agent_backend(server, cfg, backend, parts, body, context, policy_runtime)
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let bytes = body::to_bytes(response.into_body()).await.map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("read MCP tools/list response from {}: {e}", backend.name),
+                    )
+                })?;
+                server.state.record_agent_request(
+                    protocol_name(context.protocol),
+                    &route.name,
+                    &backend.name,
+                    status.as_u16(),
+                    started.elapsed().as_millis() as u64,
+                );
+                if !status.is_success() {
+                    failures.push(format!("{} returned {}", backend.name, status));
+                    continue;
+                }
+                let value = serde_json::from_slice::<Value>(&bytes).map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("parse MCP tools/list response from {}: {e}", backend.name),
+                    )
+                })?;
+                if let Some(items) = value
+                    .get("result")
+                    .and_then(|result| result.get("tools"))
+                    .and_then(Value::as_array)
+                {
+                    for item in items {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if seen.insert(name) {
+                            tools.push(item.clone());
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                server.state.record_agent_request(
+                    protocol_name(context.protocol),
+                    &route.name,
+                    &backend.name,
+                    err.0.as_u16(),
+                    started.elapsed().as_millis() as u64,
+                );
+                failures.push(format!("{}: {}", backend.name, err.1));
+            }
+        }
+    }
+
+    if tools.is_empty() && !failures.is_empty() {
+        return Err((StatusCode::BAD_GATEWAY, failures.join("; ")));
+    }
+
+    let id = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(Value::Null);
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "tools": tools }
+            })
+            .to_string(),
+        ))
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("build MCP federation response: {e}"),
+            )
+        })?;
+    apply_response_headers(response.headers_mut(), &policy_runtime.response_headers);
+    Ok(response)
+}
+
+fn detect_agent_protocol(path: &str) -> Option<AgentProtocol> {
+    if path == "/v1/chat/completions" {
+        Some(AgentProtocol::Llm)
+    } else if path == "/mcp" || path.starts_with("/mcp/") {
+        Some(AgentProtocol::Mcp)
+    } else if path == "/.well-known/agent-card.json" || path == "/a2a" || path.starts_with("/a2a/")
+    {
+        Some(AgentProtocol::A2a)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentRequestContext {
+    protocol: AgentProtocol,
+    host: String,
+    path: String,
+    path_and_query: String,
+    method: Method,
+    model: Option<String>,
+    tool: Option<String>,
+    agent: Option<String>,
+    mcp_method: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+impl AgentRequestContext {
+    fn new(protocol: AgentProtocol, parts: &http::request::Parts, body: &Bytes) -> Self {
+        let json = serde_json::from_slice::<Value>(body).ok();
+        let model = if protocol == AgentProtocol::Llm {
+            json.as_ref()
+                .and_then(|value| value.get("model"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let mcp_method = if protocol == AgentProtocol::Mcp {
+            json.as_ref()
+                .and_then(|value| value.get("method"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let tool = if protocol == AgentProtocol::Mcp {
+            json.as_ref()
+                .and_then(|value| value.get("params"))
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let agent = if protocol == AgentProtocol::A2a {
+            json.as_ref()
+                .and_then(|value| {
+                    value
+                        .get("agent")
+                        .or_else(|| value.get("params").and_then(|params| params.get("agent")))
+                })
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let host = host_header(&parts.headers).unwrap_or("*").to_string();
+        let path = parts.uri.path().to_string();
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        Self {
+            protocol,
+            host,
+            path,
+            path_and_query,
+            method: parts.method.clone(),
+            model,
+            tool,
+            agent,
+            mcp_method,
+            headers: header_pairs(&parts.headers),
+        }
+    }
+
+    fn input(&self) -> AgentMatchInput<'_> {
+        AgentMatchInput {
+            protocol: self.protocol,
+            host: &self.host,
+            path: &self.path,
+            method: self.method.as_str(),
+            model: self.model.as_deref(),
+            tool: self.tool.as_deref(),
+            agent: self.agent.as_deref(),
+            headers: &self.headers,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyRuntime {
+    request_headers: HeaderTransform,
+    response_headers: HeaderTransform,
+    timeout: Option<Duration>,
+    retry: Option<RetryPolicy>,
+}
+
+fn evaluate_policies(
+    server: &ProxyServer,
+    cfg: &dxgate_core::RuntimeConfig,
+    route: &AgentRoute,
+    backend: &Backend,
+    context: &AgentRequestContext,
+    body_size: usize,
+) -> Result<PolicyRuntime, (StatusCode, String)> {
+    let mut names = route.policies.clone();
+    names.extend(backend.policies.clone());
+    if names.is_empty() && server.policy_default == PolicyDefault::Deny {
+        server.state.record_policy_denied();
+        return Err((
+            StatusCode::FORBIDDEN,
+            "request denied by default policy".to_string(),
+        ));
+    }
+
+    let mut runtime = PolicyRuntime {
+        request_headers: HeaderTransform::default(),
+        response_headers: HeaderTransform::default(),
+        timeout: None,
+        retry: None,
+    };
+
+    for name in names {
+        let Some(policy) = cfg.policy(&name) else {
+            continue;
+        };
+        if !policy.applies_to(&context.input()) {
+            continue;
+        }
+        if policy.action == PolicyAction::Deny {
+            server.state.record_policy_denied();
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("request denied by policy {}", policy.name),
+            ));
+        }
+        if let Some(limit) = policy.max_body_bytes {
+            if body_size > limit {
+                server.state.record_policy_denied();
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("request body exceeds policy {} limit", policy.name),
+                ));
+            }
+        }
+        if let Some(auth) = &policy.auth {
+            validate_auth(auth, &context.headers).map_err(|message| {
+                server.state.record_policy_denied();
+                (
+                    StatusCode::UNAUTHORIZED,
+                    format!("policy {}: {message}", policy.name),
+                )
+            })?;
+        }
+        if let Some(rate_limit) = &policy.rate_limit {
+            let key = rate_limit_key(rate_limit.key, &policy.name, route, backend, context);
+            if !server.state.check_rate_limit(key, rate_limit) {
+                server.state.record_policy_denied();
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("rate limit exceeded by policy {}", policy.name),
+                ));
+            }
+        }
+        merge_header_transform(&mut runtime.request_headers, &policy.request_headers);
+        merge_header_transform(&mut runtime.response_headers, &policy.response_headers);
+        if let Some(timeout_ms) = policy.timeout_ms {
+            let timeout = Duration::from_millis(timeout_ms.max(1));
+            runtime.timeout = Some(
+                runtime
+                    .timeout
+                    .map(|old| old.min(timeout))
+                    .unwrap_or(timeout),
+            );
+        }
+        if let Some(retry) = &policy.retry {
+            runtime.retry = Some(retry.clone());
+        }
+    }
+
+    Ok(runtime)
+}
+
+fn validate_auth(auth: &AuthPolicy, headers: &[(String, String)]) -> Result<(), String> {
+    match auth {
+        AuthPolicy::ApiKey {
+            header,
+            values,
+            value_env,
+        } => {
+            let actual = header_value(headers, header)
+                .ok_or_else(|| format!("missing header {}", header))?;
+            let mut accepted = values.clone();
+            if let Some(env_name) = value_env {
+                if let Ok(value) = env::var(env_name) {
+                    accepted.push(value);
+                }
+            }
+            if accepted.iter().any(|value| value == actual) {
+                Ok(())
+            } else {
+                Err("invalid API key".to_string())
+            }
+        }
+        AuthPolicy::Jwt {
+            header,
+            hmac_secret_env,
+            issuer,
+            audiences,
+        } => {
+            let raw = header_value(headers, header)
+                .ok_or_else(|| format!("missing header {}", header))?;
+            let token = raw.strip_prefix("Bearer ").unwrap_or(raw);
+            let Some(secret_env) = hmac_secret_env else {
+                return Err("JWT policy requires hmac_secret_env".to_string());
+            };
+            let secret = env::var(secret_env)
+                .map_err(|_| format!("JWT secret env {} is not set", secret_env))?;
+            let mut validation = Validation::new(Algorithm::HS256);
+            if audiences.is_empty() {
+                validation.validate_aud = false;
+            } else {
+                validation.set_audience(audiences);
+            }
+            if let Some(issuer) = issuer {
+                validation.set_issuer(&[issuer]);
+            }
+            decode::<JwtClaims>(
+                token,
+                &DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            )
+            .map(|_| ())
+            .map_err(|e| format!("invalid JWT: {e}"))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
+    #[allow(dead_code)]
+    sub: Option<String>,
+    #[allow(dead_code)]
+    exp: Option<usize>,
+    #[allow(dead_code)]
+    iss: Option<String>,
+    #[allow(dead_code)]
+    aud: Option<Value>,
+}
+
+fn rate_limit_key(
+    key: RateLimitKey,
+    policy: &str,
+    route: &AgentRoute,
+    backend: &Backend,
+    context: &AgentRequestContext,
+) -> String {
+    match key {
+        RateLimitKey::Route => format!("{policy}:route:{}", route.name),
+        RateLimitKey::Backend => format!("{policy}:backend:{}", backend.name),
+        RateLimitKey::Header => format!(
+            "{policy}:header:{}",
+            header_value(&context.headers, "authorization").unwrap_or("anonymous")
+        ),
+    }
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn merge_header_transform(target: &mut HeaderTransform, next: &HeaderTransform) {
+    target.add.extend(next.add.clone());
+    target.remove.extend(next.remove.clone());
+}
+
+fn apply_request_headers(headers: &mut HeaderMap, transform: &HeaderTransform) {
+    apply_header_transform(headers, transform);
+}
+
+fn apply_response_headers(headers: &mut HeaderMap, transform: &HeaderTransform) {
+    apply_header_transform(headers, transform);
+}
+
+fn apply_header_transform(headers: &mut HeaderMap, transform: &HeaderTransform) {
+    for name in &transform.remove {
+        if let Ok(name) = HeaderName::try_from(name.as_str()) {
+            headers.remove(name);
+        }
+    }
+    for header in &transform.add {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(header.name.as_str()),
+            HttpHeaderValue::from_str(&header.value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+}
+
+fn apply_provider_headers(headers: &mut HeaderMap, provider: Option<&Provider>) {
+    let Some(provider) = provider else {
+        return;
+    };
+    for header in &provider.request_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(header.name.as_str()),
+            HttpHeaderValue::from_str(&header.value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    if let Some(env_name) = &provider.api_key_env {
+        if let Ok(key) = env::var(env_name) {
+            if let Ok(value) = HttpHeaderValue::from_str(&format!("Bearer {key}")) {
+                headers.insert(http::header::AUTHORIZATION, value);
+            }
+        }
+    }
+}
+
+fn backend_provider<'a>(
+    cfg: &'a dxgate_core::RuntimeConfig,
+    backend: &'a Backend,
+) -> Option<&'a Provider> {
+    match &backend.kind {
+        BackendKind::Llm { provider, .. } => cfg.provider(provider),
+        _ => None,
+    }
+}
+
+fn backend_matches_protocol(backend: &Backend, protocol: AgentProtocol) -> bool {
+    matches!(
+        (&backend.kind, protocol),
+        (BackendKind::Http { .. }, AgentProtocol::Http)
+            | (BackendKind::Llm { .. }, AgentProtocol::Llm)
+            | (BackendKind::Mcp { .. }, AgentProtocol::Mcp)
+            | (BackendKind::A2a { .. }, AgentProtocol::A2a)
+    )
+}
+
+fn compose_upstream_uri(endpoint: &str, path_and_query: &str) -> Result<Uri, (StatusCode, String)> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let suffix = if endpoint.ends_with("/v1") && path_and_query.starts_with("/v1/") {
+        path_and_query.trim_start_matches("/v1")
+    } else {
+        path_and_query
+    };
+    format!("{endpoint}{suffix}").parse::<Uri>().map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("invalid upstream uri for endpoint {endpoint}: {e}"),
+        )
+    })
+}
+
+fn protocol_name(protocol: AgentProtocol) -> &'static str {
+    match protocol {
+        AgentProtocol::Http => "http",
+        AgentProtocol::Llm => "llm",
+        AgentProtocol::Mcp => "mcp",
+        AgentProtocol::A2a => "a2a",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyDefault {
+    Allow,
+    Deny,
+}
+
+impl PolicyDefault {
+    fn from_env() -> Self {
+        match env::var("DXGATE_POLICY_DEFAULT") {
+            Ok(value) if value.eq_ignore_ascii_case("deny") => Self::Deny,
+            _ => Self::Allow,
+        }
+    }
+}
+
 fn endpoint_authority(endpoint: &Endpoint) -> String {
     if endpoint.address.contains(':') && !endpoint.address.starts_with('[') {
         format!("[{}]:{}", endpoint.address, endpoint.port)
@@ -169,6 +907,7 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
 #[derive(Clone)]
 struct UpstreamClients {
     plaintext: PlainClient,
+    web: WebClient,
     mtls: MtlsSupport,
 }
 
@@ -187,8 +926,14 @@ impl UpstreamClients {
             },
             _ => MtlsSupport::Disabled,
         };
+        let web_connector = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
         Self {
             plaintext: Client::new(),
+            web: Client::builder().build::<_, Body>(web_connector),
             mtls,
         }
     }
@@ -198,6 +943,16 @@ impl UpstreamClients {
         req: Request<Body>,
     ) -> Result<Response<Body>, (StatusCode, String)> {
         self.plaintext
+            .request(req)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+    }
+
+    async fn request_web(
+        &self,
+        req: Request<Body>,
+    ) -> Result<Response<Body>, (StatusCode, String)> {
+        self.web
             .request(req)
             .await
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))

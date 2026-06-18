@@ -16,6 +16,14 @@ pub struct RuntimeConfig {
     pub clusters: Vec<Cluster>,
     #[serde(default)]
     pub secrets: Vec<TlsSecret>,
+    #[serde(default)]
+    pub providers: Vec<Provider>,
+    #[serde(default)]
+    pub backends: Vec<Backend>,
+    #[serde(default)]
+    pub routes: Vec<AgentRoute>,
+    #[serde(default)]
+    pub policies: Vec<Policy>,
 }
 
 impl RuntimeConfig {
@@ -25,6 +33,10 @@ impl RuntimeConfig {
             listeners: Vec::new(),
             clusters: Vec::new(),
             secrets: Vec::new(),
+            providers: Vec::new(),
+            backends: Vec::new(),
+            routes: Vec::new(),
+            policies: Vec::new(),
         }
     }
 
@@ -68,6 +80,96 @@ impl RuntimeConfig {
             }
         }
 
+        let mut providers = BTreeSet::new();
+        for provider in &self.providers {
+            if !providers.insert(provider.name.as_str()) {
+                conflicts.push(ConfigConflict::new(
+                    "duplicate-provider",
+                    format!("provider {} is defined more than once", provider.name),
+                ));
+            }
+        }
+
+        let mut backends = BTreeSet::new();
+        for backend in &self.backends {
+            if !backends.insert(backend.name.as_str()) {
+                conflicts.push(ConfigConflict::new(
+                    "duplicate-backend",
+                    format!("backend {} is defined more than once", backend.name),
+                ));
+            }
+            if let BackendKind::Llm { provider, .. } = &backend.kind {
+                if !providers.contains(provider.as_str()) {
+                    conflicts.push(ConfigConflict::new(
+                        "missing-provider",
+                        format!(
+                            "backend {} references missing provider {}",
+                            backend.name, provider
+                        ),
+                    ));
+                }
+            }
+            for policy in &backend.policies {
+                if !self.policies.iter().any(|p| p.name == *policy) {
+                    conflicts.push(ConfigConflict::new(
+                        "missing-policy",
+                        format!(
+                            "backend {} references missing policy {}",
+                            backend.name, policy
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut policies = BTreeSet::new();
+        for policy in &self.policies {
+            if !policies.insert(policy.name.as_str()) {
+                conflicts.push(ConfigConflict::new(
+                    "duplicate-policy",
+                    format!("policy {} is defined more than once", policy.name),
+                ));
+            }
+        }
+
+        let mut routes = BTreeSet::new();
+        for route in &self.routes {
+            if !routes.insert(route.name.as_str()) {
+                conflicts.push(ConfigConflict::new(
+                    "duplicate-agent-route",
+                    format!("agent route {} is defined more than once", route.name),
+                ));
+            }
+            if route.weighted_backends.is_empty() {
+                conflicts.push(ConfigConflict::new(
+                    "empty-agent-route-destination",
+                    format!("agent route {} has no weighted backends", route.name),
+                ));
+            }
+            for dst in &route.weighted_backends {
+                if !backends.contains(dst.name.as_str()) {
+                    conflicts.push(ConfigConflict::new(
+                        "missing-backend",
+                        format!(
+                            "agent route {} references missing backend {}",
+                            route.name, dst.name
+                        ),
+                    ));
+                }
+            }
+            for policy in &route.policies {
+                if !policies.contains(policy.as_str()) {
+                    conflicts.push(ConfigConflict::new(
+                        "missing-policy",
+                        format!(
+                            "agent route {} references missing policy {}",
+                            route.name, policy
+                        ),
+                    ));
+                }
+            }
+        }
+
         for listener in &self.listeners {
             for host in &listener.virtual_hosts {
                 for route in &host.routes {
@@ -108,6 +210,25 @@ impl RuntimeConfig {
 
     pub fn cluster(&self, name: &str) -> Option<&Cluster> {
         self.clusters.iter().find(|c| c.name == name)
+    }
+
+    pub fn provider(&self, name: &str) -> Option<&Provider> {
+        self.providers.iter().find(|p| p.name == name)
+    }
+
+    pub fn backend(&self, name: &str) -> Option<&Backend> {
+        self.backends.iter().find(|b| b.name == name)
+    }
+
+    pub fn policy(&self, name: &str) -> Option<&Policy> {
+        self.policies.iter().find(|p| p.name == name)
+    }
+
+    pub fn agent_route_for<'a>(&'a self, input: &AgentMatchInput<'_>) -> Option<&'a AgentRoute> {
+        self.routes
+            .iter()
+            .filter(|route| route.protocol == input.protocol)
+            .find(|route| route.matches(input))
     }
 
     pub fn route_for<'a>(&'a self, port: u16, input: &MatchInput<'_>) -> Result<&'a Route> {
@@ -291,6 +412,380 @@ pub struct TlsSecret {
     pub private_key_pem: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provider {
+    pub name: String,
+    #[serde(default = "default_openai_compatible")]
+    pub kind: ProviderKind,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<HeaderValue>,
+}
+
+fn default_openai_compatible() -> ProviderKind {
+    ProviderKind::OpenAiCompatible
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backend {
+    pub name: String,
+    #[serde(flatten)]
+    pub kind: BackendKind,
+    #[serde(default)]
+    pub policies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BackendKind {
+    Http {
+        endpoint: String,
+    },
+    Llm {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        models: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+    },
+    Mcp {
+        endpoint: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+    },
+    A2a {
+        endpoint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+    },
+}
+
+impl Backend {
+    pub fn endpoint<'a>(&'a self, provider: Option<&'a Provider>) -> Option<&'a str> {
+        match &self.kind {
+            BackendKind::Http { endpoint }
+            | BackendKind::Mcp { endpoint, .. }
+            | BackendKind::A2a { endpoint, .. } => Some(endpoint),
+            BackendKind::Llm { endpoint, .. } => endpoint
+                .as_deref()
+                .or_else(|| provider.map(|provider| provider.base_url.as_str())),
+        }
+    }
+
+    pub fn supports_model(&self, model: Option<&str>) -> bool {
+        match &self.kind {
+            BackendKind::Llm { models, .. } => {
+                models.is_empty()
+                    || model
+                        .map(|m| models.iter().any(|v| v == m))
+                        .unwrap_or(false)
+            }
+            _ => true,
+        }
+    }
+
+    pub fn supports_tool(&self, tool: Option<&str>) -> bool {
+        match &self.kind {
+            BackendKind::Mcp { tools, .. } => {
+                tools.is_empty() || tool.map(|t| tools.iter().any(|v| v == t)).unwrap_or(false)
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRoute {
+    pub name: String,
+    pub protocol: AgentProtocol,
+    #[serde(default)]
+    pub matches: Vec<AgentRouteMatch>,
+    #[serde(default)]
+    pub weighted_backends: Vec<WeightedBackend>,
+    #[serde(default)]
+    pub policies: Vec<String>,
+}
+
+impl AgentRoute {
+    pub fn matches(&self, input: &AgentMatchInput<'_>) -> bool {
+        self.matches.is_empty() || self.matches.iter().any(|m| m.matches(input))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProtocol {
+    Http,
+    Llm,
+    Mcp,
+    A2a,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRouteMatch {
+    #[serde(default)]
+    pub path: PathMatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<HeaderMatch>,
+}
+
+impl AgentRouteMatch {
+    pub fn matches(&self, input: &AgentMatchInput<'_>) -> bool {
+        self.path.matches(input.path)
+            && optional_matches(self.host.as_deref(), Some(input.host), host_matches)
+            && optional_matches(self.method.as_deref(), Some(input.method), |a, b| {
+                a.eq_ignore_ascii_case(b)
+            })
+            && optional_matches(self.model.as_deref(), input.model, str_matches)
+            && optional_matches(self.tool.as_deref(), input.tool, str_matches)
+            && optional_matches(self.agent.as_deref(), input.agent, str_matches)
+            && self
+                .headers
+                .iter()
+                .all(|h| h.matches_headers(input.headers))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightedBackend {
+    pub name: String,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentMatchInput<'a> {
+    pub protocol: AgentProtocol,
+    pub host: &'a str,
+    pub path: &'a str,
+    pub method: &'a str,
+    pub model: Option<&'a str>,
+    pub tool: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub headers: &'a [(String, String)],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    pub name: String,
+    #[serde(default)]
+    pub action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<PolicyMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+    #[serde(default)]
+    pub request_headers: HeaderTransform,
+    #[serde(default)]
+    pub response_headers: HeaderTransform,
+}
+
+impl Policy {
+    pub fn applies_to(&self, input: &AgentMatchInput<'_>) -> bool {
+        self.matches
+            .as_ref()
+            .map(|m| m.matches(input))
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyAction {
+    Allow,
+    Deny,
+}
+
+impl Default for PolicyAction {
+    fn default() -> Self {
+        Self::Allow
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyMatch {
+    #[serde(default)]
+    pub protocols: Vec<AgentProtocol>,
+    #[serde(default)]
+    pub paths: Vec<PathMatch>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub agents: Vec<String>,
+    #[serde(default)]
+    pub headers: Vec<HeaderMatch>,
+}
+
+impl PolicyMatch {
+    pub fn matches(&self, input: &AgentMatchInput<'_>) -> bool {
+        matches_any(&self.protocols, input.protocol)
+            && path_matches_any(&self.paths, input.path)
+            && string_matches_any(&self.methods, Some(input.method), |a, b| {
+                a.eq_ignore_ascii_case(b)
+            })
+            && string_matches_any(&self.models, input.model, str_matches)
+            && string_matches_any(&self.tools, input.tool, str_matches)
+            && string_matches_any(&self.agents, input.agent, str_matches)
+            && self
+                .headers
+                .iter()
+                .all(|h| h.matches_headers(input.headers))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AuthPolicy {
+    ApiKey {
+        #[serde(default = "default_authorization_header")]
+        header: String,
+        #[serde(default)]
+        values: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value_env: Option<String>,
+    },
+    Jwt {
+        #[serde(default = "default_authorization_header")]
+        header: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hmac_secret_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issuer: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        audiences: Vec<String>,
+    },
+}
+
+fn default_authorization_header() -> String {
+    "authorization".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitPolicy {
+    pub requests: u32,
+    pub window_seconds: u64,
+    #[serde(default)]
+    pub key: RateLimitKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RateLimitKey {
+    Route,
+    Backend,
+    Header,
+}
+
+impl Default for RateLimitKey {
+    fn default() -> Self {
+        Self::Route
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub attempts: u32,
+    #[serde(default = "default_retry_statuses")]
+    pub statuses: Vec<u16>,
+}
+
+fn default_retry_statuses() -> Vec<u16> {
+    vec![502, 503, 504]
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderTransform {
+    #[serde(default)]
+    pub add: Vec<HeaderValue>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderValue {
+    pub name: String,
+    pub value: String,
+}
+
+impl HeaderMatch {
+    pub fn matches_headers(&self, headers: &[(String, String)]) -> bool {
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case(&self.name) && value == &self.value)
+    }
+}
+
+fn optional_matches(
+    expected: Option<&str>,
+    actual: Option<&str>,
+    cmp: impl Fn(&str, &str) -> bool,
+) -> bool {
+    expected
+        .map(|expected| actual.map(|actual| cmp(expected, actual)).unwrap_or(false))
+        .unwrap_or(true)
+}
+
+fn str_matches(expected: &str, actual: &str) -> bool {
+    expected == "*" || expected == actual
+}
+
+fn host_matches(expected: &str, actual: &str) -> bool {
+    expected == "*"
+        || expected.eq_ignore_ascii_case(actual)
+        || expected
+            .strip_prefix("*.")
+            .map(|suffix| actual.ends_with(suffix))
+            .unwrap_or(false)
+}
+
+fn matches_any<T: PartialEq>(expected: &[T], actual: T) -> bool {
+    expected.is_empty() || expected.iter().any(|value| value == &actual)
+}
+
+fn path_matches_any(expected: &[PathMatch], actual: &str) -> bool {
+    expected.is_empty() || expected.iter().any(|path| path.matches(actual))
+}
+
+fn string_matches_any(
+    expected: &[String],
+    actual: Option<&str>,
+    cmp: impl Fn(&str, &str) -> bool,
+) -> bool {
+    expected.is_empty()
+        || actual
+            .map(|actual| expected.iter().any(|value| cmp(value, actual)))
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +813,10 @@ mod tests {
             ],
             clusters: vec![],
             secrets: vec![],
+            providers: vec![],
+            backends: vec![],
+            routes: vec![],
+            policies: vec![],
         };
 
         assert!(cfg.validate().is_err());
@@ -350,6 +849,10 @@ mod tests {
             }],
             clusters: vec![],
             secrets: vec![],
+            providers: vec![],
+            backends: vec![],
+            routes: vec![],
+            policies: vec![],
         };
 
         let conflicts = cfg.validate().unwrap_err();
@@ -410,6 +913,10 @@ mod tests {
                 },
             ],
             secrets: vec![],
+            providers: vec![],
+            backends: vec![],
+            routes: vec![],
+            policies: vec![],
         };
 
         let headers = vec![("x-env".to_string(), "prod".to_string())];
@@ -447,5 +954,120 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn validates_agent_route_backend_and_policy_references() {
+        let cfg = RuntimeConfig {
+            version: "agent".into(),
+            listeners: vec![],
+            clusters: vec![],
+            secrets: vec![],
+            providers: vec![Provider {
+                name: "openai".into(),
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com".into(),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                request_headers: vec![],
+            }],
+            backends: vec![Backend {
+                name: "gpt".into(),
+                kind: BackendKind::Llm {
+                    provider: "openai".into(),
+                    models: vec!["gpt-4o-mini".into()],
+                    endpoint: None,
+                },
+                policies: vec!["auth".into()],
+            }],
+            routes: vec![AgentRoute {
+                name: "chat".into(),
+                protocol: AgentProtocol::Llm,
+                matches: vec![AgentRouteMatch {
+                    path: PathMatch::Exact("/v1/chat/completions".into()),
+                    host: None,
+                    method: Some("POST".into()),
+                    model: Some("gpt-4o-mini".into()),
+                    tool: None,
+                    agent: None,
+                    headers: vec![],
+                }],
+                weighted_backends: vec![WeightedBackend {
+                    name: "gpt".into(),
+                    weight: 100,
+                }],
+                policies: vec!["auth".into()],
+            }],
+            policies: vec![Policy {
+                name: "auth".into(),
+                action: PolicyAction::Allow,
+                matches: None,
+                auth: Some(AuthPolicy::ApiKey {
+                    header: "authorization".into(),
+                    values: vec!["Bearer local".into()],
+                    value_env: None,
+                }),
+                rate_limit: None,
+                timeout_ms: None,
+                retry: None,
+                max_body_bytes: None,
+                request_headers: HeaderTransform::default(),
+                response_headers: HeaderTransform::default(),
+            }],
+        };
+
+        cfg.validate().unwrap();
+        let input = AgentMatchInput {
+            protocol: AgentProtocol::Llm,
+            host: "api.example.com",
+            path: "/v1/chat/completions",
+            method: "post",
+            model: Some("gpt-4o-mini"),
+            tool: None,
+            agent: None,
+            headers: &[],
+        };
+
+        assert_eq!(cfg.agent_route_for(&input).unwrap().name, "chat");
+        assert!(cfg
+            .backend("gpt")
+            .unwrap()
+            .supports_model(Some("gpt-4o-mini")));
+        assert!(!cfg.backend("gpt").unwrap().supports_model(Some("other")));
+    }
+
+    #[test]
+    fn policy_match_filters_protocol_path_and_model() {
+        let policy = Policy {
+            name: "llm-only".into(),
+            action: PolicyAction::Deny,
+            matches: Some(PolicyMatch {
+                protocols: vec![AgentProtocol::Llm],
+                paths: vec![PathMatch::Prefix("/v1/".into())],
+                methods: vec!["POST".into()],
+                models: vec!["blocked".into()],
+                tools: vec![],
+                agents: vec![],
+                headers: vec![],
+            }),
+            auth: None,
+            rate_limit: None,
+            timeout_ms: None,
+            retry: None,
+            max_body_bytes: None,
+            request_headers: HeaderTransform::default(),
+            response_headers: HeaderTransform::default(),
+        };
+        let input = AgentMatchInput {
+            protocol: AgentProtocol::Llm,
+            host: "api.example.com",
+            path: "/v1/chat/completions",
+            method: "post",
+            model: Some("blocked"),
+            tool: None,
+            agent: None,
+            headers: &[],
+        };
+
+        assert!(policy.applies_to(&input));
     }
 }

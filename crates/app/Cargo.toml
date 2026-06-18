@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 dxgate-admin = { path = "../admin" }
+dxgate-controller = { path = "../controller" }
 dxgate-core = { path = "../core" }
 dxgate-proxy = { path = "../proxy" }
 dxgate-xds = { path = "../xds" }

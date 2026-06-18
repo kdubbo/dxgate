@@ -1,5 +1,6 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use dxgate_admin::AdminServer;
+use dxgate_controller::run_controller;
 use dxgate_core::{RouterIdentity, RuntimeConfig, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
 use dxgate_proxy::{ProxyServer, ProxyState};
 use dxgate_xds::{
@@ -9,12 +10,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::time;
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
 #[command(name = "dxgate")]
 #[command(about = "Pure Rust north-south proxy for Dubbo Gateway API traffic")]
 struct Args {
+    #[arg(long, env = "DXGATE_MODE", default_value = "proxy")]
+    mode: DxgateMode,
+
     #[arg(
         long,
         env = "DXGATE_XDS_ADDRESS",
@@ -31,8 +36,14 @@ struct Args {
     #[arg(long, env = "DXGATE_STATIC_CONFIG")]
     static_config: Option<PathBuf>,
 
+    #[arg(long, env = "DXGATE_CONFIG_WATCH", default_value_t = false)]
+    config_watch: bool,
+
     #[arg(long, env = "DXGATE_BOOTSTRAP")]
     bootstrap: Option<PathBuf>,
+
+    #[arg(long, env = "DXGATE_OTEL_ENDPOINT")]
+    otel_endpoint: Option<String>,
 
     #[arg(long, env = "DXGATE_LISTENER_NAMES", value_delimiter = ',')]
     listener_names: Vec<String>,
@@ -56,6 +67,13 @@ struct Args {
     dns_domain: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DxgateMode {
+    Proxy,
+    Controller,
+    All,
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -68,6 +86,10 @@ async fn main() -> std::io::Result<()> {
             .await
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
         apply_bootstrap(&mut args, bootstrap);
+    }
+
+    if let Some(endpoint) = args.otel_endpoint.as_deref() {
+        info!(otel_endpoint = %endpoint, "OpenTelemetry endpoint configured");
     }
 
     let identity = RouterIdentity {
@@ -95,7 +117,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    if let Some(path) = args.static_config {
+    if let Some(path) = args.static_config.clone() {
         let source = StaticConfigFile::new(path);
         match source.load().await {
             Ok(Some(cfg)) => {
@@ -108,23 +130,47 @@ async fn main() -> std::io::Result<()> {
             Ok(None) => {}
             Err(err) => error!(%err, "failed loading static config"),
         }
+        if args.config_watch {
+            let path = args.static_config.clone().unwrap();
+            let config_tx = config_tx.clone();
+            tokio::spawn(async move {
+                watch_static_config(path, config_tx).await;
+            });
+        }
     }
 
-    let xds = XdsClient::new(XdsClientConfig {
-        endpoint: args.xds_address,
-        identity,
-        listener_names: args.listener_names,
-        reconnect_delay: Duration::from_secs(10),
-    });
-    tokio::spawn(async move {
-        if let Err(err) = xds.run(config_tx).await {
-            error!(%err, "xDS client exited");
-        }
-    });
+    if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) {
+        let xds = XdsClient::new(XdsClientConfig {
+            endpoint: args.xds_address,
+            identity,
+            listener_names: args.listener_names,
+            reconnect_delay: Duration::from_secs(10),
+        });
+        let xds_tx = config_tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = xds.run(xds_tx).await {
+                error!(%err, "xDS client exited");
+            }
+        });
+    }
+
+    if matches!(args.mode, DxgateMode::Controller | DxgateMode::All) {
+        let controller_tx = config_tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_controller(controller_tx).await {
+                error!(%err, "Kubernetes controller exited");
+            }
+        });
+    }
+
+    if matches!(args.mode, DxgateMode::Controller) {
+        tokio::signal::ctrl_c().await?;
+        info!("received shutdown signal");
+        return Ok(());
+    }
 
     let proxy = ProxyServer::new(state.clone());
     let admin = AdminServer::new(state);
-
     let proxy_task = tokio::spawn(proxy.serve(args.http_addr));
     let admin_task = tokio::spawn(admin.serve(args.admin_addr));
 
@@ -135,6 +181,37 @@ async fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+async fn watch_static_config(path: PathBuf, config_tx: watch::Sender<RuntimeConfig>) {
+    let mut last = None;
+    loop {
+        match tokio::fs::metadata(&path)
+            .await
+            .and_then(|meta| meta.modified())
+        {
+            Ok(modified) if last.map(|seen| seen != modified).unwrap_or(true) => {
+                last = Some(modified);
+                let source = StaticConfigFile::new(path.clone());
+                match source.load().await {
+                    Ok(Some(cfg)) => {
+                        if let Err(err) = config_tx.send(cfg) {
+                            error!(%err, "static config watcher channel closed");
+                            return;
+                        }
+                        info!(path = %path.display(), "reloaded static config");
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        error!(%err, path = %path.display(), "failed reloading static config")
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) => error!(%err, path = %path.display(), "failed checking static config"),
+        }
+        time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {
@@ -172,18 +249,21 @@ fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bootstrap, Args};
+    use super::{apply_bootstrap, Args, DxgateMode};
     use dxgate_xds::BootstrapConfig;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
     fn base_args() -> Args {
         Args {
+            mode: DxgateMode::Proxy,
             xds_address: "http://old:15012".to_string(),
             http_addr: "0.0.0.0:80".parse().unwrap(),
             admin_addr: "0.0.0.0:15021".parse().unwrap(),
             static_config: None,
+            config_watch: false,
             bootstrap: Some(PathBuf::from("/etc/dxgate/bootstrap.json")),
+            otel_endpoint: None,
             listener_names: Vec::new(),
             pod_name: "dxgate".to_string(),
             namespace: "dubbo-system".to_string(),

@@ -1,7 +1,12 @@
-use dxgate_core::{ConfigConflict, DxgateError, Endpoint, Result, RuntimeConfig, WeightedCluster};
+use dxgate_core::{
+    ConfigConflict, DxgateError, Endpoint, RateLimitPolicy, Result, RuntimeConfig, WeightedBackend,
+    WeightedCluster,
+};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -14,6 +19,8 @@ struct Inner {
     conflicts: RwLock<Vec<ConfigConflict>>,
     ready: AtomicBool,
     picker_counter: AtomicU64,
+    rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
+    metrics: Mutex<MetricsStore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,6 +28,50 @@ pub struct Readiness {
     pub ready: bool,
     pub version: String,
     pub conflicts: Vec<ConfigConflict>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyMetrics {
+    pub total_requests: u64,
+    pub agent_requests: u64,
+    pub policy_denied: u64,
+    pub upstream_failures: u64,
+    pub routes: Vec<RouteMetric>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteMetric {
+    pub protocol: String,
+    pub route: String,
+    pub backend: String,
+    pub requests: u64,
+    pub failures: u64,
+    pub latency_ms_sum: u64,
+}
+
+#[derive(Debug, Default)]
+struct MetricsStore {
+    total_requests: u64,
+    agent_requests: u64,
+    policy_denied: u64,
+    upstream_failures: u64,
+    routes: HashMap<String, RouteMetricCounter>,
+}
+
+#[derive(Debug, Default)]
+struct RouteMetricCounter {
+    protocol: String,
+    route: String,
+    backend: String,
+    requests: u64,
+    failures: u64,
+    latency_ms_sum: u64,
+}
+
+#[derive(Debug)]
+struct RateLimitBucket {
+    window_started: Instant,
+    used: u32,
 }
 
 impl ProxyState {
@@ -31,6 +82,8 @@ impl ProxyState {
                 conflicts: RwLock::new(Vec::new()),
                 ready: AtomicBool::new(false),
                 picker_counter: AtomicU64::new(0),
+                rate_limits: Mutex::new(HashMap::new()),
+                metrics: Mutex::new(MetricsStore::default()),
             }),
         }
     }
@@ -82,6 +135,22 @@ impl ProxyState {
         })
     }
 
+    pub async fn pick_backend<'a>(
+        &self,
+        backends: &'a [WeightedBackend],
+    ) -> Option<&'a WeightedBackend> {
+        let total: u32 = backends.iter().map(|b| b.weight).sum();
+        if total == 0 {
+            return backends.first();
+        }
+        let next = self.inner.picker_counter.fetch_add(1, Ordering::Relaxed) as u32 % total;
+        let mut cursor = 0;
+        backends.iter().find(|backend| {
+            cursor += backend.weight;
+            next < cursor
+        })
+    }
+
     pub async fn pick_endpoint<'a>(
         &self,
         cluster_name: &str,
@@ -94,6 +163,90 @@ impl ProxyState {
         let idx =
             self.inner.picker_counter.fetch_add(1, Ordering::Relaxed) as usize % healthy.len();
         Ok(healthy[idx])
+    }
+
+    pub fn check_rate_limit(&self, key: String, limit: &RateLimitPolicy) -> bool {
+        let mut buckets = self.inner.rate_limits.lock().unwrap();
+        let bucket = buckets.entry(key).or_insert_with(|| RateLimitBucket {
+            window_started: Instant::now(),
+            used: 0,
+        });
+        let window = Duration::from_secs(limit.window_seconds.max(1));
+        if bucket.window_started.elapsed() >= window {
+            bucket.window_started = Instant::now();
+            bucket.used = 0;
+        }
+        if bucket.used >= limit.requests {
+            return false;
+        }
+        bucket.used += 1;
+        true
+    }
+
+    pub fn record_agent_request(
+        &self,
+        protocol: &str,
+        route: &str,
+        backend: &str,
+        status: u16,
+        latency_ms: u64,
+    ) {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        metrics.total_requests += 1;
+        metrics.agent_requests += 1;
+        if status >= 500 {
+            metrics.upstream_failures += 1;
+        }
+        let key = format!("{protocol}|{route}|{backend}");
+        let route_metric = metrics
+            .routes
+            .entry(key)
+            .or_insert_with(|| RouteMetricCounter {
+                protocol: protocol.to_string(),
+                route: route.to_string(),
+                backend: backend.to_string(),
+                ..RouteMetricCounter::default()
+            });
+        route_metric.requests += 1;
+        if status >= 500 {
+            route_metric.failures += 1;
+        }
+        route_metric.latency_ms_sum += latency_ms;
+    }
+
+    pub fn record_policy_denied(&self) {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        metrics.total_requests += 1;
+        metrics.policy_denied += 1;
+    }
+
+    pub fn metrics(&self) -> ProxyMetrics {
+        let metrics = self.inner.metrics.lock().unwrap();
+        let mut routes = metrics
+            .routes
+            .values()
+            .map(|route| RouteMetric {
+                protocol: route.protocol.clone(),
+                route: route.route.clone(),
+                backend: route.backend.clone(),
+                requests: route.requests,
+                failures: route.failures,
+                latency_ms_sum: route.latency_ms_sum,
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by(|a, b| {
+            a.protocol
+                .cmp(&b.protocol)
+                .then_with(|| a.route.cmp(&b.route))
+                .then_with(|| a.backend.cmp(&b.backend))
+        });
+        ProxyMetrics {
+            total_requests: metrics.total_requests,
+            agent_requests: metrics.agent_requests,
+            policy_denied: metrics.policy_denied,
+            upstream_failures: metrics.upstream_failures,
+            routes,
+        }
     }
 }
 
@@ -139,6 +292,10 @@ mod tests {
                 tls: None,
             }],
             secrets: vec![],
+            providers: vec![],
+            backends: vec![],
+            routes: vec![],
+            policies: vec![],
         }
     }
 

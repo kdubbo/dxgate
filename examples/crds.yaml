@@ -1,0 +1,87 @@
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: Dxgate
+metadata:
+  name: default
+  namespace: dubbo-system
+spec:
+  version: agent-crd-example
+  listeners: []
+  clusters: []
+  secrets: []
+  providers:
+    - name: openai
+      kind: open-ai-compatible
+      base_url: https://api.openai.com
+      api_key_env: OPENAI_API_KEY
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgateBackend
+metadata:
+  name: gpt
+  namespace: dubbo-system
+spec:
+  backend:
+    name: gpt
+    type: llm
+    provider: openai
+    models: ["gpt-4o-mini"]
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgateBackend
+metadata:
+  name: search-tools
+  namespace: dubbo-system
+spec:
+  backend:
+    name: search-tools
+    type: mcp
+    endpoint: http://search-tools.default.svc.cluster.local:8080
+    tools: ["search"]
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgateRoute
+metadata:
+  name: chat
+  namespace: dubbo-system
+spec:
+  route:
+    name: chat
+    protocol: llm
+    matches:
+      - path:
+          type: exact
+          value: /v1/chat/completions
+        method: POST
+        model: gpt-4o-mini
+    weighted_backends:
+      - name: gpt
+        weight: 100
+    policies: ["public-agent-policy"]
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgatePolicy
+metadata:
+  name: public-agent-policy
+  namespace: dubbo-system
+spec:
+  policy:
+    name: public-agent-policy
+    action: allow
+    auth:
+      type: api-key
+      header: authorization
+      values: ["Bearer local-dev"]
+    rate_limit:
+      requests: 60
+      window_seconds: 60
+      key: route
+    timeout_ms: 30000
+    retry:
+      attempts: 2
+      statuses: [502, 503, 504]
+    request_headers:
+      add: []
+      remove: []
+    response_headers:
+      add: []
+      remove: []

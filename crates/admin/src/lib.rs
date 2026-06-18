@@ -38,6 +38,8 @@ impl AdminServer {
             .route("/debug/config", get(debug_config))
             .route("/debug/routes", get(debug_routes))
             .route("/debug/clusters", get(debug_clusters))
+            .route("/debug/backends", get(debug_backends))
+            .route("/debug/policies", get(debug_policies))
             .with_state(self);
 
         axum::Server::bind(&addr)
@@ -63,11 +65,44 @@ async fn readyz(State(admin): State<AdminServer>) -> Response {
 
 async fn metrics(State(admin): State<AdminServer>) -> String {
     let readiness = admin.state.readiness().await;
-    format!(
+    let proxy = admin.state.metrics();
+    let mut out = format!(
         "# HELP dxgate_ready Whether dxgate has accepted runtime config\n# TYPE dxgate_ready gauge\ndxgate_ready {}\n# HELP dxgate_config_conflicts Current rejected config conflicts\n# TYPE dxgate_config_conflicts gauge\ndxgate_config_conflicts {}\n",
         if readiness.ready { 1 } else { 0 },
         readiness.conflicts.len()
-    )
+    );
+    out.push_str("# HELP dxgate_requests_total Total requests observed by dxgate\n# TYPE dxgate_requests_total counter\n");
+    out.push_str(&format!("dxgate_requests_total {}\n", proxy.total_requests));
+    out.push_str("# HELP dxgate_agent_requests_total Agent protocol requests observed by dxgate\n# TYPE dxgate_agent_requests_total counter\n");
+    out.push_str(&format!(
+        "dxgate_agent_requests_total {}\n",
+        proxy.agent_requests
+    ));
+    out.push_str("# HELP dxgate_policy_denied_total Requests denied by dxgate policy\n# TYPE dxgate_policy_denied_total counter\n");
+    out.push_str(&format!(
+        "dxgate_policy_denied_total {}\n",
+        proxy.policy_denied
+    ));
+    out.push_str("# HELP dxgate_upstream_failures_total Upstream failures observed by dxgate\n# TYPE dxgate_upstream_failures_total counter\n");
+    out.push_str(&format!(
+        "dxgate_upstream_failures_total {}\n",
+        proxy.upstream_failures
+    ));
+    for route in proxy.routes {
+        out.push_str(&format!(
+            "dxgate_agent_route_requests_total{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
+            route.protocol, route.route, route.backend, route.requests
+        ));
+        out.push_str(&format!(
+            "dxgate_agent_route_failures_total{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
+            route.protocol, route.route, route.backend, route.failures
+        ));
+        out.push_str(&format!(
+            "dxgate_agent_route_latency_ms_sum{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
+            route.protocol, route.route, route.backend, route.latency_ms_sum
+        ));
+    }
+    out
 }
 
 async fn debug_config(State(admin): State<AdminServer>) -> Json<dxgate_core::RuntimeConfig> {
@@ -99,4 +134,18 @@ async fn debug_routes(State(admin): State<AdminServer>) -> Json<serde_json::Valu
 async fn debug_clusters(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
     let cfg = admin.state.config().await;
     Json(serde_json::json!(cfg.clusters))
+}
+
+async fn debug_backends(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
+    let cfg = admin.state.config().await;
+    Json(serde_json::json!({
+        "providers": cfg.providers,
+        "backends": cfg.backends,
+        "routes": cfg.routes,
+    }))
+}
+
+async fn debug_policies(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
+    let cfg = admin.state.config().await;
+    Json(serde_json::json!(cfg.policies))
 }

@@ -375,6 +375,10 @@ impl AdsState {
             listeners,
             clusters,
             secrets: Vec::new(),
+            providers: Vec::new(),
+            backends: Vec::new(),
+            routes: Vec::new(),
+            policies: Vec::new(),
         }
     }
 
