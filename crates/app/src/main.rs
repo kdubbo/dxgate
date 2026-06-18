@@ -27,6 +27,9 @@ struct Args {
     )]
     xds_address: String,
 
+    #[arg(long, env = "DXGATE_XDS_ENABLED")]
+    xds_enabled: Option<bool>,
+
     #[arg(long, env = "DXGATE_HTTP_ADDR", default_value = "0.0.0.0:80")]
     http_addr: SocketAddr,
 
@@ -92,6 +95,7 @@ async fn main() -> std::io::Result<()> {
         info!(otel_endpoint = %endpoint, "OpenTelemetry endpoint configured");
     }
 
+    let run_xds = should_run_xds(&args);
     let identity = RouterIdentity {
         pod_name: args.pod_name,
         namespace: args.namespace,
@@ -139,7 +143,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) {
+    if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) && run_xds {
         let xds = XdsClient::new(XdsClientConfig {
             endpoint: args.xds_address,
             identity,
@@ -152,6 +156,8 @@ async fn main() -> std::io::Result<()> {
                 error!(%err, "xDS client exited");
             }
         });
+    } else if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) {
+        info!("xDS client disabled");
     }
 
     if matches!(args.mode, DxgateMode::Controller | DxgateMode::All) {
@@ -170,7 +176,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let proxy = ProxyServer::new(state.clone());
-    let admin = AdminServer::new(state);
+    let admin = AdminServer::new(state, args.http_addr);
     let proxy_task = tokio::spawn(proxy.serve(args.http_addr));
     let admin_task = tokio::spawn(admin.serve(args.admin_addr));
 
@@ -247,9 +253,14 @@ fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {
     }
 }
 
+fn should_run_xds(args: &Args) -> bool {
+    args.xds_enabled
+        .unwrap_or_else(|| args.static_config.is_none() || !args.listener_names.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_bootstrap, Args, DxgateMode};
+    use super::{apply_bootstrap, should_run_xds, Args, DxgateMode};
     use dxgate_xds::BootstrapConfig;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -258,6 +269,7 @@ mod tests {
         Args {
             mode: DxgateMode::Proxy,
             xds_address: "http://old:15012".to_string(),
+            xds_enabled: None,
             http_addr: "0.0.0.0:80".parse().unwrap(),
             admin_addr: "0.0.0.0:15021".parse().unwrap(),
             static_config: None,
@@ -299,5 +311,26 @@ mod tests {
             args.listener_names,
             ["public-dubbo.app.svc.cluster.local:80"]
         );
+    }
+
+    #[test]
+    fn static_only_run_disables_xds_by_default() {
+        let mut args = base_args();
+        args.static_config = Some(PathBuf::from("examples/agent-runtime.yaml"));
+
+        assert!(!should_run_xds(&args));
+
+        args.xds_enabled = Some(true);
+        assert!(should_run_xds(&args));
+    }
+
+    #[test]
+    fn xds_runs_by_default_without_static_config_or_with_listener_names() {
+        let mut args = base_args();
+        assert!(should_run_xds(&args));
+
+        args.static_config = Some(PathBuf::from("examples/agent-runtime.yaml"));
+        args.listener_names = vec!["public.example:80".to_string()];
+        assert!(should_run_xds(&args));
     }
 }
