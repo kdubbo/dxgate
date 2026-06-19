@@ -17,6 +17,7 @@ use hyper::client::HttpConnector;
 use hyper::Client;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use opentelemetry::propagation::Injector;
 use rustls::client::{ServerCertVerified, ServerCertVerifier, WebPkiVerifier};
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
 use serde::Deserialize;
@@ -30,11 +31,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 type PlainClient = Client<HttpConnector, Body>;
 type WebClient = Client<HttpsConnector<HttpConnector>, Body>;
 type MtlsClient = Client<HttpsConnector<HttpConnector>, Body>;
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 #[derive(Clone)]
 pub struct ProxyServer {
@@ -62,9 +65,22 @@ impl ProxyServer {
 }
 
 async fn proxy_request(State(server): State<ProxyServer>, req: Request<Body>) -> Response<Body> {
-    match forward(server, req).await {
-        Ok(resp) => resp,
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let span = tracing::info_span!(
+        "dxgate.request",
+        http.method = %method,
+        http.target = %path,
+        http.status_code = tracing::field::Empty
+    );
+    let result = forward(server, req).instrument(span.clone()).await;
+    match result {
+        Ok(resp) => {
+            span.record("http.status_code", resp.status().as_u16());
+            resp
+        }
         Err((status, message)) => {
+            span.record("http.status_code", status.as_u16());
             warn!(status = status.as_u16(), %message, "request failed");
             Response::builder()
                 .status(status)
@@ -172,6 +188,7 @@ async fn forward_http(
 
     *req.uri_mut() = upstream_uri;
     req.headers_mut().remove(http::header::HOST);
+    inject_trace_context(req.headers_mut());
 
     if let Some(tls) = tls {
         return server.clients.request_mtls(&cluster, tls, req).await;
@@ -210,12 +227,16 @@ async fn forward_agent(
         ));
     }
 
-    let primary = server
-        .state
-        .pick_backend(&eligible)
-        .await
-        .cloned()
-        .unwrap_or_else(|| eligible[0].clone());
+    let primary = if let Some(bound) = mcp_session_backend(&server, &context, &eligible) {
+        bound
+    } else {
+        server
+            .state
+            .pick_backend(&eligible)
+            .await
+            .cloned()
+            .unwrap_or_else(|| eligible[0].clone())
+    };
     let mut ordered = vec![primary.clone()];
     ordered.extend(eligible.into_iter().filter(|b| b.name != primary.name));
 
@@ -281,11 +302,21 @@ async fn request_agent_with_failover(
                 continue;
             };
             let started = Instant::now();
+            let upstream_span = tracing::info_span!(
+                "dxgate.agent.upstream",
+                protocol = protocol_name(context.protocol),
+                route = %route.name,
+                backend = %backend.name,
+                http.status_code = tracing::field::Empty
+            );
             match request_agent_backend(server, cfg, backend, parts, body, context, policy_runtime)
+                .instrument(upstream_span.clone())
                 .await
             {
                 Ok(mut response) => {
                     let status = response.status();
+                    upstream_span.record("http.status_code", status.as_u16());
+                    update_mcp_session(&server.state, backend, context, response.headers(), status);
                     server.state.record_agent_request(
                         protocol_name(context.protocol),
                         &route.name,
@@ -297,6 +328,7 @@ async fn request_agent_with_failover(
                         response.headers_mut(),
                         &policy_runtime.response_headers,
                     );
+                    apply_mcp_stream_headers(response.headers_mut(), context);
                     if attempt + 1 < attempts && retry.statuses.contains(&status.as_u16()) {
                         last_error = Some((
                             status,
@@ -307,6 +339,7 @@ async fn request_agent_with_failover(
                     return Ok(response);
                 }
                 Err(err) => {
+                    upstream_span.record("http.status_code", err.0.as_u16());
                     server.state.record_agent_request(
                         protocol_name(context.protocol),
                         &route.name,
@@ -349,6 +382,7 @@ async fn request_agent_backend(
     apply_request_headers(&mut headers, &policy_runtime.request_headers);
     apply_provider_headers(&mut headers, provider);
     headers.remove(http::header::HOST);
+    inject_trace_context(&mut headers);
 
     let mut builder = Request::builder()
         .method(parts.method.clone())
@@ -393,11 +427,20 @@ async fn federate_mcp_tools(
             continue;
         };
         let started = Instant::now();
+        let upstream_span = tracing::info_span!(
+            "dxgate.agent.upstream",
+            protocol = protocol_name(context.protocol),
+            route = %route.name,
+            backend = %backend.name,
+            http.status_code = tracing::field::Empty
+        );
         match request_agent_backend(server, cfg, backend, parts, body, context, policy_runtime)
+            .instrument(upstream_span.clone())
             .await
         {
             Ok(response) => {
                 let status = response.status();
+                upstream_span.record("http.status_code", status.as_u16());
                 let bytes = body::to_bytes(response.into_body()).await.map_err(|e| {
                     (
                         StatusCode::BAD_GATEWAY,
@@ -439,6 +482,7 @@ async fn federate_mcp_tools(
                 }
             }
             Err(err) => {
+                upstream_span.record("http.status_code", err.0.as_u16());
                 server.state.record_agent_request(
                     protocol_name(context.protocol),
                     &route.name,
@@ -504,6 +548,8 @@ struct AgentRequestContext {
     tool: Option<String>,
     agent: Option<String>,
     mcp_method: Option<String>,
+    mcp_session_id: Option<String>,
+    mcp_stream: bool,
     headers: Vec<(String, String)>,
 }
 
@@ -554,6 +600,18 @@ impl AgentRequestContext {
             .path_and_query()
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| path.clone());
+        let mcp_session_id = if protocol == AgentProtocol::Mcp {
+            parts
+                .headers
+                .get(MCP_SESSION_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let mcp_stream = protocol == AgentProtocol::Mcp
+            && (parts.method == Method::GET
+                || header_contains(&parts.headers, http::header::ACCEPT, "text/event-stream"));
 
         Self {
             protocol,
@@ -565,6 +623,8 @@ impl AgentRequestContext {
             tool,
             agent,
             mcp_method,
+            mcp_session_id,
+            mcp_stream,
             headers: header_pairs(&parts.headers),
         }
     }
@@ -581,6 +641,67 @@ impl AgentRequestContext {
             headers: &self.headers,
         }
     }
+}
+
+fn mcp_session_backend(
+    server: &ProxyServer,
+    context: &AgentRequestContext,
+    eligible: &[WeightedBackend],
+) -> Option<WeightedBackend> {
+    if context.protocol != AgentProtocol::Mcp {
+        return None;
+    }
+    let backend_name = context
+        .mcp_session_id
+        .as_deref()
+        .and_then(|session_id| server.state.mcp_session_backend(session_id))?;
+    eligible
+        .iter()
+        .find(|weighted| weighted.name == backend_name)
+        .cloned()
+}
+
+fn update_mcp_session(
+    state: &ProxyState,
+    backend: &Backend,
+    context: &AgentRequestContext,
+    headers: &HeaderMap,
+    status: StatusCode,
+) {
+    if context.protocol != AgentProtocol::Mcp || !status.is_success() {
+        return;
+    }
+    if let Some(session_id) = headers
+        .get(MCP_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        state.bind_mcp_session(session_id, backend.name.clone());
+    } else if context.method == Method::DELETE {
+        if let Some(session_id) = &context.mcp_session_id {
+            state.remove_mcp_session(session_id);
+        }
+    }
+}
+
+fn apply_mcp_stream_headers(headers: &mut HeaderMap, context: &AgentRequestContext) {
+    if !context.mcp_stream {
+        return;
+    }
+    headers
+        .entry(http::header::CACHE_CONTROL)
+        .or_insert_with(|| HttpHeaderValue::from_static("no-cache, no-transform"));
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HttpHeaderValue::from_static("no"),
+    );
+}
+
+fn header_contains(headers: &HeaderMap, name: HeaderName, needle: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains(needle))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -902,6 +1023,27 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect()
+}
+
+fn inject_trace_context(headers: &mut HeaderMap) {
+    let context = tracing::Span::current().context();
+    let mut injector = HeaderInjector(headers);
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut injector)
+    });
+}
+
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(key),
+            HttpHeaderValue::from_str(value.as_str()),
+        ) {
+            self.0.insert(name, value);
+        }
+    }
 }
 
 #[derive(Clone)]

@@ -1,6 +1,6 @@
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode, Uri};
-use axum::routing::{any, post};
+use axum::http::{HeaderMap, Request, Response, StatusCode, Uri};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use dxgate_core::{
     AgentProtocol, AgentRoute, AgentRouteMatch, AuthPolicy, Backend, BackendKind, HeaderTransform,
@@ -135,6 +135,86 @@ async fn mcp_tools_list_federates_multiple_backends() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(names, ["search", "calendar"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_sse_session_binds_followup_requests_to_same_backend() {
+    let first = spawn_mcp_session_backend("mcp-a", "session-a").await;
+    let second = spawn_mcp_session_backend("mcp-b", "session-b").await;
+    let proxy = spawn_proxy(agent_config(
+        vec![
+            mcp_backend("mcp-a", first.addr),
+            mcp_backend("mcp-b", second.addr),
+        ],
+        vec![AgentRoute {
+            name: "mcp-stream".into(),
+            protocol: AgentProtocol::Mcp,
+            matches: vec![AgentRouteMatch {
+                path: PathMatch::Exact("/mcp".into()),
+                host: None,
+                method: None,
+                model: None,
+                tool: None,
+                agent: None,
+                headers: vec![],
+            }],
+            weighted_backends: vec![
+                WeightedBackend {
+                    name: "mcp-a".into(),
+                    weight: 100,
+                },
+                WeightedBackend {
+                    name: "mcp-b".into(),
+                    weight: 100,
+                },
+            ],
+            policies: vec![],
+        }],
+        vec![],
+    ))
+    .await;
+
+    let stream = request_text(
+        Request::builder()
+            .method("GET")
+            .uri(format!("http://{}/mcp", proxy.addr))
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(stream.0, StatusCode::OK);
+    assert_eq!(
+        stream
+            .2
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("session-a")
+    );
+    assert_eq!(
+        stream
+            .2
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache, no-transform")
+    );
+    assert!(stream.1.contains("event: message"));
+
+    let followup = post_json_with_headers(
+        proxy.addr,
+        "/mcp",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "search" }
+        }),
+        &[("mcp-session-id", "session-a")],
+    )
+    .await;
+
+    assert_eq!(followup.0, StatusCode::OK);
+    assert_eq!(followup.1["backend"], "mcp-a");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -278,6 +358,37 @@ async fn spawn_mcp_backend(tool_name: &'static str) -> TestServer {
     server
 }
 
+async fn spawn_mcp_session_backend(
+    backend_name: &'static str,
+    session_id: &'static str,
+) -> TestServer {
+    let addr = unused_addr();
+    let app = Router::new().route(
+        "/mcp",
+        get(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("mcp-session-id", session_id)
+                .body(Body::from(format!(
+                    "event: message\ndata: {{\"backend\":\"{backend_name}\"}}\n\n"
+                )))
+                .unwrap()
+        })
+        .post(move || async move {
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "backend": backend_name,
+                "result": { "ok": true }
+            }))
+        }),
+    );
+    let server = spawn_app(addr, app);
+    wait_until_serving(server.addr).await;
+    server
+}
+
 async fn spawn_a2a_backend() -> TestServer {
     let addr = unused_addr();
     let app = Router::new().route(
@@ -382,6 +493,32 @@ async fn post_json(
     }
     let request = builder.body(Body::from(value.to_string())).unwrap();
     read_json(Client::new().request(request).await.unwrap()).await
+}
+
+async fn post_json_with_headers(
+    addr: SocketAddr,
+    path: &str,
+    value: Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let uri: Uri = format!("http://{addr}{path}").parse().unwrap();
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::from(value.to_string())).unwrap();
+    read_json(Client::new().request(request).await.unwrap()).await
+}
+
+async fn request_text(request: Request<Body>) -> (StatusCode, String, HeaderMap) {
+    let response = Client::new().request(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = body::to_bytes(response.into_body()).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap(), headers)
 }
 
 async fn get_json(addr: SocketAddr, path: &str) -> (StatusCode, Value) {

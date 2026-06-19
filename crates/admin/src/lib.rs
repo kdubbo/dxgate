@@ -118,6 +118,16 @@ async fn metrics(State(admin): State<AdminServer>) -> String {
             "dxgate_agent_route_latency_ms_sum{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
             route.protocol, route.route, route.backend, route.latency_ms_sum
         ));
+        for bucket in &route.latency_ms_buckets {
+            out.push_str(&format!(
+                "dxgate_agent_route_latency_ms_bucket{{protocol=\"{}\",route=\"{}\",backend=\"{}\",le=\"{}\"}} {}\n",
+                route.protocol, route.route, route.backend, bucket.le, bucket.count
+            ));
+        }
+        out.push_str(&format!(
+            "dxgate_agent_route_latency_ms_bucket{{protocol=\"{}\",route=\"{}\",backend=\"{}\",le=\"+Inf\"}} {}\n",
+            route.protocol, route.route, route.backend, route.requests
+        ));
     }
     out
 }

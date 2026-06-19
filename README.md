@@ -2,8 +2,10 @@
   <img src="./logo/dxgate-logo.svg" alt="dxgate logo" width="260">
 </p>
 
-![license](https://img.shields.io/badge/license-Apache--2.0-green.svg)
-![Rust: 1.76+](https://img.shields.io/badge/Rust-1.76%2B-orange.svg?style=flat)
+<p align="center">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="license">
+  <img src="https://img.shields.io/badge/Rust-1.76%2B-orange.svg?style=flat" alt="Rust: 1.76+">
+</p>
 
 dxgate is the delegated gateway for Dubbo Gateway API traffic. It serves as dubbod external data-plane proxy and consumes control-plane configuration as a router xDS client.
 
@@ -19,3 +21,13 @@ cargo run --bin dxgate -- \
 ```
 
 When `--static-config` is used without listener names, dxgate does not start the xDS client by default. Set `--xds-enabled true` or `DXGATE_XDS_ENABLED=true` to run static config and xDS together.
+
+Kubernetes controller mode:
+
+```bash
+cargo run --bin dxgate -- --print-crds | kubectl apply -f -
+kubectl apply -f examples/rbac.yaml
+kubectl apply -f examples/dxgate.yaml
+kubectl apply -f examples/crds.yaml
+DXGATE_MODE=all DXGATE_OTEL_ENDPOINT=http://otel-collector:4317 cargo run --bin dxgate
+```

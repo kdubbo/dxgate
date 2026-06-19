@@ -1,17 +1,23 @@
 use clap::{Parser, ValueEnum};
 use dxgate_admin::AdminServer;
-use dxgate_controller::run_controller;
+use dxgate_controller::{crds, run_controller};
 use dxgate_core::{RouterIdentity, RuntimeConfig, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
 use dxgate_proxy::{ProxyServer, ProxyState};
 use dxgate_xds::{
     BootstrapConfig, RuntimeConfigSource, StaticConfigFile, XdsClient, XdsClientConfig,
 };
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::Resource;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time;
 use tracing::{error, info};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Debug, Parser)]
 #[command(name = "dxgate")]
@@ -48,6 +54,9 @@ struct Args {
     #[arg(long, env = "DXGATE_OTEL_ENDPOINT")]
     otel_endpoint: Option<String>,
 
+    #[arg(long)]
+    print_crds: bool,
+
     #[arg(long, env = "DXGATE_LISTENER_NAMES", value_delimiter = ',')]
     listener_names: Vec<String>,
 
@@ -79,21 +88,18 @@ enum DxgateMode {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let mut args = Args::parse();
+    if args.print_crds {
+        print_crds()?;
+        return Ok(());
+    }
     if let Some(path) = args.bootstrap.clone() {
         let bootstrap = BootstrapConfig::load(path)
             .await
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
         apply_bootstrap(&mut args, bootstrap);
     }
-
-    if let Some(endpoint) = args.otel_endpoint.as_deref() {
-        info!(otel_endpoint = %endpoint, "OpenTelemetry endpoint configured");
-    }
+    let otel_enabled = init_tracing(args.otel_endpoint.as_deref())?;
 
     let run_xds = should_run_xds(&args);
     let identity = RouterIdentity {
@@ -186,7 +192,56 @@ async fn main() -> std::io::Result<()> {
         _ = tokio::signal::ctrl_c() => info!("received shutdown signal"),
     }
 
+    if otel_enabled {
+        opentelemetry::global::shutdown_tracer_provider();
+    }
+
     Ok(())
+}
+
+fn print_crds() -> std::io::Result<()> {
+    for (idx, crd) in crds().into_iter().enumerate() {
+        if idx > 0 {
+            println!("---");
+        }
+        let yaml = serde_yaml::to_string(&crd)
+            .map_err(|err| std::io::Error::other(format!("serialize CRD: {err}")))?;
+        print!("{yaml}");
+    }
+    Ok(())
+}
+
+fn init_tracing(otel_endpoint: Option<&str>) -> std::io::Result<bool> {
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+    let fmt_layer = tracing_subscriber::fmt::layer();
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    if let Some(endpoint) = otel_endpoint {
+        let tracer = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    .with_endpoint(endpoint.to_string()),
+            )
+            .with_trace_config(
+                opentelemetry_sdk::trace::config()
+                    .with_resource(Resource::new(vec![KeyValue::new("service.name", "dxgate")])),
+            )
+            .install_batch(opentelemetry_sdk::runtime::Tokio)
+            .map_err(|err| std::io::Error::other(format!("initialize OTEL tracing: {err}")))?;
+        registry
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .init();
+        info!(otel_endpoint = %endpoint, "OpenTelemetry tracing enabled");
+        Ok(true)
+    } else {
+        registry.init();
+        Ok(false)
+    }
 }
 
 async fn watch_static_config(path: PathBuf, config_tx: watch::Sender<RuntimeConfig>) {
@@ -276,6 +331,7 @@ mod tests {
             config_watch: false,
             bootstrap: Some(PathBuf::from("/etc/dxgate/bootstrap.json")),
             otel_endpoint: None,
+            print_crds: false,
             listener_names: Vec::new(),
             pod_name: "dxgate".to_string(),
             namespace: "dubbo-system".to_string(),

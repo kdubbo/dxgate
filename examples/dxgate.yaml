@@ -51,7 +51,7 @@ metadata:
   namespace: dubbo-system
   labels:
     app.kubernetes.io/name: dxgate
-automountServiceAccountToken: false
+automountServiceAccountToken: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -76,6 +76,8 @@ spec:
           image: kdubbo/dxgate:latest
           imagePullPolicy: IfNotPresent
           env:
+            - name: DXGATE_MODE
+              value: all
             - name: DXGATE_BOOTSTRAP
               value: /etc/dxgate/bootstrap.json
             - name: DXGATE_STATIC_CONFIG

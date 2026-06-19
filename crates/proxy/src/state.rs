@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+const LATENCY_BUCKETS_MS: [u64; 7] = [5, 10, 25, 50, 100, 250, 1000];
+
 #[derive(Clone)]
 pub struct ProxyState {
     inner: Arc<Inner>,
@@ -20,6 +22,7 @@ struct Inner {
     ready: AtomicBool,
     picker_counter: AtomicU64,
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
+    mcp_sessions: Mutex<HashMap<String, String>>,
     metrics: Mutex<MetricsStore>,
 }
 
@@ -47,6 +50,13 @@ pub struct RouteMetric {
     pub requests: u64,
     pub failures: u64,
     pub latency_ms_sum: u64,
+    pub latency_ms_buckets: Vec<LatencyBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencyBucket {
+    pub le: u64,
+    pub count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +76,7 @@ struct RouteMetricCounter {
     requests: u64,
     failures: u64,
     latency_ms_sum: u64,
+    latency_ms_buckets: [u64; LATENCY_BUCKETS_MS.len()],
 }
 
 #[derive(Debug)]
@@ -83,6 +94,7 @@ impl ProxyState {
                 ready: AtomicBool::new(false),
                 picker_counter: AtomicU64::new(0),
                 rate_limits: Mutex::new(HashMap::new()),
+                mcp_sessions: Mutex::new(HashMap::new()),
                 metrics: Mutex::new(MetricsStore::default()),
             }),
         }
@@ -212,12 +224,38 @@ impl ProxyState {
             route_metric.failures += 1;
         }
         route_metric.latency_ms_sum += latency_ms;
+        for (idx, bucket) in LATENCY_BUCKETS_MS.iter().enumerate() {
+            if latency_ms <= *bucket {
+                route_metric.latency_ms_buckets[idx] += 1;
+            }
+        }
     }
 
     pub fn record_policy_denied(&self) {
         let mut metrics = self.inner.metrics.lock().unwrap();
         metrics.total_requests += 1;
         metrics.policy_denied += 1;
+    }
+
+    pub fn bind_mcp_session(&self, session_id: impl Into<String>, backend: impl Into<String>) {
+        self.inner
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.into(), backend.into());
+    }
+
+    pub fn mcp_session_backend(&self, session_id: &str) -> Option<String> {
+        self.inner
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+    }
+
+    pub fn remove_mcp_session(&self, session_id: &str) {
+        self.inner.mcp_sessions.lock().unwrap().remove(session_id);
     }
 
     pub fn metrics(&self) -> ProxyMetrics {
@@ -232,6 +270,14 @@ impl ProxyState {
                 requests: route.requests,
                 failures: route.failures,
                 latency_ms_sum: route.latency_ms_sum,
+                latency_ms_buckets: LATENCY_BUCKETS_MS
+                    .iter()
+                    .zip(route.latency_ms_buckets.iter())
+                    .map(|(le, count)| LatencyBucket {
+                        le: *le,
+                        count: *count,
+                    })
+                    .collect(),
             })
             .collect::<Vec<_>>();
         routes.sort_by(|a, b| {
