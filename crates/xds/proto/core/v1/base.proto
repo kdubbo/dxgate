@@ -29,6 +29,14 @@ message TransportSocket {
   }
 }
 
+message DataSource {
+  oneof specifier {
+    string filename = 1;
+    bytes inline_bytes = 2;
+    string inline_string = 3;
+  }
+}
+
 message ControlPlane {
   string identifier = 1;
 }

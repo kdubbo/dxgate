@@ -2,12 +2,27 @@ syntax = "proto3";
 
 package extensions.transport_sockets.tls.v1;
 
+import "core/v1/base.proto";
 import "google/protobuf/wrappers.proto";
 
 option go_package = "github.com/kdubbo/xds-api/extensions/transport_sockets/tls/v1;tlsv1";
 
 message CertificateValidationContext {
   repeated string match_subject_alt_names = 1;
+  core.v1.DataSource trusted_ca = 3;
+}
+
+message TlsCertificate {
+  core.v1.DataSource certificate_chain = 1;
+  core.v1.DataSource private_key = 2;
+}
+
+message Secret {
+  string name = 1;
+  oneof type {
+    TlsCertificate tls_certificate = 2;
+    CertificateValidationContext validation_context = 3;
+  }
 }
 
 message UpstreamTlsContext {

@@ -247,6 +247,104 @@ type TransportSocket_TypedConfig struct {
 
 func (*TransportSocket_TypedConfig) isTransportSocket_ConfigType() {}
 
+type DataSource struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Specifier:
+	//
+	//	*DataSource_Filename
+	//	*DataSource_InlineBytes
+	//	*DataSource_InlineString
+	Specifier     isDataSource_Specifier `protobuf_oneof:"specifier"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DataSource) Reset() {
+	*x = DataSource{}
+	mi := &file_core_v1_base_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DataSource) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DataSource) ProtoMessage() {}
+
+func (x *DataSource) ProtoReflect() protoreflect.Message {
+	mi := &file_core_v1_base_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DataSource.ProtoReflect.Descriptor instead.
+func (*DataSource) Descriptor() ([]byte, []int) {
+	return file_core_v1_base_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *DataSource) GetSpecifier() isDataSource_Specifier {
+	if x != nil {
+		return x.Specifier
+	}
+	return nil
+}
+
+func (x *DataSource) GetFilename() string {
+	if x != nil {
+		if x, ok := x.Specifier.(*DataSource_Filename); ok {
+			return x.Filename
+		}
+	}
+	return ""
+}
+
+func (x *DataSource) GetInlineBytes() []byte {
+	if x != nil {
+		if x, ok := x.Specifier.(*DataSource_InlineBytes); ok {
+			return x.InlineBytes
+		}
+	}
+	return nil
+}
+
+func (x *DataSource) GetInlineString() string {
+	if x != nil {
+		if x, ok := x.Specifier.(*DataSource_InlineString); ok {
+			return x.InlineString
+		}
+	}
+	return ""
+}
+
+type isDataSource_Specifier interface {
+	isDataSource_Specifier()
+}
+
+type DataSource_Filename struct {
+	Filename string `protobuf:"bytes,1,opt,name=filename,proto3,oneof"`
+}
+
+type DataSource_InlineBytes struct {
+	InlineBytes []byte `protobuf:"bytes,2,opt,name=inline_bytes,json=inlineBytes,proto3,oneof"`
+}
+
+type DataSource_InlineString struct {
+	InlineString string `protobuf:"bytes,3,opt,name=inline_string,json=inlineString,proto3,oneof"`
+}
+
+func (*DataSource_Filename) isDataSource_Specifier() {}
+
+func (*DataSource_InlineBytes) isDataSource_Specifier() {}
+
+func (*DataSource_InlineString) isDataSource_Specifier() {}
+
 type ControlPlane struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Identifier    string                 `protobuf:"bytes,1,opt,name=identifier,proto3" json:"identifier,omitempty"`
@@ -256,7 +354,7 @@ type ControlPlane struct {
 
 func (x *ControlPlane) Reset() {
 	*x = ControlPlane{}
-	mi := &file_core_v1_base_proto_msgTypes[4]
+	mi := &file_core_v1_base_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -268,7 +366,7 @@ func (x *ControlPlane) String() string {
 func (*ControlPlane) ProtoMessage() {}
 
 func (x *ControlPlane) ProtoReflect() protoreflect.Message {
-	mi := &file_core_v1_base_proto_msgTypes[4]
+	mi := &file_core_v1_base_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -281,7 +379,7 @@ func (x *ControlPlane) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlPlane.ProtoReflect.Descriptor instead.
 func (*ControlPlane) Descriptor() ([]byte, []int) {
-	return file_core_v1_base_proto_rawDescGZIP(), []int{4}
+	return file_core_v1_base_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ControlPlane) GetIdentifier() string {
@@ -311,7 +409,13 @@ const file_core_v1_base_proto_rawDesc = "" +
 	"\x0fTransportSocket\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x129\n" +
 	"\ftyped_config\x18\x03 \x01(\v2\x14.google.protobuf.AnyH\x00R\vtypedConfigB\r\n" +
-	"\vconfig_type\".\n" +
+	"\vconfig_type\"\x83\x01\n" +
+	"\n" +
+	"DataSource\x12\x1c\n" +
+	"\bfilename\x18\x01 \x01(\tH\x00R\bfilename\x12#\n" +
+	"\finline_bytes\x18\x02 \x01(\fH\x00R\vinlineBytes\x12%\n" +
+	"\rinline_string\x18\x03 \x01(\tH\x00R\finlineStringB\v\n" +
+	"\tspecifier\".\n" +
 	"\fControlPlane\x12\x1e\n" +
 	"\n" +
 	"identifier\x18\x01 \x01(\tR\n" +
@@ -329,23 +433,24 @@ func file_core_v1_base_proto_rawDescGZIP() []byte {
 	return file_core_v1_base_proto_rawDescData
 }
 
-var file_core_v1_base_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_core_v1_base_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_core_v1_base_proto_goTypes = []any{
 	(*Metadata)(nil),        // 0: core.v1.Metadata
 	(*Locality)(nil),        // 1: core.v1.Locality
 	(*Node)(nil),            // 2: core.v1.Node
 	(*TransportSocket)(nil), // 3: core.v1.TransportSocket
-	(*ControlPlane)(nil),    // 4: core.v1.ControlPlane
-	nil,                     // 5: core.v1.Metadata.FilterMetadataEntry
-	(*structpb.Struct)(nil), // 6: google.protobuf.Struct
-	(*anypb.Any)(nil),       // 7: google.protobuf.Any
+	(*DataSource)(nil),      // 4: core.v1.DataSource
+	(*ControlPlane)(nil),    // 5: core.v1.ControlPlane
+	nil,                     // 6: core.v1.Metadata.FilterMetadataEntry
+	(*structpb.Struct)(nil), // 7: google.protobuf.Struct
+	(*anypb.Any)(nil),       // 8: google.protobuf.Any
 }
 var file_core_v1_base_proto_depIdxs = []int32{
-	5, // 0: core.v1.Metadata.filter_metadata:type_name -> core.v1.Metadata.FilterMetadataEntry
-	6, // 1: core.v1.Node.metadata:type_name -> google.protobuf.Struct
+	6, // 0: core.v1.Metadata.filter_metadata:type_name -> core.v1.Metadata.FilterMetadataEntry
+	7, // 1: core.v1.Node.metadata:type_name -> google.protobuf.Struct
 	1, // 2: core.v1.Node.locality:type_name -> core.v1.Locality
-	7, // 3: core.v1.TransportSocket.typed_config:type_name -> google.protobuf.Any
-	6, // 4: core.v1.Metadata.FilterMetadataEntry.value:type_name -> google.protobuf.Struct
+	8, // 3: core.v1.TransportSocket.typed_config:type_name -> google.protobuf.Any
+	7, // 4: core.v1.Metadata.FilterMetadataEntry.value:type_name -> google.protobuf.Struct
 	5, // [5:5] is the sub-list for method output_type
 	5, // [5:5] is the sub-list for method input_type
 	5, // [5:5] is the sub-list for extension type_name
@@ -361,13 +466,18 @@ func file_core_v1_base_proto_init() {
 	file_core_v1_base_proto_msgTypes[3].OneofWrappers = []any{
 		(*TransportSocket_TypedConfig)(nil),
 	}
+	file_core_v1_base_proto_msgTypes[4].OneofWrappers = []any{
+		(*DataSource_Filename)(nil),
+		(*DataSource_InlineBytes)(nil),
+		(*DataSource_InlineString)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_core_v1_base_proto_rawDesc), len(file_core_v1_base_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
