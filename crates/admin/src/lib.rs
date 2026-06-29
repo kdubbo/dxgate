@@ -105,15 +105,57 @@ async fn metrics(State(admin): State<AdminServer>) -> String {
         "dxgate_upstream_failures_total {}\n",
         proxy.upstream_failures
     ));
-    for route in proxy.routes {
+    out.push_str("# HELP dxgate_http_route_requests_total HTTP gateway requests observed by route and cluster\n# TYPE dxgate_http_route_requests_total counter\n");
+    for route in &proxy.http_routes {
+        out.push_str(&format!(
+            "dxgate_http_route_requests_total{{route=\"{}\",cluster=\"{}\"}} {}\n",
+            route.route, route.cluster, route.requests
+        ));
+    }
+    out.push_str("# HELP dxgate_http_route_failures_total HTTP gateway upstream failures observed by route and cluster\n# TYPE dxgate_http_route_failures_total counter\n");
+    for route in &proxy.http_routes {
+        out.push_str(&format!(
+            "dxgate_http_route_failures_total{{route=\"{}\",cluster=\"{}\"}} {}\n",
+            route.route, route.cluster, route.failures
+        ));
+    }
+    out.push_str("# HELP dxgate_http_route_latency_ms HTTP gateway upstream latency in milliseconds\n# TYPE dxgate_http_route_latency_ms histogram\n");
+    for route in &proxy.http_routes {
+        out.push_str(&format!(
+            "dxgate_http_route_latency_ms_sum{{route=\"{}\",cluster=\"{}\"}} {}\n",
+            route.route, route.cluster, route.latency_ms_sum
+        ));
+        for bucket in &route.latency_ms_buckets {
+            out.push_str(&format!(
+                "dxgate_http_route_latency_ms_bucket{{route=\"{}\",cluster=\"{}\",le=\"{}\"}} {}\n",
+                route.route, route.cluster, bucket.le, bucket.count
+            ));
+        }
+        out.push_str(&format!(
+            "dxgate_http_route_latency_ms_bucket{{route=\"{}\",cluster=\"{}\",le=\"+Inf\"}} {}\n",
+            route.route, route.cluster, route.requests
+        ));
+        out.push_str(&format!(
+            "dxgate_http_route_latency_ms_count{{route=\"{}\",cluster=\"{}\"}} {}\n",
+            route.route, route.cluster, route.requests
+        ));
+    }
+    out.push_str("# HELP dxgate_agent_route_requests_total Agent protocol requests observed by route and backend\n# TYPE dxgate_agent_route_requests_total counter\n");
+    for route in &proxy.routes {
         out.push_str(&format!(
             "dxgate_agent_route_requests_total{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
             route.protocol, route.route, route.backend, route.requests
         ));
+    }
+    out.push_str("# HELP dxgate_agent_route_failures_total Agent protocol upstream failures observed by route and backend\n# TYPE dxgate_agent_route_failures_total counter\n");
+    for route in &proxy.routes {
         out.push_str(&format!(
             "dxgate_agent_route_failures_total{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
             route.protocol, route.route, route.backend, route.failures
         ));
+    }
+    out.push_str("# HELP dxgate_agent_route_latency_ms Agent protocol upstream latency in milliseconds\n# TYPE dxgate_agent_route_latency_ms histogram\n");
+    for route in &proxy.routes {
         out.push_str(&format!(
             "dxgate_agent_route_latency_ms_sum{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
             route.protocol, route.route, route.backend, route.latency_ms_sum
@@ -126,6 +168,10 @@ async fn metrics(State(admin): State<AdminServer>) -> String {
         }
         out.push_str(&format!(
             "dxgate_agent_route_latency_ms_bucket{{protocol=\"{}\",route=\"{}\",backend=\"{}\",le=\"+Inf\"}} {}\n",
+            route.protocol, route.route, route.backend, route.requests
+        ));
+        out.push_str(&format!(
+            "dxgate_agent_route_latency_ms_count{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
             route.protocol, route.route, route.backend, route.requests
         ));
     }
@@ -478,11 +524,17 @@ const ADMIN_HTML: &str = r#"<!doctype html>
     }
 
     function routeMetrics() {
-      return state.metrics.split('\n').filter((row) => row.startsWith('dxgate_agent_route_requests_total')).map((row) => {
+      const agent = state.metrics.split('\n').filter((row) => row.startsWith('dxgate_agent_route_requests_total')).map((row) => {
         const labels = Object.fromEntries([...row.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
         const value = row.trim().split(/\s+/).pop();
         return { ...labels, requests: value };
       });
+      const http = state.metrics.split('\n').filter((row) => row.startsWith('dxgate_http_route_requests_total')).map((row) => {
+        const labels = Object.fromEntries([...row.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
+        const value = row.trim().split(/\s+/).pop();
+        return { protocol: 'http', route: labels.route, backend: labels.cluster, requests: value };
+      });
+      return http.concat(agent);
     }
 
     function table(id, columns, rows) {
@@ -536,7 +588,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       table('traffic-table', [
         { label: 'Protocol', value: (r) => tags([r.protocol], r.protocol) },
         { label: 'Route', value: (r) => esc(r.route) },
-        { label: 'Backend', value: (r) => esc(r.backend) },
+        { label: 'Backend/cluster', value: (r) => esc(r.backend) },
         { label: 'Requests', value: (r) => esc(r.requests) }
       ], routeMetrics());
       table('routes-table', [

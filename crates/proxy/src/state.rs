@@ -40,7 +40,18 @@ pub struct ProxyMetrics {
     pub agent_requests: u64,
     pub policy_denied: u64,
     pub upstream_failures: u64,
+    pub http_routes: Vec<HttpRouteMetric>,
     pub routes: Vec<RouteMetric>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpRouteMetric {
+    pub route: String,
+    pub cluster: String,
+    pub requests: u64,
+    pub failures: u64,
+    pub latency_ms_sum: u64,
+    pub latency_ms_buckets: Vec<LatencyBucket>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,7 +77,18 @@ struct MetricsStore {
     agent_requests: u64,
     policy_denied: u64,
     upstream_failures: u64,
+    http_routes: HashMap<String, HttpRouteMetricCounter>,
     routes: HashMap<String, RouteMetricCounter>,
+}
+
+#[derive(Debug, Default)]
+struct HttpRouteMetricCounter {
+    route: String,
+    cluster: String,
+    requests: u64,
+    failures: u64,
+    latency_ms_sum: u64,
+    latency_ms_buckets: [u64; LATENCY_BUCKETS_MS.len()],
 }
 
 #[derive(Debug, Default)]
@@ -252,6 +274,34 @@ impl ProxyState {
         }
     }
 
+    pub fn record_http_request(&self, route: &str, cluster: &str, status: u16, latency_ms: u64) {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        metrics.total_requests += 1;
+        if status >= 500 {
+            metrics.upstream_failures += 1;
+        }
+        let key = format!("{route}|{cluster}");
+        let route_metric =
+            metrics
+                .http_routes
+                .entry(key)
+                .or_insert_with(|| HttpRouteMetricCounter {
+                    route: route.to_string(),
+                    cluster: cluster.to_string(),
+                    ..HttpRouteMetricCounter::default()
+                });
+        route_metric.requests += 1;
+        if status >= 500 {
+            route_metric.failures += 1;
+        }
+        route_metric.latency_ms_sum += latency_ms;
+        for (idx, bucket) in LATENCY_BUCKETS_MS.iter().enumerate() {
+            if latency_ms <= *bucket {
+                route_metric.latency_ms_buckets[idx] += 1;
+            }
+        }
+    }
+
     pub fn record_agent_request(
         &self,
         protocol: &str,
@@ -317,6 +367,30 @@ impl ProxyState {
 
     pub fn metrics(&self) -> ProxyMetrics {
         let metrics = self.inner.metrics.lock().unwrap();
+        let mut http_routes = metrics
+            .http_routes
+            .values()
+            .map(|route| HttpRouteMetric {
+                route: route.route.clone(),
+                cluster: route.cluster.clone(),
+                requests: route.requests,
+                failures: route.failures,
+                latency_ms_sum: route.latency_ms_sum,
+                latency_ms_buckets: LATENCY_BUCKETS_MS
+                    .iter()
+                    .zip(route.latency_ms_buckets.iter())
+                    .map(|(le, count)| LatencyBucket {
+                        le: *le,
+                        count: *count,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        http_routes.sort_by(|a, b| {
+            a.route
+                .cmp(&b.route)
+                .then_with(|| a.cluster.cmp(&b.cluster))
+        });
         let mut routes = metrics
             .routes
             .values()
@@ -348,6 +422,7 @@ impl ProxyState {
             agent_requests: metrics.agent_requests,
             policy_denied: metrics.policy_denied,
             upstream_failures: metrics.upstream_failures,
+            http_routes,
             routes,
         }
     }
@@ -503,5 +578,26 @@ mod tests {
             node_name: None,
         }];
         assert!(state.pick_endpoint("backend", &unhealthy).await.is_err());
+    }
+
+    #[test]
+    fn records_http_route_metrics() {
+        let state = ProxyState::new(RuntimeConfig::empty("test"));
+
+        state.record_http_request("default", "reviews", 200, 12);
+        state.record_http_request("default", "reviews", 502, 260);
+
+        let metrics = state.metrics();
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_failures, 1);
+        assert_eq!(metrics.http_routes.len(), 1);
+        let route = &metrics.http_routes[0];
+        assert_eq!(route.route, "default");
+        assert_eq!(route.cluster, "reviews");
+        assert_eq!(route.requests, 2);
+        assert_eq!(route.failures, 1);
+        assert_eq!(route.latency_ms_sum, 272);
+        assert_eq!(route.latency_ms_buckets[2].count, 1);
+        assert_eq!(route.latency_ms_buckets[6].count, 2);
     }
 }

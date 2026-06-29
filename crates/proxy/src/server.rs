@@ -135,11 +135,11 @@ async fn forward_http(
         headers: &headers,
     };
 
-    let weighted_clusters = cfg
+    let route = cfg
         .route_for(HTTP_LISTENER_PORT, &input)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
-        .weighted_clusters
-        .clone();
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let route_name = route.name.clone();
+    let weighted_clusters = route.weighted_clusters.clone();
 
     let weighted = server
         .state
@@ -161,22 +161,33 @@ async fn forward_http(
             )
         })?
         .clone();
+    let cluster_name = cluster.name.clone();
 
-    let endpoint = server
+    let endpoint = match server
         .state
-        .pick_endpoint(&cluster.name, &cluster.endpoints)
+        .pick_endpoint(&cluster_name, &cluster.endpoints)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-    let _circuit_breaker_permit =
-        server
-            .state
-            .try_acquire_circuit_breaker(&cluster)
-            .map_err(|_| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("cluster {} circuit breaker open", cluster.name),
-                )
-            })?;
+    {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            server
+                .state
+                .record_http_request(&route_name, &cluster_name, 503, 0);
+            return Err((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
+        }
+    };
+    let _circuit_breaker_permit = match server.state.try_acquire_circuit_breaker(&cluster) {
+        Ok(permit) => permit,
+        Err(_) => {
+            server
+                .state
+                .record_http_request(&route_name, &cluster_name, 503, 0);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("cluster {} circuit breaker open", cluster_name),
+            ));
+        }
+    };
 
     let tls = cluster.tls.as_ref();
     let request_mode = upstream_request_mode(tls);
@@ -194,7 +205,8 @@ async fn forward_http(
         })?;
 
     debug!(
-        cluster = %cluster.name,
+        route = %route_name,
+        cluster = %cluster_name,
         endpoint = %endpoint.address,
         upstream_mode = ?request_mode,
         "forwarding request"
@@ -204,14 +216,31 @@ async fn forward_http(
     req.headers_mut().remove(http::header::HOST);
     inject_trace_context(req.headers_mut());
 
-    match request_mode {
+    let started = Instant::now();
+    let result = match request_mode {
         UpstreamRequestMode::PlainHttp => server.clients.request_plain(req).await,
         UpstreamRequestMode::SimpleTls => server.clients.request_web(req).await,
         UpstreamRequestMode::DubboMutual => {
             let tls = tls.expect("dubbo mutual request mode requires TLS config");
             server.clients.request_mtls(&cluster, tls, req).await
         }
-    }
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let status = result
+        .as_ref()
+        .map(|response| response.status().as_u16())
+        .unwrap_or_else(|(status, _)| status.as_u16());
+    server
+        .state
+        .record_http_request(&route_name, &cluster_name, status, latency_ms);
+    info!(
+        route = %route_name,
+        cluster = %cluster_name,
+        status = status,
+        latency_ms = latency_ms,
+        "http access"
+    );
+    result
 }
 
 async fn forward_agent(
