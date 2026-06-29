@@ -435,6 +435,7 @@ dependencies = [
  "hyper-rustls 0.24.2",
  "jsonwebtoken",
  "opentelemetry",
+ "opentelemetry_sdk",
  "rcgen",
  "rustls 0.21.12",
  "rustls-pemfile 1.0.4",

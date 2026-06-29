@@ -23,5 +23,6 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk.workspace = true
 rcgen = "0.12"
 tokio-rustls = "0.24"

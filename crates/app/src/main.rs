@@ -9,6 +9,7 @@ use dxgate_xds::{
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::Resource;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -53,6 +54,12 @@ struct Args {
 
     #[arg(long, env = "DXGATE_OTEL_ENDPOINT")]
     otel_endpoint: Option<String>,
+
+    #[arg(long, env = "DXGATE_OTEL_SERVICE_NAME", default_value = "dxgate")]
+    otel_service_name: String,
+
+    #[arg(long, env = "DXGATE_OTEL_SAMPLING_PERCENTAGE", default_value_t = 100.0)]
+    otel_sampling_percentage: f64,
 
     #[arg(long)]
     print_crds: bool,
@@ -99,7 +106,11 @@ async fn main() -> std::io::Result<()> {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
         apply_bootstrap(&mut args, bootstrap);
     }
-    let otel_enabled = init_tracing(args.otel_endpoint.as_deref())?;
+    let otel_enabled = init_tracing(
+        args.otel_endpoint.as_deref(),
+        &args.otel_service_name,
+        args.otel_sampling_percentage,
+    )?;
 
     let run_xds = should_run_xds(&args);
     let identity = RouterIdentity {
@@ -211,7 +222,11 @@ fn print_crds() -> std::io::Result<()> {
     Ok(())
 }
 
-fn init_tracing(otel_endpoint: Option<&str>) -> std::io::Result<bool> {
+fn init_tracing(
+    otel_endpoint: Option<&str>,
+    otel_service_name: &str,
+    otel_sampling_percentage: f64,
+) -> std::io::Result<bool> {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     let env_filter = tracing_subscriber::EnvFilter::from_default_env();
     let fmt_layer = tracing_subscriber::fmt::layer();
@@ -220,6 +235,12 @@ fn init_tracing(otel_endpoint: Option<&str>) -> std::io::Result<bool> {
         .with(fmt_layer);
 
     if let Some(endpoint) = otel_endpoint {
+        let sampling_percentage = if otel_sampling_percentage.is_finite() {
+            otel_sampling_percentage.clamp(0.0, 100.0)
+        } else {
+            100.0
+        };
+        let sampling_ratio = sampling_percentage / 100.0;
         let tracer = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_exporter(
@@ -229,14 +250,25 @@ fn init_tracing(otel_endpoint: Option<&str>) -> std::io::Result<bool> {
             )
             .with_trace_config(
                 opentelemetry_sdk::trace::config()
-                    .with_resource(Resource::new(vec![KeyValue::new("service.name", "dxgate")])),
+                    .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+                        sampling_ratio,
+                    ))))
+                    .with_resource(Resource::new(vec![KeyValue::new(
+                        "service.name",
+                        otel_service_name.to_string(),
+                    )])),
             )
             .install_batch(opentelemetry_sdk::runtime::Tokio)
             .map_err(|err| std::io::Error::other(format!("initialize OTEL tracing: {err}")))?;
         registry
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
             .init();
-        info!(otel_endpoint = %endpoint, "OpenTelemetry tracing enabled");
+        info!(
+            otel_endpoint = %endpoint,
+            otel_service_name = %otel_service_name,
+            otel_sampling_percentage = sampling_percentage,
+            "OpenTelemetry tracing enabled"
+        );
         Ok(true)
     } else {
         registry.init();
@@ -331,6 +363,8 @@ mod tests {
             config_watch: false,
             bootstrap: Some(PathBuf::from("/etc/dxgate/bootstrap.json")),
             otel_endpoint: None,
+            otel_service_name: "dxgate".to_string(),
+            otel_sampling_percentage: 100.0,
             print_crds: false,
             listener_names: Vec::new(),
             pod_name: "dxgate".to_string(),

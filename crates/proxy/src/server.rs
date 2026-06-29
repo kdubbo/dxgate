@@ -17,7 +17,8 @@ use hyper::client::HttpConnector;
 use hyper::Client;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use opentelemetry::propagation::Injector;
+use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::trace::TraceContextExt;
 use rustls::client::{ServerCertVerified, ServerCertVerifier, WebPkiVerifier};
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
 use serde::Deserialize;
@@ -45,6 +46,7 @@ pub struct ProxyServer {
     clients: UpstreamClients,
     policy_default: PolicyDefault,
     metrics_identity: MetricsIdentity,
+    access_log: AccessLogConfig,
 }
 
 impl ProxyServer {
@@ -54,6 +56,7 @@ impl ProxyServer {
             clients: UpstreamClients::from_env(),
             policy_default: PolicyDefault::from_env(),
             metrics_identity: MetricsIdentity::from_env(),
+            access_log: AccessLogConfig::from_env(),
         }
     }
 
@@ -83,15 +86,71 @@ impl MetricsIdentity {
     }
 }
 
+#[derive(Clone)]
+struct AccessLogConfig {
+    enabled: bool,
+    format: AccessLogFormat,
+}
+
+impl AccessLogConfig {
+    fn from_env() -> Self {
+        let enabled = env::var("DXGATE_ACCESS_LOG").ok();
+        let format = env::var("DXGATE_ACCESS_LOG_FORMAT").ok();
+        Self::from_values(enabled.as_deref(), format.as_deref())
+    }
+
+    fn from_values(enabled: Option<&str>, format: Option<&str>) -> Self {
+        Self {
+            enabled: parse_access_log_enabled(enabled),
+            format: parse_access_log_format(format),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessLogFormat {
+    Text,
+    Json,
+}
+
+fn parse_access_log_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value)
+            if value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off") =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+fn parse_access_log_format(value: Option<&str>) -> AccessLogFormat {
+    match value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("json") => AccessLogFormat::Json,
+        _ => AccessLogFormat::Text,
+    }
+}
+
 async fn proxy_request(State(server): State<ProxyServer>, req: Request<Body>) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let parent_context = extract_trace_context(req.headers());
     let span = tracing::info_span!(
         "dxgate.request",
         http.method = %method,
         http.target = %path,
-        http.status_code = tracing::field::Empty
+        http.status_code = tracing::field::Empty,
+        http.latency_ms = tracing::field::Empty,
+        gateway.namespace = tracing::field::Empty,
+        gateway.name = tracing::field::Empty,
+        http.route = tracing::field::Empty,
+        dxgate.cluster = tracing::field::Empty,
+        upstream.address = tracing::field::Empty
     );
+    span.set_parent(parent_context);
     let result = forward(server, req).instrument(span.clone()).await;
     match result {
         Ok(resp) => {
@@ -141,7 +200,7 @@ async fn forward_http(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let method = req.method().as_str().to_string();
-    let host = host_header(req.headers()).unwrap_or("*");
+    let host = host_header(req.headers()).unwrap_or("*").to_string();
     let path = req
         .uri()
         .path_and_query()
@@ -150,21 +209,50 @@ async fn forward_http(
         .to_string();
     let headers = header_pairs(req.headers());
     let input = MatchInput {
-        host,
+        host: &host,
         path: &path,
         headers: &headers,
     };
 
-    let route = cfg
-        .route_for(HTTP_LISTENER_PORT, &input)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let route = match cfg.route_for(HTTP_LISTENER_PORT, &input) {
+        Ok(route) => route,
+        Err(err) => {
+            record_http_observation(
+                &server,
+                HttpObservation {
+                    route: "none",
+                    cluster: "none",
+                    method: &method,
+                    host: &host,
+                    path: &path,
+                    status_code: StatusCode::NOT_FOUND.as_u16(),
+                    latency_ms: 0,
+                    upstream: "none",
+                },
+            );
+            return Err((StatusCode::NOT_FOUND, err.to_string()));
+        }
+    };
     let route_name = route.name.clone();
+    record_http_span(&server, &route_name, "none", "none", 0, 0);
     let weighted_clusters = route.weighted_clusters.clone();
 
     let weighted = match server.state.pick_cluster(&weighted_clusters).await {
         Some(weighted) => weighted,
         None => {
-            record_http_metric(&server, &route_name, "none", &method, 503, 0);
+            record_http_observation(
+                &server,
+                HttpObservation {
+                    route: &route_name,
+                    cluster: "none",
+                    method: &method,
+                    host: &host,
+                    path: &path,
+                    status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    latency_ms: 0,
+                    upstream: "none",
+                },
+            );
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "route has no clusters".to_string(),
@@ -175,7 +263,19 @@ async fn forward_http(
     let cluster = match cfg.cluster(&weighted.name) {
         Some(cluster) => cluster.clone(),
         None => {
-            record_http_metric(&server, &route_name, &weighted.name, &method, 503, 0);
+            record_http_observation(
+                &server,
+                HttpObservation {
+                    route: &route_name,
+                    cluster: &weighted.name,
+                    method: &method,
+                    host: &host,
+                    path: &path,
+                    status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    latency_ms: 0,
+                    upstream: "none",
+                },
+            );
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("cluster {} not found", weighted.name),
@@ -191,14 +291,40 @@ async fn forward_http(
     {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            record_http_metric(&server, &route_name, &cluster_name, &method, 503, 0);
+            record_http_observation(
+                &server,
+                HttpObservation {
+                    route: &route_name,
+                    cluster: &cluster_name,
+                    method: &method,
+                    host: &host,
+                    path: &path,
+                    status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    latency_ms: 0,
+                    upstream: "none",
+                },
+            );
             return Err((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
         }
     };
+    let upstream = endpoint_authority(&endpoint);
+    record_http_span(&server, &route_name, &cluster_name, &upstream, 0, 0);
     let _circuit_breaker_permit = match server.state.try_acquire_circuit_breaker(&cluster) {
         Ok(permit) => permit,
         Err(_) => {
-            record_http_metric(&server, &route_name, &cluster_name, &method, 503, 0);
+            record_http_observation(
+                &server,
+                HttpObservation {
+                    route: &route_name,
+                    cluster: &cluster_name,
+                    method: &method,
+                    host: &host,
+                    path: &path,
+                    status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    latency_ms: 0,
+                    upstream: &upstream,
+                },
+            );
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("cluster {} circuit breaker open", cluster_name),
@@ -212,10 +338,22 @@ async fn forward_http(
         UpstreamRequestMode::PlainHttp => "http",
         UpstreamRequestMode::SimpleTls | UpstreamRequestMode::DubboMutual => "https",
     };
-    let upstream_uri = format!("{}://{}{}", scheme, endpoint_authority(&endpoint), path)
+    let upstream_uri = format!("{}://{}{}", scheme, upstream, path)
         .parse::<Uri>()
         .map_err(|e| {
-            record_http_metric(&server, &route_name, &cluster_name, &method, 502, 0);
+            record_http_observation(
+                &server,
+                HttpObservation {
+                    route: &route_name,
+                    cluster: &cluster_name,
+                    method: &method,
+                    host: &host,
+                    path: &path,
+                    status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                    latency_ms: 0,
+                    upstream: &upstream,
+                },
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 format!("invalid upstream uri: {e}"),
@@ -248,22 +386,74 @@ async fn forward_http(
         .as_ref()
         .map(|response| response.status().as_u16())
         .unwrap_or_else(|(status, _)| status.as_u16());
-    record_http_metric(
+    record_http_observation(
         &server,
-        &route_name,
-        &cluster_name,
-        &method,
-        status,
-        latency_ms,
-    );
-    info!(
-        route = %route_name,
-        cluster = %cluster_name,
-        status = status,
-        latency_ms = latency_ms,
-        "http access"
+        HttpObservation {
+            route: &route_name,
+            cluster: &cluster_name,
+            method: &method,
+            host: &host,
+            path: &path,
+            status_code: status,
+            latency_ms,
+            upstream: &upstream,
+        },
     );
     result
+}
+
+struct HttpObservation<'a> {
+    route: &'a str,
+    cluster: &'a str,
+    method: &'a str,
+    host: &'a str,
+    path: &'a str,
+    status_code: u16,
+    latency_ms: u64,
+    upstream: &'a str,
+}
+
+fn record_http_observation(server: &ProxyServer, observation: HttpObservation<'_>) {
+    record_http_metric(
+        server,
+        observation.route,
+        observation.cluster,
+        observation.method,
+        observation.status_code,
+        observation.latency_ms,
+    );
+    record_http_span(
+        server,
+        observation.route,
+        observation.cluster,
+        observation.upstream,
+        observation.status_code,
+        observation.latency_ms,
+    );
+    emit_http_access_log(server, &observation);
+}
+
+fn record_http_span(
+    server: &ProxyServer,
+    route: &str,
+    cluster: &str,
+    upstream: &str,
+    status_code: u16,
+    latency_ms: u64,
+) {
+    let span = tracing::Span::current();
+    span.record(
+        "gateway.namespace",
+        server.metrics_identity.namespace.as_str(),
+    );
+    span.record("gateway.name", server.metrics_identity.gateway.as_str());
+    span.record("http.route", route);
+    span.record("dxgate.cluster", cluster);
+    span.record("upstream.address", upstream);
+    if status_code > 0 {
+        span.record("http.status_code", status_code);
+    }
+    span.record("http.latency_ms", latency_ms);
 }
 
 fn record_http_metric(
@@ -1129,12 +1319,29 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+fn extract_trace_context(headers: &HeaderMap) -> opentelemetry::Context {
+    let extractor = HeaderExtractor(headers);
+    opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor))
+}
+
 fn inject_trace_context(headers: &mut HeaderMap) {
     let context = tracing::Span::current().context();
     let mut injector = HeaderInjector(headers);
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut injector)
     });
+}
+
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(HeaderName::as_str).collect()
+    }
 }
 
 struct HeaderInjector<'a>(&'a mut HeaderMap);
@@ -1147,6 +1354,92 @@ impl Injector for HeaderInjector<'_> {
         ) {
             self.0.insert(name, value);
         }
+    }
+}
+
+fn emit_http_access_log(server: &ProxyServer, observation: &HttpObservation<'_>) {
+    if !server.access_log.enabled {
+        return;
+    }
+    let (trace_id, span_id) = current_trace_ids();
+    let event = AccessLogEvent {
+        namespace: &server.metrics_identity.namespace,
+        gateway: &server.metrics_identity.gateway,
+        route: observation.route,
+        cluster: observation.cluster,
+        method: observation.method,
+        host: observation.host,
+        path: observation.path,
+        status_code: observation.status_code,
+        latency_ms: observation.latency_ms,
+        upstream: observation.upstream,
+        trace_id: &trace_id,
+        span_id: &span_id,
+    };
+    let line = access_log_line(server.access_log.format, &event);
+    info!(target: "dxgate.access", "{}", line);
+}
+
+fn current_trace_ids() -> (String, String) {
+    let context = tracing::Span::current().context();
+    let span_context = context.span().span_context().clone();
+    if span_context.is_valid() {
+        (
+            span_context.trace_id().to_string(),
+            span_context.span_id().to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+struct AccessLogEvent<'a> {
+    namespace: &'a str,
+    gateway: &'a str,
+    route: &'a str,
+    cluster: &'a str,
+    method: &'a str,
+    host: &'a str,
+    path: &'a str,
+    status_code: u16,
+    latency_ms: u64,
+    upstream: &'a str,
+    trace_id: &'a str,
+    span_id: &'a str,
+}
+
+fn access_log_line(format: AccessLogFormat, event: &AccessLogEvent<'_>) -> String {
+    match format {
+        AccessLogFormat::Text => format!(
+            "namespace={} gateway={} route={} cluster={} method={} host={} path={} status_code={} latency_ms={} upstream={} trace_id={} span_id={}",
+            event.namespace,
+            event.gateway,
+            event.route,
+            event.cluster,
+            event.method,
+            event.host,
+            event.path,
+            event.status_code,
+            event.latency_ms,
+            event.upstream,
+            event.trace_id,
+            event.span_id
+        ),
+        AccessLogFormat::Json => serde_json::json!({
+            "namespace": event.namespace,
+            "gateway": event.gateway,
+            "route": event.route,
+            "cluster": event.cluster,
+            "method": event.method,
+            "host": event.host,
+            "path": event.path,
+            "status_code": event.status_code,
+            "latency_ms": event.latency_ms,
+            "upstream": event.upstream,
+            "trace_id": event.trace_id,
+            "span_id": event.span_id,
+        })
+        .to_string(),
     }
 }
 
@@ -1645,6 +1938,75 @@ mod tests {
             upstream_request_mode(Some(&mutual)),
             UpstreamRequestMode::DubboMutual
         );
+    }
+
+    #[test]
+    fn extracts_traceparent_from_headers() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HttpHeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+
+        let context = extract_trace_context(&headers);
+        let span_context = context.span().span_context().clone();
+
+        assert!(span_context.is_valid());
+        assert_eq!(
+            span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(span_context.span_id().to_string(), "00f067aa0ba902b7");
+    }
+
+    #[test]
+    fn access_log_config_parses_defaults_and_overrides() {
+        let default = AccessLogConfig::from_values(None, None);
+        assert!(default.enabled);
+        assert_eq!(default.format, AccessLogFormat::Text);
+
+        let disabled = AccessLogConfig::from_values(Some("false"), Some("json"));
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.format, AccessLogFormat::Json);
+
+        let invalid_format = AccessLogConfig::from_values(Some("true"), Some("yaml"));
+        assert!(invalid_format.enabled);
+        assert_eq!(invalid_format.format, AccessLogFormat::Text);
+    }
+
+    #[test]
+    fn access_log_line_formats_text_and_json() {
+        let event = AccessLogEvent {
+            namespace: "default",
+            gateway: "edge",
+            route: "httpbin",
+            cluster: "httpbin-v1",
+            method: "GET",
+            host: "httpbin.example",
+            path: "/status/502",
+            status_code: 502,
+            latency_ms: 17,
+            upstream: "httpbin.org:443",
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+            span_id: "00f067aa0ba902b7",
+        };
+
+        let text = access_log_line(AccessLogFormat::Text, &event);
+        assert!(text.contains("route=httpbin"));
+        assert!(text.contains("status_code=502"));
+        assert!(text.contains("trace_id=4bf92f3577b34da6a3ce929d0e0e4736"));
+
+        let json = access_log_line(AccessLogFormat::Json, &event);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["namespace"], "default");
+        assert_eq!(value["gateway"], "edge");
+        assert_eq!(value["status_code"], 502);
+        assert_eq!(value["latency_ms"], 17);
+        assert_eq!(value["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(value["span_id"], "00f067aa0ba902b7");
     }
 
     fn test_ca() -> RcgenCertificate {
