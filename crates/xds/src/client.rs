@@ -10,7 +10,7 @@ use crate::proto::service::discovery::v1::{DiscoveryRequest, DiscoveryResponse};
 use dxgate_core::{
     CircuitBreakerConfig, Cluster, Endpoint as RuntimeEndpoint, HeaderMatch, Listener,
     ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch, RouterIdentity,
-    RuntimeConfig, UpstreamTls, VirtualHost, WeightedCluster,
+    RuntimeConfig, UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedCluster,
 };
 use prost::Message;
 use prost_types::{value::Kind, Struct, Value};
@@ -484,10 +484,18 @@ fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamT
     }
     let tls = xds_tls::UpstreamTlsContext::decode(typed_config.value.as_slice()).ok()?;
     let common = tls.common_tls_context.as_ref();
+    let certificate_provider = common.and_then(certificate_provider_name);
+    let validation_provider = common.and_then(validation_provider_name);
+    let mode = if certificate_provider.is_some() {
+        UpstreamTlsMode::DubboMutual
+    } else {
+        UpstreamTlsMode::Simple
+    };
     Some(UpstreamTls {
+        mode,
         sni: first_non_empty(tls.sni, cluster_authority(&cluster.name)),
-        certificate_provider: common.and_then(certificate_provider_name),
-        validation_provider: common.and_then(validation_provider_name),
+        certificate_provider,
+        validation_provider,
         alpn_protocols: common
             .map(|common| common.alpn_protocols.clone())
             .unwrap_or_default(),
@@ -978,9 +986,35 @@ mod tests {
             Some("orders.app.svc.cluster.local")
         );
         let tls = cfg.clusters[0].tls.as_ref().unwrap();
+        assert_eq!(tls.mode, UpstreamTlsMode::DubboMutual);
         assert_eq!(tls.certificate_provider.as_deref(), Some("workload"));
         assert_eq!(tls.validation_provider.as_deref(), Some("roots"));
         assert_eq!(tls.alpn_protocols, ["h2"]);
+    }
+
+    #[test]
+    fn upstream_tls_without_workload_certificate_provider_is_simple() {
+        let cluster = xds_cluster::Cluster {
+            name: "outbound|443||httpbin-egress.app.svc.cluster.local".into(),
+            transport_socket: Some(xds_core::TransportSocket {
+                name: "envoy.transport_sockets.tls".into(),
+                config_type: Some(xds_core::transport_socket::ConfigType::TypedConfig(any(
+                    "type.googleapis.com/extensions.transport_sockets.tls.v1.UpstreamTlsContext",
+                    xds_tls::UpstreamTlsContext {
+                        sni: "httpbin.org".into(),
+                        common_tls_context: Some(xds_tls::CommonTlsContext::default()),
+                    },
+                ))),
+            }),
+            ..xds_cluster::Cluster::default()
+        };
+
+        let tls = upstream_tls_from_cluster(&cluster).expect("expected TLS config");
+
+        assert_eq!(tls.mode, UpstreamTlsMode::Simple);
+        assert_eq!(tls.sni.as_deref(), Some("httpbin.org"));
+        assert_eq!(tls.certificate_provider, None);
+        assert_eq!(tls.validation_provider, None);
     }
 
     fn response(type_url: &str, resources: Vec<Any>) -> DiscoveryResponse {

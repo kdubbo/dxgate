@@ -10,7 +10,7 @@ use axum::Router;
 use dxgate_core::{
     AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, BackendKind, Cluster,
     Endpoint, HeaderTransform, MatchInput, PolicyAction, Provider, RateLimitKey, RetryPolicy,
-    UpstreamTls, WeightedBackend, HTTP_LISTENER_PORT,
+    UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
 };
 use hyper::body::{self, Bytes};
 use hyper::client::HttpConnector;
@@ -179,7 +179,11 @@ async fn forward_http(
             })?;
 
     let tls = cluster.tls.as_ref();
-    let scheme = if tls.is_some() { "https" } else { "http" };
+    let request_mode = upstream_request_mode(tls);
+    let scheme = match request_mode {
+        UpstreamRequestMode::PlainHttp => "http",
+        UpstreamRequestMode::SimpleTls | UpstreamRequestMode::DubboMutual => "https",
+    };
     let upstream_uri = format!("{}://{}{}", scheme, endpoint_authority(&endpoint), path)
         .parse::<Uri>()
         .map_err(|e| {
@@ -192,7 +196,7 @@ async fn forward_http(
     debug!(
         cluster = %cluster.name,
         endpoint = %endpoint.address,
-        mtls = tls.is_some(),
+        upstream_mode = ?request_mode,
         "forwarding request"
     );
 
@@ -200,10 +204,14 @@ async fn forward_http(
     req.headers_mut().remove(http::header::HOST);
     inject_trace_context(req.headers_mut());
 
-    if let Some(tls) = tls {
-        return server.clients.request_mtls(&cluster, tls, req).await;
+    match request_mode {
+        UpstreamRequestMode::PlainHttp => server.clients.request_plain(req).await,
+        UpstreamRequestMode::SimpleTls => server.clients.request_web(req).await,
+        UpstreamRequestMode::DubboMutual => {
+            let tls = tls.expect("dubbo mutual request mode requires TLS config");
+            server.clients.request_mtls(&cluster, tls, req).await
+        }
     }
-    server.clients.request_plain(req).await
 }
 
 async fn forward_agent(
@@ -1016,6 +1024,21 @@ fn endpoint_authority(endpoint: &Endpoint) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamRequestMode {
+    PlainHttp,
+    SimpleTls,
+    DubboMutual,
+}
+
+fn upstream_request_mode(tls: Option<&UpstreamTls>) -> UpstreamRequestMode {
+    match tls.map(|tls| tls.mode) {
+        None => UpstreamRequestMode::PlainHttp,
+        Some(UpstreamTlsMode::Simple) => UpstreamRequestMode::SimpleTls,
+        Some(UpstreamTlsMode::DubboMutual) => UpstreamRequestMode::DubboMutual,
+    }
+}
+
 fn host_header(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(http::header::HOST)
@@ -1490,6 +1513,7 @@ mod tests {
         let pool = MtlsClientPool::from_bootstrap(bootstrap.to_str().unwrap()).unwrap();
         let client = pool
             .client_for(&UpstreamTls {
+                mode: UpstreamTlsMode::DubboMutual,
                 sni: Some("nginx.app.svc.cluster.local".into()),
                 certificate_provider: None,
                 validation_provider: None,
@@ -1511,6 +1535,7 @@ mod tests {
     #[test]
     fn mtls_cache_key_tracks_provider_and_alpn() {
         let tls = UpstreamTls {
+            mode: UpstreamTlsMode::DubboMutual,
             sni: Some("nginx.app.svc.cluster.local".into()),
             certificate_provider: Some("workload".into()),
             validation_provider: Some("roots".into()),
@@ -1520,6 +1545,34 @@ mod tests {
         assert_eq!(
             mtls_cache_key(&tls),
             "nginx.app.svc.cluster.local|workload|roots|h2,http/1.1"
+        );
+    }
+
+    #[test]
+    fn upstream_request_mode_uses_simple_tls_without_mtls_bootstrap() {
+        let simple = UpstreamTls {
+            mode: UpstreamTlsMode::Simple,
+            sni: Some("httpbin.org".into()),
+            certificate_provider: None,
+            validation_provider: None,
+            alpn_protocols: vec![],
+        };
+        let mutual = UpstreamTls {
+            mode: UpstreamTlsMode::DubboMutual,
+            sni: Some("nginx.app.svc.cluster.local".into()),
+            certificate_provider: None,
+            validation_provider: None,
+            alpn_protocols: vec![],
+        };
+
+        assert_eq!(upstream_request_mode(None), UpstreamRequestMode::PlainHttp);
+        assert_eq!(
+            upstream_request_mode(Some(&simple)),
+            UpstreamRequestMode::SimpleTls
+        );
+        assert_eq!(
+            upstream_request_mode(Some(&mutual)),
+            UpstreamRequestMode::DubboMutual
         );
     }
 

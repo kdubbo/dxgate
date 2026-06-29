@@ -422,6 +422,8 @@ pub struct OutlierDetectionConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamTls {
+    #[serde(default, skip_serializing_if = "is_default_tls_mode")]
+    pub mode: UpstreamTlsMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +432,23 @@ pub struct UpstreamTls {
     pub validation_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn_protocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTlsMode {
+    Simple,
+    DubboMutual,
+}
+
+impl Default for UpstreamTlsMode {
+    fn default() -> Self {
+        Self::DubboMutual
+    }
+}
+
+fn is_default_tls_mode(mode: &UpstreamTlsMode) -> bool {
+    *mode == UpstreamTlsMode::default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
