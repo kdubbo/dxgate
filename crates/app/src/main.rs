@@ -228,7 +228,8 @@ fn init_tracing(
     otel_sampling_percentage: f64,
 ) -> std::io::Result<bool> {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer();
     let registry = tracing_subscriber::registry()
         .with(env_filter)
