@@ -371,12 +371,53 @@ pub struct Cluster {
     pub endpoints: Vec<Endpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<UpstreamTls>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outlier_detection: Option<OutlierDetectionConfig>,
 }
 
 impl Cluster {
     pub fn healthy_endpoints(&self) -> impl Iterator<Item = &Endpoint> {
         self.endpoints.iter().filter(|ep| ep.healthy)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2_max_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_connection: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+}
+
+impl CircuitBreakerConfig {
+    pub fn concurrent_request_limit(&self) -> Option<u32> {
+        self.http2_max_requests
+            .or(self.max_connections)
+            .or(self.http1_max_pending_requests)
+            .filter(|limit| *limit > 0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutlierDetectionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_5xx_errors: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ejection_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ejection_percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_health_percent: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -905,11 +946,15 @@ mod tests {
                     name: "admin".into(),
                     endpoints: vec![],
                     tls: None,
+                    circuit_breaker: None,
+                    outlier_detection: None,
                 },
                 Cluster {
                     name: "default".into(),
                     endpoints: vec![],
                     tls: None,
+                    circuit_breaker: None,
+                    outlier_detection: None,
                 },
             ],
             secrets: vec![],

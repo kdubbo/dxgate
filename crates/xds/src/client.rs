@@ -8,8 +8,9 @@ use crate::proto::route::v1 as xds_route;
 use crate::proto::service::discovery::v1::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::proto::service::discovery::v1::{DiscoveryRequest, DiscoveryResponse};
 use dxgate_core::{
-    Cluster, Endpoint as RuntimeEndpoint, HeaderMatch, Listener, ListenerProtocol, PathMatch,
-    Route, RouteMatch, RouterIdentity, RuntimeConfig, UpstreamTls, VirtualHost, WeightedCluster,
+    CircuitBreakerConfig, Cluster, Endpoint as RuntimeEndpoint, HeaderMatch, Listener,
+    ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch, RouterIdentity,
+    RuntimeConfig, UpstreamTls, VirtualHost, WeightedCluster,
 };
 use prost::Message;
 use prost_types::{value::Kind, Struct, Value};
@@ -304,6 +305,8 @@ impl AdsState {
                 cluster.name.clone(),
                 ClusterSnapshot {
                     tls: upstream_tls_from_cluster(&cluster),
+                    circuit_breaker: circuit_breaker_from_cluster(&cluster),
+                    outlier_detection: outlier_detection_from_cluster(&cluster),
                     name: cluster.name,
                     eds_service_name,
                 },
@@ -363,6 +366,8 @@ impl AdsState {
                     .cloned()
                     .unwrap_or_default(),
                 tls: cluster.tls.clone(),
+                circuit_breaker: cluster.circuit_breaker.clone(),
+                outlier_detection: cluster.outlier_detection.clone(),
             })
             .collect();
 
@@ -463,6 +468,8 @@ struct ClusterSnapshot {
     name: String,
     eds_service_name: String,
     tls: Option<UpstreamTls>,
+    circuit_breaker: Option<CircuitBreakerConfig>,
+    outlier_detection: Option<OutlierDetectionConfig>,
 }
 
 fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamTls> {
@@ -485,6 +492,38 @@ fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamT
             .map(|common| common.alpn_protocols.clone())
             .unwrap_or_default(),
     })
+}
+
+fn circuit_breaker_from_cluster(cluster: &xds_cluster::Cluster) -> Option<CircuitBreakerConfig> {
+    let threshold = cluster.circuit_breakers.as_ref()?.thresholds.first()?;
+    Some(CircuitBreakerConfig {
+        max_connections: threshold.max_connections,
+        http1_max_pending_requests: threshold.max_pending_requests,
+        http2_max_requests: threshold.max_requests,
+        max_requests_per_connection: cluster.max_requests_per_connection.as_ref().copied(),
+        max_retries: threshold.max_retries,
+    })
+}
+
+fn outlier_detection_from_cluster(
+    cluster: &xds_cluster::Cluster,
+) -> Option<OutlierDetectionConfig> {
+    let outlier = cluster.outlier_detection.as_ref()?;
+    Some(OutlierDetectionConfig {
+        consecutive_5xx_errors: outlier.consecutive_5xx,
+        interval: outlier.interval.as_ref().map(duration_to_string),
+        base_ejection_time: outlier.base_ejection_time.as_ref().map(duration_to_string),
+        max_ejection_percent: outlier.max_ejection_percent,
+        min_health_percent: outlier.min_health_percent,
+    })
+}
+
+fn duration_to_string(duration: &prost_types::Duration) -> String {
+    if duration.nanos == 0 {
+        format!("{}s", duration.seconds)
+    } else {
+        format!("{}.{:09}s", duration.seconds, duration.nanos)
+    }
 }
 
 fn certificate_provider_name(common: &xds_tls::CommonTlsContext) -> Option<String> {

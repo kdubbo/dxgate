@@ -29,6 +29,34 @@ message Cluster {
     google.protobuf.Any typed_config = 2;
   }
 
+  message CircuitBreakers {
+    message Thresholds {
+      google.protobuf.UInt32Value max_connections = 1;
+      google.protobuf.UInt32Value max_pending_requests = 2;
+      google.protobuf.UInt32Value max_requests = 3;
+      google.protobuf.UInt32Value max_retries = 4;
+      bool track_remaining = 5;
+    }
+
+    repeated Thresholds thresholds = 1;
+  }
+
+  message OutlierDetection {
+    google.protobuf.UInt32Value consecutive_5xx = 1;
+    google.protobuf.UInt32Value enforcing_consecutive_5xx = 2;
+    google.protobuf.UInt32Value consecutive_gateway_failure = 3;
+    google.protobuf.UInt32Value enforcing_consecutive_gateway_failure = 4;
+    google.protobuf.Duration interval = 5;
+    google.protobuf.Duration base_ejection_time = 6;
+    google.protobuf.UInt32Value max_ejection_percent = 7;
+    bool split_external_local_origin_errors = 8;
+    google.protobuf.UInt32Value consecutive_local_origin_failure = 9;
+    google.protobuf.UInt32Value enforcing_consecutive_local_origin_failure = 10;
+    google.protobuf.UInt32Value enforcing_success_rate = 11;
+    google.protobuf.UInt32Value enforcing_local_origin_success_rate = 12;
+    google.protobuf.UInt32Value min_health_percent = 13;
+  }
+
   enum DiscoveryType {
     STATIC = 0;
     STRICT_DNS = 1;
@@ -57,4 +85,7 @@ message Cluster {
   endpoint.v1.ClusterLoadAssignment load_assignment = 33;
   CommonLbConfig common_lb_config = 27;
   core.v1.TransportSocket transport_socket = 24;
+  CircuitBreakers circuit_breakers = 10;
+  OutlierDetection outlier_detection = 19;
+  google.protobuf.UInt32Value max_requests_per_connection = 29;
 }

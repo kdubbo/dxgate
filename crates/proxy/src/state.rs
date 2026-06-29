@@ -1,6 +1,6 @@
 use dxgate_core::{
-    ConfigConflict, DxgateError, Endpoint, RateLimitPolicy, Result, RuntimeConfig, WeightedBackend,
-    WeightedCluster,
+    Cluster, ConfigConflict, DxgateError, Endpoint, RateLimitPolicy, Result, RuntimeConfig,
+    WeightedBackend, WeightedCluster,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ struct Inner {
     ready: AtomicBool,
     picker_counter: AtomicU64,
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
+    circuit_breakers: Mutex<HashMap<String, CircuitBreakerBucket>>,
     mcp_sessions: Mutex<HashMap<String, String>>,
     metrics: Mutex<MetricsStore>,
 }
@@ -85,6 +86,22 @@ struct RateLimitBucket {
     used: u32,
 }
 
+#[derive(Debug, Default)]
+struct CircuitBreakerBucket {
+    active: u32,
+}
+
+pub struct CircuitBreakerPermit {
+    state: ProxyState,
+    cluster: String,
+}
+
+impl Drop for CircuitBreakerPermit {
+    fn drop(&mut self) {
+        self.state.release_circuit_breaker(&self.cluster);
+    }
+}
+
 impl ProxyState {
     pub fn new(initial: RuntimeConfig) -> Self {
         Self {
@@ -94,6 +111,7 @@ impl ProxyState {
                 ready: AtomicBool::new(false),
                 picker_counter: AtomicU64::new(0),
                 rate_limits: Mutex::new(HashMap::new()),
+                circuit_breakers: Mutex::new(HashMap::new()),
                 mcp_sessions: Mutex::new(HashMap::new()),
                 metrics: Mutex::new(MetricsStore::default()),
             }),
@@ -106,6 +124,16 @@ impl ProxyState {
     ) -> std::result::Result<(), Vec<ConfigConflict>> {
         match cfg.validate() {
             Ok(()) => {
+                let cluster_names: std::collections::HashSet<String> = cfg
+                    .clusters
+                    .iter()
+                    .map(|cluster| cluster.name.clone())
+                    .collect();
+                self.inner
+                    .circuit_breakers
+                    .lock()
+                    .unwrap()
+                    .retain(|name, bucket| cluster_names.contains(name) || bucket.active > 0);
                 *self.inner.config.write().await = cfg;
                 self.inner.conflicts.write().await.clear();
                 self.inner.ready.store(true, Ordering::SeqCst);
@@ -193,6 +221,35 @@ impl ProxyState {
         }
         bucket.used += 1;
         true
+    }
+
+    pub fn try_acquire_circuit_breaker(
+        &self,
+        cluster: &Cluster,
+    ) -> std::result::Result<Option<CircuitBreakerPermit>, ()> {
+        let Some(limit) = cluster
+            .circuit_breaker
+            .as_ref()
+            .and_then(|breaker| breaker.concurrent_request_limit())
+        else {
+            return Ok(None);
+        };
+        let mut buckets = self.inner.circuit_breakers.lock().unwrap();
+        let bucket = buckets.entry(cluster.name.clone()).or_default();
+        if bucket.active >= limit {
+            return Err(());
+        }
+        bucket.active += 1;
+        Ok(Some(CircuitBreakerPermit {
+            state: self.clone(),
+            cluster: cluster.name.clone(),
+        }))
+    }
+
+    fn release_circuit_breaker(&self, cluster: &str) {
+        if let Some(bucket) = self.inner.circuit_breakers.lock().unwrap().get_mut(cluster) {
+            bucket.active = bucket.active.saturating_sub(1);
+        }
     }
 
     pub fn record_agent_request(
@@ -336,6 +393,8 @@ mod tests {
                     node_name: None,
                 }],
                 tls: None,
+                circuit_breaker: None,
+                outlier_detection: None,
             }],
             secrets: vec![],
             providers: vec![],
@@ -385,6 +444,35 @@ mod tests {
         }
 
         assert_eq!(names, ["a", "a", "b", "a", "a", "b"]);
+    }
+
+    #[test]
+    fn circuit_breaker_enforces_concurrent_limit() {
+        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let cluster = Cluster {
+            name: "backend".into(),
+            endpoints: vec![],
+            tls: None,
+            circuit_breaker: Some(dxgate_core::CircuitBreakerConfig {
+                max_connections: None,
+                http1_max_pending_requests: None,
+                http2_max_requests: Some(1),
+                max_requests_per_connection: None,
+                max_retries: None,
+            }),
+            outlier_detection: None,
+        };
+
+        let permit = state
+            .try_acquire_circuit_breaker(&cluster)
+            .expect("first request should pass")
+            .expect("configured circuit breaker should return a permit");
+        assert!(state.try_acquire_circuit_breaker(&cluster).is_err());
+        drop(permit);
+        assert!(state
+            .try_acquire_circuit_breaker(&cluster)
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

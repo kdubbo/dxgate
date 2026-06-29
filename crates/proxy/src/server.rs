@@ -167,6 +167,16 @@ async fn forward_http(
         .pick_endpoint(&cluster.name, &cluster.endpoints)
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let _circuit_breaker_permit =
+        server
+            .state
+            .try_acquire_circuit_breaker(&cluster)
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("cluster {} circuit breaker open", cluster.name),
+                )
+            })?;
 
     let tls = cluster.tls.as_ref();
     let scheme = if tls.is_some() { "https" } else { "http" };

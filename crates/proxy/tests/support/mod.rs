@@ -173,6 +173,8 @@ fn runtime_config(backend_addr: SocketAddr) -> RuntimeConfig {
                 node_name: None,
             }],
             tls: None,
+            circuit_breaker: None,
+            outlier_detection: None,
         }],
         secrets: vec![],
         providers: vec![],

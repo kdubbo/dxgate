@@ -148,6 +148,9 @@ type Cluster struct {
 	LoadAssignment                *v11.ClusterLoadAssignment     `protobuf:"bytes,33,opt,name=load_assignment,json=loadAssignment,proto3" json:"load_assignment,omitempty"`
 	CommonLbConfig                *Cluster_CommonLbConfig        `protobuf:"bytes,27,opt,name=common_lb_config,json=commonLbConfig,proto3" json:"common_lb_config,omitempty"`
 	TransportSocket               *v1.TransportSocket            `protobuf:"bytes,24,opt,name=transport_socket,json=transportSocket,proto3" json:"transport_socket,omitempty"`
+	CircuitBreakers               *Cluster_CircuitBreakers       `protobuf:"bytes,10,opt,name=circuit_breakers,json=circuitBreakers,proto3" json:"circuit_breakers,omitempty"`
+	OutlierDetection              *Cluster_OutlierDetection      `protobuf:"bytes,19,opt,name=outlier_detection,json=outlierDetection,proto3" json:"outlier_detection,omitempty"`
+	MaxRequestsPerConnection      *wrapperspb.UInt32Value        `protobuf:"bytes,29,opt,name=max_requests_per_connection,json=maxRequestsPerConnection,proto3" json:"max_requests_per_connection,omitempty"`
 	unknownFields                 protoimpl.UnknownFields
 	sizeCache                     protoimpl.SizeCache
 }
@@ -273,6 +276,27 @@ func (x *Cluster) GetCommonLbConfig() *Cluster_CommonLbConfig {
 func (x *Cluster) GetTransportSocket() *v1.TransportSocket {
 	if x != nil {
 		return x.TransportSocket
+	}
+	return nil
+}
+
+func (x *Cluster) GetCircuitBreakers() *Cluster_CircuitBreakers {
+	if x != nil {
+		return x.CircuitBreakers
+	}
+	return nil
+}
+
+func (x *Cluster) GetOutlierDetection() *Cluster_OutlierDetection {
+	if x != nil {
+		return x.OutlierDetection
+	}
+	return nil
+}
+
+func (x *Cluster) GetMaxRequestsPerConnection() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MaxRequestsPerConnection
 	}
 	return nil
 }
@@ -441,12 +465,272 @@ func (x *Cluster_CustomClusterType) GetTypedConfig() *anypb.Any {
 	return nil
 }
 
+type Cluster_CircuitBreakers struct {
+	state         protoimpl.MessageState                `protogen:"open.v1"`
+	Thresholds    []*Cluster_CircuitBreakers_Thresholds `protobuf:"bytes,1,rep,name=thresholds,proto3" json:"thresholds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Cluster_CircuitBreakers) Reset() {
+	*x = Cluster_CircuitBreakers{}
+	mi := &file_cluster_v1_cluster_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Cluster_CircuitBreakers) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Cluster_CircuitBreakers) ProtoMessage() {}
+
+func (x *Cluster_CircuitBreakers) ProtoReflect() protoreflect.Message {
+	mi := &file_cluster_v1_cluster_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Cluster_CircuitBreakers.ProtoReflect.Descriptor instead.
+func (*Cluster_CircuitBreakers) Descriptor() ([]byte, []int) {
+	return file_cluster_v1_cluster_proto_rawDescGZIP(), []int{0, 3}
+}
+
+func (x *Cluster_CircuitBreakers) GetThresholds() []*Cluster_CircuitBreakers_Thresholds {
+	if x != nil {
+		return x.Thresholds
+	}
+	return nil
+}
+
+type Cluster_OutlierDetection struct {
+	state                                  protoimpl.MessageState  `protogen:"open.v1"`
+	Consecutive_5Xx                        *wrapperspb.UInt32Value `protobuf:"bytes,1,opt,name=consecutive_5xx,json=consecutive5xx,proto3" json:"consecutive_5xx,omitempty"`
+	EnforcingConsecutive_5Xx               *wrapperspb.UInt32Value `protobuf:"bytes,2,opt,name=enforcing_consecutive_5xx,json=enforcingConsecutive5xx,proto3" json:"enforcing_consecutive_5xx,omitempty"`
+	ConsecutiveGatewayFailure              *wrapperspb.UInt32Value `protobuf:"bytes,3,opt,name=consecutive_gateway_failure,json=consecutiveGatewayFailure,proto3" json:"consecutive_gateway_failure,omitempty"`
+	EnforcingConsecutiveGatewayFailure     *wrapperspb.UInt32Value `protobuf:"bytes,4,opt,name=enforcing_consecutive_gateway_failure,json=enforcingConsecutiveGatewayFailure,proto3" json:"enforcing_consecutive_gateway_failure,omitempty"`
+	Interval                               *durationpb.Duration    `protobuf:"bytes,5,opt,name=interval,proto3" json:"interval,omitempty"`
+	BaseEjectionTime                       *durationpb.Duration    `protobuf:"bytes,6,opt,name=base_ejection_time,json=baseEjectionTime,proto3" json:"base_ejection_time,omitempty"`
+	MaxEjectionPercent                     *wrapperspb.UInt32Value `protobuf:"bytes,7,opt,name=max_ejection_percent,json=maxEjectionPercent,proto3" json:"max_ejection_percent,omitempty"`
+	SplitExternalLocalOriginErrors         bool                    `protobuf:"varint,8,opt,name=split_external_local_origin_errors,json=splitExternalLocalOriginErrors,proto3" json:"split_external_local_origin_errors,omitempty"`
+	ConsecutiveLocalOriginFailure          *wrapperspb.UInt32Value `protobuf:"bytes,9,opt,name=consecutive_local_origin_failure,json=consecutiveLocalOriginFailure,proto3" json:"consecutive_local_origin_failure,omitempty"`
+	EnforcingConsecutiveLocalOriginFailure *wrapperspb.UInt32Value `protobuf:"bytes,10,opt,name=enforcing_consecutive_local_origin_failure,json=enforcingConsecutiveLocalOriginFailure,proto3" json:"enforcing_consecutive_local_origin_failure,omitempty"`
+	EnforcingSuccessRate                   *wrapperspb.UInt32Value `protobuf:"bytes,11,opt,name=enforcing_success_rate,json=enforcingSuccessRate,proto3" json:"enforcing_success_rate,omitempty"`
+	EnforcingLocalOriginSuccessRate        *wrapperspb.UInt32Value `protobuf:"bytes,12,opt,name=enforcing_local_origin_success_rate,json=enforcingLocalOriginSuccessRate,proto3" json:"enforcing_local_origin_success_rate,omitempty"`
+	MinHealthPercent                       *wrapperspb.UInt32Value `protobuf:"bytes,13,opt,name=min_health_percent,json=minHealthPercent,proto3" json:"min_health_percent,omitempty"`
+	unknownFields                          protoimpl.UnknownFields
+	sizeCache                              protoimpl.SizeCache
+}
+
+func (x *Cluster_OutlierDetection) Reset() {
+	*x = Cluster_OutlierDetection{}
+	mi := &file_cluster_v1_cluster_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Cluster_OutlierDetection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Cluster_OutlierDetection) ProtoMessage() {}
+
+func (x *Cluster_OutlierDetection) ProtoReflect() protoreflect.Message {
+	mi := &file_cluster_v1_cluster_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Cluster_OutlierDetection.ProtoReflect.Descriptor instead.
+func (*Cluster_OutlierDetection) Descriptor() ([]byte, []int) {
+	return file_cluster_v1_cluster_proto_rawDescGZIP(), []int{0, 4}
+}
+
+func (x *Cluster_OutlierDetection) GetConsecutive_5Xx() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.Consecutive_5Xx
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetEnforcingConsecutive_5Xx() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.EnforcingConsecutive_5Xx
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetConsecutiveGatewayFailure() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.ConsecutiveGatewayFailure
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetEnforcingConsecutiveGatewayFailure() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.EnforcingConsecutiveGatewayFailure
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetInterval() *durationpb.Duration {
+	if x != nil {
+		return x.Interval
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetBaseEjectionTime() *durationpb.Duration {
+	if x != nil {
+		return x.BaseEjectionTime
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetMaxEjectionPercent() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MaxEjectionPercent
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetSplitExternalLocalOriginErrors() bool {
+	if x != nil {
+		return x.SplitExternalLocalOriginErrors
+	}
+	return false
+}
+
+func (x *Cluster_OutlierDetection) GetConsecutiveLocalOriginFailure() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.ConsecutiveLocalOriginFailure
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetEnforcingConsecutiveLocalOriginFailure() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.EnforcingConsecutiveLocalOriginFailure
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetEnforcingSuccessRate() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.EnforcingSuccessRate
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetEnforcingLocalOriginSuccessRate() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.EnforcingLocalOriginSuccessRate
+	}
+	return nil
+}
+
+func (x *Cluster_OutlierDetection) GetMinHealthPercent() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MinHealthPercent
+	}
+	return nil
+}
+
+type Cluster_CircuitBreakers_Thresholds struct {
+	state              protoimpl.MessageState  `protogen:"open.v1"`
+	MaxConnections     *wrapperspb.UInt32Value `protobuf:"bytes,1,opt,name=max_connections,json=maxConnections,proto3" json:"max_connections,omitempty"`
+	MaxPendingRequests *wrapperspb.UInt32Value `protobuf:"bytes,2,opt,name=max_pending_requests,json=maxPendingRequests,proto3" json:"max_pending_requests,omitempty"`
+	MaxRequests        *wrapperspb.UInt32Value `protobuf:"bytes,3,opt,name=max_requests,json=maxRequests,proto3" json:"max_requests,omitempty"`
+	MaxRetries         *wrapperspb.UInt32Value `protobuf:"bytes,4,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`
+	TrackRemaining     bool                    `protobuf:"varint,5,opt,name=track_remaining,json=trackRemaining,proto3" json:"track_remaining,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) Reset() {
+	*x = Cluster_CircuitBreakers_Thresholds{}
+	mi := &file_cluster_v1_cluster_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Cluster_CircuitBreakers_Thresholds) ProtoMessage() {}
+
+func (x *Cluster_CircuitBreakers_Thresholds) ProtoReflect() protoreflect.Message {
+	mi := &file_cluster_v1_cluster_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Cluster_CircuitBreakers_Thresholds.ProtoReflect.Descriptor instead.
+func (*Cluster_CircuitBreakers_Thresholds) Descriptor() ([]byte, []int) {
+	return file_cluster_v1_cluster_proto_rawDescGZIP(), []int{0, 3, 0}
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) GetMaxConnections() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MaxConnections
+	}
+	return nil
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) GetMaxPendingRequests() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MaxPendingRequests
+	}
+	return nil
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) GetMaxRequests() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MaxRequests
+	}
+	return nil
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) GetMaxRetries() *wrapperspb.UInt32Value {
+	if x != nil {
+		return x.MaxRetries
+	}
+	return nil
+}
+
+func (x *Cluster_CircuitBreakers_Thresholds) GetTrackRemaining() bool {
+	if x != nil {
+		return x.TrackRemaining
+	}
+	return false
+}
+
 var File_cluster_v1_cluster_proto protoreflect.FileDescriptor
 
 const file_cluster_v1_cluster_proto_rawDesc = "" +
 	"\n" +
 	"\x18cluster/v1/cluster.proto\x12\n" +
-	"cluster.v1\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/wrappers.proto\x1a\x1acore/v1/health_check.proto\x1a\x12core/v1/base.proto\x1a\x1bcore/v1/config_source.proto\x1a\x1aendpoint/v1/endpoint.proto\"\xf5\t\n" +
+	"cluster.v1\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/wrappers.proto\x1a\x1acore/v1/health_check.proto\x1a\x12core/v1/base.proto\x1a\x1bcore/v1/config_source.proto\x1a\x1aendpoint/v1/endpoint.proto\"\xb6\x18\n" +
 	"\aCluster\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\"\n" +
 	"\ralt_stat_name\x18\x1c \x01(\tR\valtStatName\x127\n" +
@@ -459,7 +743,11 @@ const file_cluster_v1_cluster_proto_rawDesc = "" +
 	"\rhealth_checks\x18\a \x03(\v2\x14.core.v1.HealthCheckR\fhealthChecks\x12K\n" +
 	"\x0fload_assignment\x18! \x01(\v2\".endpoint.v1.ClusterLoadAssignmentR\x0eloadAssignment\x12L\n" +
 	"\x10common_lb_config\x18\x1b \x01(\v2\".cluster.v1.Cluster.CommonLbConfigR\x0ecommonLbConfig\x12C\n" +
-	"\x10transport_socket\x18\x18 \x01(\v2\x18.core.v1.TransportSocketR\x0ftransportSocket\x1ak\n" +
+	"\x10transport_socket\x18\x18 \x01(\v2\x18.core.v1.TransportSocketR\x0ftransportSocket\x12N\n" +
+	"\x10circuit_breakers\x18\n" +
+	" \x01(\v2#.cluster.v1.Cluster.CircuitBreakersR\x0fcircuitBreakers\x12Q\n" +
+	"\x11outlier_detection\x18\x13 \x01(\v2$.cluster.v1.Cluster.OutlierDetectionR\x10outlierDetection\x12[\n" +
+	"\x1bmax_requests_per_connection\x18\x1d \x01(\v2\x1c.google.protobuf.UInt32ValueR\x18maxRequestsPerConnection\x1ak\n" +
 	"\x10EdsClusterConfig\x124\n" +
 	"\n" +
 	"eds_config\x18\x01 \x01(\v2\x15.core.v1.ConfigSourceR\tedsConfig\x12!\n" +
@@ -468,7 +756,34 @@ const file_cluster_v1_cluster_proto_rawDesc = "" +
 	"\x14override_host_status\x18\b \x01(\v2\x18.core.v1.HealthStatusSetR\x12overrideHostStatus\x1a`\n" +
 	"\x11CustomClusterType\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x127\n" +
-	"\ftyped_config\x18\x02 \x01(\v2\x14.google.protobuf.AnyR\vtypedConfig\"E\n" +
+	"\ftyped_config\x18\x02 \x01(\v2\x14.google.protobuf.AnyR\vtypedConfig\x1a\xb0\x03\n" +
+	"\x0fCircuitBreakers\x12N\n" +
+	"\n" +
+	"thresholds\x18\x01 \x03(\v2..cluster.v1.Cluster.CircuitBreakers.ThresholdsR\n" +
+	"thresholds\x1a\xcc\x02\n" +
+	"\n" +
+	"Thresholds\x12E\n" +
+	"\x0fmax_connections\x18\x01 \x01(\v2\x1c.google.protobuf.UInt32ValueR\x0emaxConnections\x12N\n" +
+	"\x14max_pending_requests\x18\x02 \x01(\v2\x1c.google.protobuf.UInt32ValueR\x12maxPendingRequests\x12?\n" +
+	"\fmax_requests\x18\x03 \x01(\v2\x1c.google.protobuf.UInt32ValueR\vmaxRequests\x12=\n" +
+	"\vmax_retries\x18\x04 \x01(\v2\x1c.google.protobuf.UInt32ValueR\n" +
+	"maxRetries\x12'\n" +
+	"\x0ftrack_remaining\x18\x05 \x01(\bR\x0etrackRemaining\x1a\x8b\t\n" +
+	"\x10OutlierDetection\x12E\n" +
+	"\x0fconsecutive_5xx\x18\x01 \x01(\v2\x1c.google.protobuf.UInt32ValueR\x0econsecutive5xx\x12X\n" +
+	"\x19enforcing_consecutive_5xx\x18\x02 \x01(\v2\x1c.google.protobuf.UInt32ValueR\x17enforcingConsecutive5xx\x12\\\n" +
+	"\x1bconsecutive_gateway_failure\x18\x03 \x01(\v2\x1c.google.protobuf.UInt32ValueR\x19consecutiveGatewayFailure\x12o\n" +
+	"%enforcing_consecutive_gateway_failure\x18\x04 \x01(\v2\x1c.google.protobuf.UInt32ValueR\"enforcingConsecutiveGatewayFailure\x125\n" +
+	"\binterval\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\binterval\x12G\n" +
+	"\x12base_ejection_time\x18\x06 \x01(\v2\x19.google.protobuf.DurationR\x10baseEjectionTime\x12N\n" +
+	"\x14max_ejection_percent\x18\a \x01(\v2\x1c.google.protobuf.UInt32ValueR\x12maxEjectionPercent\x12J\n" +
+	"\"split_external_local_origin_errors\x18\b \x01(\bR\x1esplitExternalLocalOriginErrors\x12e\n" +
+	" consecutive_local_origin_failure\x18\t \x01(\v2\x1c.google.protobuf.UInt32ValueR\x1dconsecutiveLocalOriginFailure\x12x\n" +
+	"*enforcing_consecutive_local_origin_failure\x18\n" +
+	" \x01(\v2\x1c.google.protobuf.UInt32ValueR&enforcingConsecutiveLocalOriginFailure\x12R\n" +
+	"\x16enforcing_success_rate\x18\v \x01(\v2\x1c.google.protobuf.UInt32ValueR\x14enforcingSuccessRate\x12j\n" +
+	"#enforcing_local_origin_success_rate\x18\f \x01(\v2\x1c.google.protobuf.UInt32ValueR\x1fenforcingLocalOriginSuccessRate\x12J\n" +
+	"\x12min_health_percent\x18\r \x01(\v2\x1c.google.protobuf.UInt32ValueR\x10minHealthPercent\"E\n" +
 	"\rDiscoveryType\x12\n" +
 	"\n" +
 	"\x06STATIC\x10\x00\x12\x0e\n" +
@@ -497,42 +812,65 @@ func file_cluster_v1_cluster_proto_rawDescGZIP() []byte {
 }
 
 var file_cluster_v1_cluster_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_cluster_v1_cluster_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_cluster_v1_cluster_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_cluster_v1_cluster_proto_goTypes = []any{
-	(Cluster_DiscoveryType)(0),        // 0: cluster.v1.Cluster.DiscoveryType
-	(Cluster_LbPolicy)(0),             // 1: cluster.v1.Cluster.LbPolicy
-	(*Cluster)(nil),                   // 2: cluster.v1.Cluster
-	(*Cluster_EdsClusterConfig)(nil),  // 3: cluster.v1.Cluster.EdsClusterConfig
-	(*Cluster_CommonLbConfig)(nil),    // 4: cluster.v1.Cluster.CommonLbConfig
-	(*Cluster_CustomClusterType)(nil), // 5: cluster.v1.Cluster.CustomClusterType
-	(*durationpb.Duration)(nil),       // 6: google.protobuf.Duration
-	(*wrapperspb.UInt32Value)(nil),    // 7: google.protobuf.UInt32Value
-	(*v1.HealthCheck)(nil),            // 8: core.v1.HealthCheck
-	(*v11.ClusterLoadAssignment)(nil), // 9: endpoint.v1.ClusterLoadAssignment
-	(*v1.TransportSocket)(nil),        // 10: core.v1.TransportSocket
-	(*v1.ConfigSource)(nil),           // 11: core.v1.ConfigSource
-	(*v1.HealthStatusSet)(nil),        // 12: core.v1.HealthStatusSet
-	(*anypb.Any)(nil),                 // 13: google.protobuf.Any
+	(Cluster_DiscoveryType)(0),                 // 0: cluster.v1.Cluster.DiscoveryType
+	(Cluster_LbPolicy)(0),                      // 1: cluster.v1.Cluster.LbPolicy
+	(*Cluster)(nil),                            // 2: cluster.v1.Cluster
+	(*Cluster_EdsClusterConfig)(nil),           // 3: cluster.v1.Cluster.EdsClusterConfig
+	(*Cluster_CommonLbConfig)(nil),             // 4: cluster.v1.Cluster.CommonLbConfig
+	(*Cluster_CustomClusterType)(nil),          // 5: cluster.v1.Cluster.CustomClusterType
+	(*Cluster_CircuitBreakers)(nil),            // 6: cluster.v1.Cluster.CircuitBreakers
+	(*Cluster_OutlierDetection)(nil),           // 7: cluster.v1.Cluster.OutlierDetection
+	(*Cluster_CircuitBreakers_Thresholds)(nil), // 8: cluster.v1.Cluster.CircuitBreakers.Thresholds
+	(*durationpb.Duration)(nil),                // 9: google.protobuf.Duration
+	(*wrapperspb.UInt32Value)(nil),             // 10: google.protobuf.UInt32Value
+	(*v1.HealthCheck)(nil),                     // 11: core.v1.HealthCheck
+	(*v11.ClusterLoadAssignment)(nil),          // 12: endpoint.v1.ClusterLoadAssignment
+	(*v1.TransportSocket)(nil),                 // 13: core.v1.TransportSocket
+	(*v1.ConfigSource)(nil),                    // 14: core.v1.ConfigSource
+	(*v1.HealthStatusSet)(nil),                 // 15: core.v1.HealthStatusSet
+	(*anypb.Any)(nil),                          // 16: google.protobuf.Any
 }
 var file_cluster_v1_cluster_proto_depIdxs = []int32{
 	0,  // 0: cluster.v1.Cluster.type:type_name -> cluster.v1.Cluster.DiscoveryType
 	5,  // 1: cluster.v1.Cluster.cluster_type:type_name -> cluster.v1.Cluster.CustomClusterType
 	3,  // 2: cluster.v1.Cluster.eds_cluster_config:type_name -> cluster.v1.Cluster.EdsClusterConfig
-	6,  // 3: cluster.v1.Cluster.connect_timeout:type_name -> google.protobuf.Duration
-	7,  // 4: cluster.v1.Cluster.per_connection_buffer_limit_bytes:type_name -> google.protobuf.UInt32Value
+	9,  // 3: cluster.v1.Cluster.connect_timeout:type_name -> google.protobuf.Duration
+	10, // 4: cluster.v1.Cluster.per_connection_buffer_limit_bytes:type_name -> google.protobuf.UInt32Value
 	1,  // 5: cluster.v1.Cluster.lb_policy:type_name -> cluster.v1.Cluster.LbPolicy
-	8,  // 6: cluster.v1.Cluster.health_checks:type_name -> core.v1.HealthCheck
-	9,  // 7: cluster.v1.Cluster.load_assignment:type_name -> endpoint.v1.ClusterLoadAssignment
+	11, // 6: cluster.v1.Cluster.health_checks:type_name -> core.v1.HealthCheck
+	12, // 7: cluster.v1.Cluster.load_assignment:type_name -> endpoint.v1.ClusterLoadAssignment
 	4,  // 8: cluster.v1.Cluster.common_lb_config:type_name -> cluster.v1.Cluster.CommonLbConfig
-	10, // 9: cluster.v1.Cluster.transport_socket:type_name -> core.v1.TransportSocket
-	11, // 10: cluster.v1.Cluster.EdsClusterConfig.eds_config:type_name -> core.v1.ConfigSource
-	12, // 11: cluster.v1.Cluster.CommonLbConfig.override_host_status:type_name -> core.v1.HealthStatusSet
-	13, // 12: cluster.v1.Cluster.CustomClusterType.typed_config:type_name -> google.protobuf.Any
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	13, // 9: cluster.v1.Cluster.transport_socket:type_name -> core.v1.TransportSocket
+	6,  // 10: cluster.v1.Cluster.circuit_breakers:type_name -> cluster.v1.Cluster.CircuitBreakers
+	7,  // 11: cluster.v1.Cluster.outlier_detection:type_name -> cluster.v1.Cluster.OutlierDetection
+	10, // 12: cluster.v1.Cluster.max_requests_per_connection:type_name -> google.protobuf.UInt32Value
+	14, // 13: cluster.v1.Cluster.EdsClusterConfig.eds_config:type_name -> core.v1.ConfigSource
+	15, // 14: cluster.v1.Cluster.CommonLbConfig.override_host_status:type_name -> core.v1.HealthStatusSet
+	16, // 15: cluster.v1.Cluster.CustomClusterType.typed_config:type_name -> google.protobuf.Any
+	8,  // 16: cluster.v1.Cluster.CircuitBreakers.thresholds:type_name -> cluster.v1.Cluster.CircuitBreakers.Thresholds
+	10, // 17: cluster.v1.Cluster.OutlierDetection.consecutive_5xx:type_name -> google.protobuf.UInt32Value
+	10, // 18: cluster.v1.Cluster.OutlierDetection.enforcing_consecutive_5xx:type_name -> google.protobuf.UInt32Value
+	10, // 19: cluster.v1.Cluster.OutlierDetection.consecutive_gateway_failure:type_name -> google.protobuf.UInt32Value
+	10, // 20: cluster.v1.Cluster.OutlierDetection.enforcing_consecutive_gateway_failure:type_name -> google.protobuf.UInt32Value
+	9,  // 21: cluster.v1.Cluster.OutlierDetection.interval:type_name -> google.protobuf.Duration
+	9,  // 22: cluster.v1.Cluster.OutlierDetection.base_ejection_time:type_name -> google.protobuf.Duration
+	10, // 23: cluster.v1.Cluster.OutlierDetection.max_ejection_percent:type_name -> google.protobuf.UInt32Value
+	10, // 24: cluster.v1.Cluster.OutlierDetection.consecutive_local_origin_failure:type_name -> google.protobuf.UInt32Value
+	10, // 25: cluster.v1.Cluster.OutlierDetection.enforcing_consecutive_local_origin_failure:type_name -> google.protobuf.UInt32Value
+	10, // 26: cluster.v1.Cluster.OutlierDetection.enforcing_success_rate:type_name -> google.protobuf.UInt32Value
+	10, // 27: cluster.v1.Cluster.OutlierDetection.enforcing_local_origin_success_rate:type_name -> google.protobuf.UInt32Value
+	10, // 28: cluster.v1.Cluster.OutlierDetection.min_health_percent:type_name -> google.protobuf.UInt32Value
+	10, // 29: cluster.v1.Cluster.CircuitBreakers.Thresholds.max_connections:type_name -> google.protobuf.UInt32Value
+	10, // 30: cluster.v1.Cluster.CircuitBreakers.Thresholds.max_pending_requests:type_name -> google.protobuf.UInt32Value
+	10, // 31: cluster.v1.Cluster.CircuitBreakers.Thresholds.max_requests:type_name -> google.protobuf.UInt32Value
+	10, // 32: cluster.v1.Cluster.CircuitBreakers.Thresholds.max_retries:type_name -> google.protobuf.UInt32Value
+	33, // [33:33] is the sub-list for method output_type
+	33, // [33:33] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_cluster_v1_cluster_proto_init() }
@@ -550,7 +888,7 @@ func file_cluster_v1_cluster_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cluster_v1_cluster_proto_rawDesc), len(file_cluster_v1_cluster_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   4,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
