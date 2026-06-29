@@ -3,9 +3,11 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use dxgate_proxy::ProxyState;
+use dxgate_proxy::{HttpRouteMetric, ProxyMetrics, ProxyState, Readiness, RouteMetric};
 use serde::Serialize;
 use std::net::SocketAddr;
+
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildInfo {
@@ -80,9 +82,17 @@ async fn readyz(State(admin): State<AdminServer>) -> Response {
     (status, Json(readiness)).into_response()
 }
 
-async fn metrics(State(admin): State<AdminServer>) -> String {
+async fn metrics(State(admin): State<AdminServer>) -> Response {
     let readiness = admin.state.readiness().await;
     let proxy = admin.state.metrics();
+    (
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        prometheus_metrics(readiness, proxy),
+    )
+        .into_response()
+}
+
+fn prometheus_metrics(readiness: Readiness, proxy: ProxyMetrics) -> String {
     let mut out = format!(
         "# HELP dxgate_ready Whether dxgate has accepted runtime config\n# TYPE dxgate_ready gauge\ndxgate_ready {}\n# HELP dxgate_config_conflicts Current rejected config conflicts\n# TYPE dxgate_config_conflicts gauge\ndxgate_config_conflicts {}\n",
         if readiness.ready { 1 } else { 0 },
@@ -107,75 +117,116 @@ async fn metrics(State(admin): State<AdminServer>) -> String {
     ));
     out.push_str("# HELP dxgate_http_route_requests_total HTTP gateway requests observed by route and cluster\n# TYPE dxgate_http_route_requests_total counter\n");
     for route in &proxy.http_routes {
+        let labels = http_route_labels(route);
         out.push_str(&format!(
-            "dxgate_http_route_requests_total{{route=\"{}\",cluster=\"{}\"}} {}\n",
-            route.route, route.cluster, route.requests
+            "dxgate_http_route_requests_total{{{labels}}} {}\n",
+            route.requests
         ));
     }
     out.push_str("# HELP dxgate_http_route_failures_total HTTP gateway upstream failures observed by route and cluster\n# TYPE dxgate_http_route_failures_total counter\n");
     for route in &proxy.http_routes {
+        let labels = http_route_labels(route);
         out.push_str(&format!(
-            "dxgate_http_route_failures_total{{route=\"{}\",cluster=\"{}\"}} {}\n",
-            route.route, route.cluster, route.failures
+            "dxgate_http_route_failures_total{{{labels}}} {}\n",
+            route.failures
         ));
     }
     out.push_str("# HELP dxgate_http_route_latency_ms HTTP gateway upstream latency in milliseconds\n# TYPE dxgate_http_route_latency_ms histogram\n");
     for route in &proxy.http_routes {
+        let labels = http_route_labels(route);
         out.push_str(&format!(
-            "dxgate_http_route_latency_ms_sum{{route=\"{}\",cluster=\"{}\"}} {}\n",
-            route.route, route.cluster, route.latency_ms_sum
+            "dxgate_http_route_latency_ms_sum{{{labels}}} {}\n",
+            route.latency_ms_sum
         ));
         for bucket in &route.latency_ms_buckets {
             out.push_str(&format!(
-                "dxgate_http_route_latency_ms_bucket{{route=\"{}\",cluster=\"{}\",le=\"{}\"}} {}\n",
-                route.route, route.cluster, bucket.le, bucket.count
+                "dxgate_http_route_latency_ms_bucket{{{labels},le=\"{}\"}} {}\n",
+                bucket.le, bucket.count
             ));
         }
         out.push_str(&format!(
-            "dxgate_http_route_latency_ms_bucket{{route=\"{}\",cluster=\"{}\",le=\"+Inf\"}} {}\n",
-            route.route, route.cluster, route.requests
+            "dxgate_http_route_latency_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
+            route.requests
         ));
         out.push_str(&format!(
-            "dxgate_http_route_latency_ms_count{{route=\"{}\",cluster=\"{}\"}} {}\n",
-            route.route, route.cluster, route.requests
+            "dxgate_http_route_latency_ms_count{{{labels}}} {}\n",
+            route.requests
         ));
     }
     out.push_str("# HELP dxgate_agent_route_requests_total Agent protocol requests observed by route and backend\n# TYPE dxgate_agent_route_requests_total counter\n");
     for route in &proxy.routes {
+        let labels = agent_route_labels(route);
         out.push_str(&format!(
-            "dxgate_agent_route_requests_total{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
-            route.protocol, route.route, route.backend, route.requests
+            "dxgate_agent_route_requests_total{{{labels}}} {}\n",
+            route.requests
         ));
     }
     out.push_str("# HELP dxgate_agent_route_failures_total Agent protocol upstream failures observed by route and backend\n# TYPE dxgate_agent_route_failures_total counter\n");
     for route in &proxy.routes {
+        let labels = agent_route_labels(route);
         out.push_str(&format!(
-            "dxgate_agent_route_failures_total{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
-            route.protocol, route.route, route.backend, route.failures
+            "dxgate_agent_route_failures_total{{{labels}}} {}\n",
+            route.failures
         ));
     }
     out.push_str("# HELP dxgate_agent_route_latency_ms Agent protocol upstream latency in milliseconds\n# TYPE dxgate_agent_route_latency_ms histogram\n");
     for route in &proxy.routes {
+        let labels = agent_route_labels(route);
         out.push_str(&format!(
-            "dxgate_agent_route_latency_ms_sum{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
-            route.protocol, route.route, route.backend, route.latency_ms_sum
+            "dxgate_agent_route_latency_ms_sum{{{labels}}} {}\n",
+            route.latency_ms_sum
         ));
         for bucket in &route.latency_ms_buckets {
             out.push_str(&format!(
-                "dxgate_agent_route_latency_ms_bucket{{protocol=\"{}\",route=\"{}\",backend=\"{}\",le=\"{}\"}} {}\n",
-                route.protocol, route.route, route.backend, bucket.le, bucket.count
+                "dxgate_agent_route_latency_ms_bucket{{{labels},le=\"{}\"}} {}\n",
+                bucket.le, bucket.count
             ));
         }
         out.push_str(&format!(
-            "dxgate_agent_route_latency_ms_bucket{{protocol=\"{}\",route=\"{}\",backend=\"{}\",le=\"+Inf\"}} {}\n",
-            route.protocol, route.route, route.backend, route.requests
+            "dxgate_agent_route_latency_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
+            route.requests
         ));
         out.push_str(&format!(
-            "dxgate_agent_route_latency_ms_count{{protocol=\"{}\",route=\"{}\",backend=\"{}\"}} {}\n",
-            route.protocol, route.route, route.backend, route.requests
+            "dxgate_agent_route_latency_ms_count{{{labels}}} {}\n",
+            route.requests
         ));
     }
     out
+}
+
+fn http_route_labels(route: &HttpRouteMetric) -> String {
+    let status_code = route.status_code.to_string();
+    prometheus_labels(&[
+        ("namespace", route.namespace.as_str()),
+        ("gateway", route.gateway.as_str()),
+        ("route", route.route.as_str()),
+        ("cluster", route.cluster.as_str()),
+        ("method", route.method.as_str()),
+        ("status_code", status_code.as_str()),
+    ])
+}
+
+fn agent_route_labels(route: &RouteMetric) -> String {
+    prometheus_labels(&[
+        ("protocol", route.protocol.as_str()),
+        ("route", route.route.as_str()),
+        ("backend", route.backend.as_str()),
+    ])
+}
+
+fn prometheus_labels(labels: &[(&str, &str)]) -> String {
+    labels
+        .iter()
+        .map(|(name, value)| format!("{name}=\"{}\"", prometheus_label_value(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
 async fn debug_config(State(admin): State<AdminServer>) -> Json<dxgate_core::RuntimeConfig> {
@@ -673,7 +724,8 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
-    use super::admin_html;
+    use super::{admin_html, prometheus_metrics};
+    use dxgate_proxy::{HttpRouteMetric, LatencyBucket, ProxyMetrics, Readiness};
 
     #[test]
     fn admin_ui_contains_runtime_panels() {
@@ -702,5 +754,47 @@ mod tests {
         assert!(!html.contains("metric-routes\">0"));
         assert!(!html.contains("value=\"/mcp\""));
         assert!(!html.contains("mcp-result\">{}"));
+    }
+
+    #[test]
+    fn prometheus_metrics_escape_labels_and_include_http_dimensions() {
+        let text = prometheus_metrics(
+            Readiness {
+                ready: true,
+                version: "test".into(),
+                conflicts: vec![],
+            },
+            ProxyMetrics {
+                total_requests: 1,
+                agent_requests: 0,
+                policy_denied: 0,
+                upstream_failures: 1,
+                http_routes: vec![HttpRouteMetric {
+                    namespace: "app\nns".into(),
+                    gateway: "public\"gw".into(),
+                    route: "default\\route".into(),
+                    cluster: "reviews".into(),
+                    method: "GET".into(),
+                    status_code: 502,
+                    requests: 1,
+                    failures: 1,
+                    latency_ms_sum: 25,
+                    latency_ms_buckets: vec![
+                        LatencyBucket { le: 5, count: 0 },
+                        LatencyBucket { le: 25, count: 1 },
+                    ],
+                }],
+                routes: vec![],
+            },
+        );
+
+        assert!(text.contains("namespace=\"app\\nns\""));
+        assert!(text.contains("gateway=\"public\\\"gw\""));
+        assert!(text.contains("route=\"default\\\\route\""));
+        assert!(text.contains("method=\"GET\""));
+        assert!(text.contains("status_code=\"502\""));
+        assert!(text.contains("dxgate_http_route_latency_ms_sum{"));
+        assert!(text.contains("dxgate_http_route_latency_ms_count{"));
+        assert!(text.contains("le=\"+Inf\""));
     }
 }

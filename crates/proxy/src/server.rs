@@ -44,6 +44,7 @@ pub struct ProxyServer {
     state: ProxyState,
     clients: UpstreamClients,
     policy_default: PolicyDefault,
+    metrics_identity: MetricsIdentity,
 }
 
 impl ProxyServer {
@@ -52,6 +53,7 @@ impl ProxyServer {
             state,
             clients: UpstreamClients::from_env(),
             policy_default: PolicyDefault::from_env(),
+            metrics_identity: MetricsIdentity::from_env(),
         }
     }
 
@@ -61,6 +63,23 @@ impl ProxyServer {
             .serve(app.into_make_service())
             .await
             .map_err(std::io::Error::other)
+    }
+}
+
+#[derive(Clone)]
+struct MetricsIdentity {
+    namespace: String,
+    gateway: String,
+}
+
+impl MetricsIdentity {
+    fn from_env() -> Self {
+        Self {
+            namespace: env::var("POD_NAMESPACE").unwrap_or_else(|_| "unknown".to_string()),
+            gateway: env::var("DXGATE_GATEWAY_NAME")
+                .or_else(|_| env::var("GATEWAY_NAME"))
+                .unwrap_or_else(|_| "unknown".to_string()),
+        }
     }
 }
 
@@ -121,6 +140,7 @@ async fn forward_http(
     cfg: dxgate_core::RuntimeConfig,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    let method = req.method().as_str().to_string();
     let host = host_header(req.headers()).unwrap_or("*");
     let path = req
         .uri()
@@ -141,26 +161,27 @@ async fn forward_http(
     let route_name = route.name.clone();
     let weighted_clusters = route.weighted_clusters.clone();
 
-    let weighted = server
-        .state
-        .pick_cluster(&weighted_clusters)
-        .await
-        .ok_or_else(|| {
-            (
+    let weighted = match server.state.pick_cluster(&weighted_clusters).await {
+        Some(weighted) => weighted,
+        None => {
+            record_http_metric(&server, &route_name, "none", &method, 503, 0);
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "route has no clusters".to_string(),
-            )
-        })?;
+            ));
+        }
+    };
 
-    let cluster = cfg
-        .cluster(&weighted.name)
-        .ok_or_else(|| {
-            (
+    let cluster = match cfg.cluster(&weighted.name) {
+        Some(cluster) => cluster.clone(),
+        None => {
+            record_http_metric(&server, &route_name, &weighted.name, &method, 503, 0);
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("cluster {} not found", weighted.name),
-            )
-        })?
-        .clone();
+            ));
+        }
+    };
     let cluster_name = cluster.name.clone();
 
     let endpoint = match server
@@ -170,18 +191,14 @@ async fn forward_http(
     {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            server
-                .state
-                .record_http_request(&route_name, &cluster_name, 503, 0);
+            record_http_metric(&server, &route_name, &cluster_name, &method, 503, 0);
             return Err((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
         }
     };
     let _circuit_breaker_permit = match server.state.try_acquire_circuit_breaker(&cluster) {
         Ok(permit) => permit,
         Err(_) => {
-            server
-                .state
-                .record_http_request(&route_name, &cluster_name, 503, 0);
+            record_http_metric(&server, &route_name, &cluster_name, &method, 503, 0);
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("cluster {} circuit breaker open", cluster_name),
@@ -198,6 +215,7 @@ async fn forward_http(
     let upstream_uri = format!("{}://{}{}", scheme, endpoint_authority(&endpoint), path)
         .parse::<Uri>()
         .map_err(|e| {
+            record_http_metric(&server, &route_name, &cluster_name, &method, 502, 0);
             (
                 StatusCode::BAD_GATEWAY,
                 format!("invalid upstream uri: {e}"),
@@ -230,9 +248,14 @@ async fn forward_http(
         .as_ref()
         .map(|response| response.status().as_u16())
         .unwrap_or_else(|(status, _)| status.as_u16());
-    server
-        .state
-        .record_http_request(&route_name, &cluster_name, status, latency_ms);
+    record_http_metric(
+        &server,
+        &route_name,
+        &cluster_name,
+        &method,
+        status,
+        latency_ms,
+    );
     info!(
         route = %route_name,
         cluster = %cluster_name,
@@ -241,6 +264,25 @@ async fn forward_http(
         "http access"
     );
     result
+}
+
+fn record_http_metric(
+    server: &ProxyServer,
+    route: &str,
+    cluster: &str,
+    method: &str,
+    status_code: u16,
+    latency_ms: u64,
+) {
+    server.state.record_http_request(
+        &server.metrics_identity.namespace,
+        &server.metrics_identity.gateway,
+        route,
+        cluster,
+        method,
+        status_code,
+        latency_ms,
+    );
 }
 
 async fn forward_agent(

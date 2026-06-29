@@ -46,8 +46,12 @@ pub struct ProxyMetrics {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HttpRouteMetric {
+    pub namespace: String,
+    pub gateway: String,
     pub route: String,
     pub cluster: String,
+    pub method: String,
+    pub status_code: u16,
     pub requests: u64,
     pub failures: u64,
     pub latency_ms_sum: u64,
@@ -83,8 +87,12 @@ struct MetricsStore {
 
 #[derive(Debug, Default)]
 struct HttpRouteMetricCounter {
+    namespace: String,
+    gateway: String,
     route: String,
     cluster: String,
+    method: String,
+    status_code: u16,
     requests: u64,
     failures: u64,
     latency_ms_sum: u64,
@@ -274,24 +282,37 @@ impl ProxyState {
         }
     }
 
-    pub fn record_http_request(&self, route: &str, cluster: &str, status: u16, latency_ms: u64) {
+    pub fn record_http_request(
+        &self,
+        namespace: &str,
+        gateway: &str,
+        route: &str,
+        cluster: &str,
+        method: &str,
+        status_code: u16,
+        latency_ms: u64,
+    ) {
         let mut metrics = self.inner.metrics.lock().unwrap();
         metrics.total_requests += 1;
-        if status >= 500 {
+        if status_code >= 500 {
             metrics.upstream_failures += 1;
         }
-        let key = format!("{route}|{cluster}");
+        let key = format!("{namespace}|{gateway}|{route}|{cluster}|{method}|{status_code}");
         let route_metric =
             metrics
                 .http_routes
                 .entry(key)
                 .or_insert_with(|| HttpRouteMetricCounter {
+                    namespace: namespace.to_string(),
+                    gateway: gateway.to_string(),
                     route: route.to_string(),
                     cluster: cluster.to_string(),
+                    method: method.to_string(),
+                    status_code,
                     ..HttpRouteMetricCounter::default()
                 });
         route_metric.requests += 1;
-        if status >= 500 {
+        if status_code >= 500 {
             route_metric.failures += 1;
         }
         route_metric.latency_ms_sum += latency_ms;
@@ -371,8 +392,12 @@ impl ProxyState {
             .http_routes
             .values()
             .map(|route| HttpRouteMetric {
+                namespace: route.namespace.clone(),
+                gateway: route.gateway.clone(),
                 route: route.route.clone(),
                 cluster: route.cluster.clone(),
+                method: route.method.clone(),
+                status_code: route.status_code,
                 requests: route.requests,
                 failures: route.failures,
                 latency_ms_sum: route.latency_ms_sum,
@@ -387,9 +412,13 @@ impl ProxyState {
             })
             .collect::<Vec<_>>();
         http_routes.sort_by(|a, b| {
-            a.route
-                .cmp(&b.route)
+            a.namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.gateway.cmp(&b.gateway))
+                .then_with(|| a.route.cmp(&b.route))
                 .then_with(|| a.cluster.cmp(&b.cluster))
+                .then_with(|| a.method.cmp(&b.method))
+                .then_with(|| a.status_code.cmp(&b.status_code))
         });
         let mut routes = metrics
             .routes
@@ -584,20 +613,26 @@ mod tests {
     fn records_http_route_metrics() {
         let state = ProxyState::new(RuntimeConfig::empty("test"));
 
-        state.record_http_request("default", "reviews", 200, 12);
-        state.record_http_request("default", "reviews", 502, 260);
+        state.record_http_request("app", "public", "default", "reviews", "GET", 200, 12);
+        state.record_http_request("app", "public", "default", "reviews", "GET", 502, 260);
 
         let metrics = state.metrics();
         assert_eq!(metrics.total_requests, 2);
         assert_eq!(metrics.upstream_failures, 1);
-        assert_eq!(metrics.http_routes.len(), 1);
-        let route = &metrics.http_routes[0];
+        assert_eq!(metrics.http_routes.len(), 2);
+        let route = metrics
+            .http_routes
+            .iter()
+            .find(|metric| metric.status_code == 502)
+            .expect("missing 502 route metric");
+        assert_eq!(route.namespace, "app");
+        assert_eq!(route.gateway, "public");
         assert_eq!(route.route, "default");
         assert_eq!(route.cluster, "reviews");
-        assert_eq!(route.requests, 2);
+        assert_eq!(route.method, "GET");
+        assert_eq!(route.requests, 1);
         assert_eq!(route.failures, 1);
-        assert_eq!(route.latency_ms_sum, 272);
-        assert_eq!(route.latency_ms_buckets[2].count, 1);
-        assert_eq!(route.latency_ms_buckets[6].count, 2);
+        assert_eq!(route.latency_ms_sum, 260);
+        assert_eq!(route.latency_ms_buckets[6].count, 1);
     }
 }
