@@ -36,9 +36,10 @@ fn copy_generated_sources() -> std::io::Result<bool> {
     }
 
     println!("cargo:rerun-if-changed={}", generated.display());
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "OUT_DIR is not set")
-    })?);
+    let out_dir =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "OUT_DIR is not set")
+        })?);
     for entry in fs::read_dir(generated)? {
         let entry = entry?;
         let path = entry.path();

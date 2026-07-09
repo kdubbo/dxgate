@@ -45,10 +45,10 @@ pub enum XdsError {
     },
 
     #[error("failed opening ADS stream: {0}")]
-    StreamOpen(tonic::Status),
+    StreamOpen(Box<tonic::Status>),
 
     #[error("ADS stream receive failed: {0}")]
-    StreamReceive(tonic::Status),
+    StreamReceive(Box<tonic::Status>),
 
     #[error("ADS request channel is closed")]
     RequestChannelClosed,
@@ -123,7 +123,7 @@ impl XdsClient {
         let response = ads
             .stream_aggregated_resources(ReceiverStream::new(request_rx))
             .await
-            .map_err(XdsError::StreamOpen)?;
+            .map_err(|status| XdsError::StreamOpen(Box::new(status)))?;
         let mut stream = response.into_inner();
 
         info!(
@@ -133,7 +133,11 @@ impl XdsClient {
             "connected dxgate router to dubbod ADS endpoint"
         );
 
-        while let Some(resp) = stream.message().await.map_err(XdsError::StreamReceive)? {
+        while let Some(resp) = stream
+            .message()
+            .await
+            .map_err(|status| XdsError::StreamReceive(Box::new(status)))?
+        {
             let updates = state.apply_response(&resp)?;
             send_discovery_request(
                 &request_tx,
@@ -473,9 +477,8 @@ struct ClusterSnapshot {
 }
 
 fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamTls> {
-    let typed_config = match cluster.transport_socket.as_ref()?.config_type.as_ref()? {
-        xds_core::transport_socket::ConfigType::TypedConfig(any) => any,
-    };
+    let xds_core::transport_socket::ConfigType::TypedConfig(typed_config) =
+        cluster.transport_socket.as_ref()?.config_type.as_ref()?;
     if !typed_config
         .type_url
         .ends_with("extensions.transport_sockets.tls.v1.UpstreamTlsContext")
@@ -542,11 +545,8 @@ fn certificate_provider_name(common: &xds_tls::CommonTlsContext) -> Option<Strin
 }
 
 fn validation_provider_name(common: &xds_tls::CommonTlsContext) -> Option<String> {
-    let combined = match common.validation_context_type.as_ref()? {
-        xds_tls::common_tls_context::ValidationContextType::CombinedValidationContext(combined) => {
-            combined
-        }
-    };
+    let xds_tls::common_tls_context::ValidationContextType::CombinedValidationContext(combined) =
+        common.validation_context_type.as_ref()?;
     combined
         .validation_context_certificate_provider_instance
         .as_ref()
@@ -585,15 +585,15 @@ fn listener_snapshot(listener: xds_listener::Listener) -> Result<ListenerSnapsho
 
     for hcm in http_connection_managers(&listener)? {
         match hcm.route_specifier {
-            Some(xds_hcm::http_connection_manager::RouteSpecifier::Rds(rds)) => {
-                if !rds.route_config_name.is_empty() {
-                    route_names.push(rds.route_config_name);
-                }
+            Some(xds_hcm::http_connection_manager::RouteSpecifier::Rds(rds))
+                if !rds.route_config_name.is_empty() =>
+            {
+                route_names.push(rds.route_config_name);
             }
             Some(xds_hcm::http_connection_manager::RouteSpecifier::RouteConfig(route_config)) => {
                 inline_virtual_hosts.extend(convert_virtual_hosts(&route_config.virtual_hosts));
             }
-            None => {}
+            _ => {}
         }
     }
 

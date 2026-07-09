@@ -487,9 +487,11 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       <section id="tab-overview">
         <div class="grid">
           <div class="metric"><span>Ready</span><strong id="metric-ready">loading</strong></div>
+          <div class="metric"><span>Requests</span><strong id="metric-requests">loading</strong></div>
           <div class="metric"><span>Agent routes</span><strong id="metric-routes">loading</strong></div>
           <div class="metric"><span>Backends</span><strong id="metric-backends">loading</strong></div>
           <div class="metric"><span>Policy denies</span><strong id="metric-denies">loading</strong></div>
+          <div class="metric"><span>Upstream failures</span><strong id="metric-failures">loading</strong></div>
         </div>
         <div class="panel">
           <h2>Route traffic</h2>
@@ -505,6 +507,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       <section id="tab-backends" class="hidden">
         <div class="panel"><h2>Backends</h2><div class="table-wrap"><table id="backends-table"></table></div></div>
         <div class="panel"><h2>Providers</h2><div class="table-wrap"><table id="providers-table"></table></div></div>
+        <div class="panel"><h2>Dubbo clusters</h2><div class="table-wrap"><table id="clusters-table"></table></div></div>
       </section>
 
       <section id="tab-policies" class="hidden">
@@ -631,9 +634,11 @@ const ADMIN_HTML: &str = r#"<!doctype html>
     function render() {
       const ready = Boolean(state.ready && state.ready.ready);
       $('metric-ready').textContent = ready ? 'yes' : 'no';
+      $('metric-requests').textContent = metric('dxgate_requests_total');
       $('metric-routes').textContent = cfgList('routes').length;
       $('metric-backends').textContent = cfgList('backends').length;
       $('metric-denies').textContent = metric('dxgate_policy_denied_total');
+      $('metric-failures').textContent = metric('dxgate_upstream_failures_total');
       $('config-json').textContent = JSON.stringify(state.config, null, 2);
       syncPlaygroundFromRuntime();
       table('traffic-table', [
@@ -669,6 +674,12 @@ const ADMIN_HTML: &str = r#"<!doctype html>
         { label: 'Base URL', value: (r) => esc(r.base_url) },
         { label: 'Key env', value: (r) => esc(r.api_key_env || '-') }
       ], cfgList('providers'));
+      table('clusters-table', [
+        { label: 'Name', value: (r) => esc(r.name) },
+        { label: 'Endpoints', value: (r) => tags((r.endpoints || []).map((e) => e.address + ':' + e.port + (e.healthy === false ? ' (unhealthy)' : ''))) },
+        { label: 'Upstream TLS', value: (r) => esc(r.tls ? (r.tls.mode || 'dubbo_mutual') : 'plaintext') },
+        { label: 'Circuit breaker', value: (r) => r.circuit_breaker ? '<code>' + esc(JSON.stringify(r.circuit_breaker)) + '</code>' : '-' }
+      ], cfgList('clusters'));
       table('policies-table', [
         { label: 'Name', value: (r) => esc(r.name) },
         { label: 'Action', value: (r) => esc(r.action || 'allow') },
@@ -737,6 +748,13 @@ mod tests {
         assert!(html.contains("const proxyPort = 18080;"));
         assert!(html.contains("MCP request"));
         assert!(html.contains("/assets/dxgate-logo.svg"));
+        assert!(html.contains("id=\"metric-requests\""));
+        assert!(html.contains("id=\"metric-failures\""));
+        assert!(html.contains("dxgate_requests_total"));
+        assert!(html.contains("dxgate_upstream_failures_total"));
+        assert!(html.contains("Dubbo clusters"));
+        assert!(html.contains("id=\"clusters-table\""));
+        assert!(html.contains("cfgList('clusters')"));
         assert!(!html.contains("class=\"mark\""));
         assert!(!html.contains("<strong>dxgate</strong>"));
         assert!(!html.contains("<span>admin</span>"));

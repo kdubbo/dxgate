@@ -93,7 +93,7 @@ pub fn env_usize(name: &str, default: usize) -> usize {
 
 pub fn percentile(latencies: &mut [Duration], percentile: usize) -> Duration {
     latencies.sort_unstable();
-    let rank = ((latencies.len() * percentile) + 99) / 100;
+    let rank = (latencies.len() * percentile).div_ceil(100);
     latencies[rank.saturating_sub(1)]
 }
 

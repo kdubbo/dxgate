@@ -253,6 +253,8 @@ impl ProxyState {
         true
     }
 
+    // Err(()) means the breaker is open; there is no failure detail to carry.
+    #[allow(clippy::result_unit_err)]
     pub fn try_acquire_circuit_breaker(
         &self,
         cluster: &Cluster,
@@ -282,6 +284,7 @@ impl ProxyState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_http_request(
         &self,
         namespace: &str,

@@ -434,17 +434,12 @@ pub struct UpstreamTls {
     pub alpn_protocols: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamTlsMode {
     Simple,
+    #[default]
     DubboMutual,
-}
-
-impl Default for UpstreamTlsMode {
-    fn default() -> Self {
-        Self::DubboMutual
-    }
 }
 
 fn is_default_tls_mode(mode: &UpstreamTlsMode) -> bool {
@@ -540,13 +535,12 @@ impl Backend {
         }
     }
 
+    // A request that names no model/tool (e.g. MCP initialize or tools/list)
+    // is not constrained, so backends with declared capabilities stay eligible.
     pub fn supports_model(&self, model: Option<&str>) -> bool {
         match &self.kind {
             BackendKind::Llm { models, .. } => {
-                models.is_empty()
-                    || model
-                        .map(|m| models.iter().any(|v| v == m))
-                        .unwrap_or(false)
+                models.is_empty() || model.map(|m| models.iter().any(|v| v == m)).unwrap_or(true)
             }
             _ => true,
         }
@@ -555,7 +549,7 @@ impl Backend {
     pub fn supports_tool(&self, tool: Option<&str>) -> bool {
         match &self.kind {
             BackendKind::Mcp { tools, .. } => {
-                tools.is_empty() || tool.map(|t| tools.iter().any(|v| v == t)).unwrap_or(false)
+                tools.is_empty() || tool.map(|t| tools.iter().any(|v| v == t)).unwrap_or(true)
             }
             _ => true,
         }
@@ -674,17 +668,12 @@ impl Policy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyAction {
+    #[default]
     Allow,
     Deny,
-}
-
-impl Default for PolicyAction {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,18 +746,13 @@ pub struct RateLimitPolicy {
     pub key: RateLimitKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RateLimitKey {
+    #[default]
     Route,
     Backend,
     Header,
-}
-
-impl Default for RateLimitKey {
-    fn default() -> Self {
-        Self::Route
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1097,6 +1081,23 @@ mod tests {
             .unwrap()
             .supports_model(Some("gpt-4o-mini")));
         assert!(!cfg.backend("gpt").unwrap().supports_model(Some("other")));
+        assert!(cfg.backend("gpt").unwrap().supports_model(None));
+    }
+
+    #[test]
+    fn unconstrained_requests_keep_capability_scoped_backends_eligible() {
+        let backend = Backend {
+            name: "tools".into(),
+            kind: BackendKind::Mcp {
+                endpoint: "http://tools.svc:8080".into(),
+                tools: vec!["search".into()],
+            },
+            policies: vec![],
+        };
+
+        assert!(backend.supports_tool(None));
+        assert!(backend.supports_tool(Some("search")));
+        assert!(!backend.supports_tool(Some("calendar")));
     }
 
     #[test]

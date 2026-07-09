@@ -39,6 +39,7 @@ type PlainClient = Client<HttpConnector, Body>;
 type WebClient = Client<HttpsConnector<HttpConnector>, Body>;
 type MtlsClient = Client<HttpsConnector<HttpConnector>, Body>;
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ProxyServer {
@@ -47,6 +48,7 @@ pub struct ProxyServer {
     policy_default: PolicyDefault,
     metrics_identity: MetricsIdentity,
     access_log: AccessLogConfig,
+    max_body_bytes: usize,
 }
 
 impl ProxyServer {
@@ -57,6 +59,7 @@ impl ProxyServer {
             policy_default: PolicyDefault::from_env(),
             metrics_identity: MetricsIdentity::from_env(),
             access_log: AccessLogConfig::from_env(),
+            max_body_bytes: parse_max_body_bytes(env::var("DXGATE_MAX_BODY_BYTES").ok().as_deref()),
         }
     }
 
@@ -114,17 +117,14 @@ enum AccessLogFormat {
 }
 
 fn parse_access_log_enabled(value: Option<&str>) -> bool {
-    match value.map(str::trim).filter(|value| !value.is_empty()) {
+    !matches!(
+        value.map(str::trim).filter(|value| !value.is_empty()),
         Some(value)
             if value.eq_ignore_ascii_case("false")
                 || value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("no")
-                || value.eq_ignore_ascii_case("off") =>
-        {
-            false
-        }
-        _ => true,
-    }
+                || value.eq_ignore_ascii_case("off")
+    )
 }
 
 fn parse_access_log_format(value: Option<&str>) -> AccessLogFormat {
@@ -132,6 +132,52 @@ fn parse_access_log_format(value: Option<&str>) -> AccessLogFormat {
         Some(value) if value.eq_ignore_ascii_case("json") => AccessLogFormat::Json,
         _ => AccessLogFormat::Text,
     }
+}
+
+fn parse_max_body_bytes(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES)
+}
+
+// Buffered reads back agent-route retries and body inspection; the limit keeps a
+// single oversized request from exhausting proxy memory before policies run.
+async fn read_body_limited(
+    headers: &HeaderMap,
+    mut body: Body,
+    limit: usize,
+) -> Result<Bytes, (StatusCode, String)> {
+    use hyper::body::HttpBody;
+
+    if let Some(length) = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if length > limit {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body of {length} bytes exceeds limit of {limit} bytes"),
+            ));
+        }
+    }
+
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk =
+            chunk.map_err(|e| (StatusCode::BAD_REQUEST, format!("read request body: {e}")))?;
+        if buf.len() + chunk.len() > limit {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeds limit of {limit} bytes"),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 async fn proxy_request(State(server): State<ProxyServer>, req: Request<Body>) -> Response<Body> {
@@ -181,9 +227,7 @@ async fn forward(
     });
     if let Some(protocol) = protocol {
         let (parts, body) = req.into_parts();
-        let body_bytes = body::to_bytes(body)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("read request body: {e}")))?;
+        let body_bytes = read_body_limited(&parts.headers, body, server.max_body_bytes).await?;
         let context = AgentRequestContext::new(protocol, &parts, &body_bytes);
         if let Some(route) = cfg.agent_route_for(&context.input()).cloned() {
             return forward_agent(server, cfg, parts, body_bytes, context, route).await;
@@ -307,7 +351,7 @@ async fn forward_http(
             return Err((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
         }
     };
-    let upstream = endpoint_authority(&endpoint);
+    let upstream = endpoint_authority(endpoint);
     record_http_span(&server, &route_name, &cluster_name, &upstream, 0, 0);
     let _circuit_breaker_permit = match server.state.try_acquire_circuit_breaker(&cluster) {
         Ok(permit) => permit,
@@ -558,6 +602,7 @@ async fn forward_agent(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn request_agent_with_failover(
     server: &ProxyServer,
     cfg: &dxgate_core::RuntimeConfig,
@@ -687,6 +732,7 @@ async fn request_agent_backend(
     fut.await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn federate_mcp_tools(
     server: &ProxyServer,
     cfg: &dxgate_core::RuntimeConfig,
@@ -1773,6 +1819,55 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn max_body_bytes_parses_env_values() {
+        assert_eq!(parse_max_body_bytes(None), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(parse_max_body_bytes(Some("")), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(parse_max_body_bytes(Some("0")), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(parse_max_body_bytes(Some("abc")), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(parse_max_body_bytes(Some(" 4096 ")), 4096);
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_rejects_oversized_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HttpHeaderValue::from_static("32"),
+        );
+
+        let (status, _) = read_body_limited(&headers, Body::from("ignored"), 16)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_rejects_oversized_stream_without_content_length() {
+        let (mut sender, body) = Body::channel();
+        let writer = tokio::spawn(async move {
+            for _ in 0..4 {
+                if sender.send_data(Bytes::from(vec![0u8; 8])).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (status, _) = read_body_limited(&HeaderMap::new(), body, 16)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_passes_body_within_limit() {
+        let bytes = read_body_limited(&HeaderMap::new(), Body::from("hello"), 16)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"hello");
+    }
 
     #[test]
     fn parses_grpc_xds_bootstrap_file_watcher_provider() {
