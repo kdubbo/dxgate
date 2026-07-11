@@ -81,6 +81,7 @@ All flags are also available as environment variables (`--help` for the full lis
 | `DXGATE_ACCESS_LOG_FORMAT` | `text` | `json` for structured access logs |
 | `DXGATE_OTEL_ENDPOINT` | – | OTLP gRPC endpoint; enables trace export |
 | `DXGATE_OTEL_SAMPLING_PERCENTAGE` | `100` | Parent-based trace sampling ratio |
+| `DXGATE_OTEL_TAGS` | – | JSON object of static span tags, for example `{"foo":"bar"}` |
 
 Note: rate-limit buckets are in-process; with multiple replicas each replica enforces its own budget.
 

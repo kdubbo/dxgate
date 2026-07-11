@@ -61,6 +61,9 @@ struct Args {
     #[arg(long, env = "DXGATE_OTEL_SAMPLING_PERCENTAGE", default_value_t = 100.0)]
     otel_sampling_percentage: f64,
 
+    #[arg(long, env = "DXGATE_OTEL_TAGS")]
+    otel_tags: Option<String>,
+
     #[arg(long)]
     print_crds: bool,
 
@@ -110,6 +113,7 @@ async fn main() -> std::io::Result<()> {
         args.otel_endpoint.as_deref(),
         &args.otel_service_name,
         args.otel_sampling_percentage,
+        args.otel_tags.as_deref(),
     )?;
 
     let run_xds = should_run_xds(&args);
@@ -226,6 +230,7 @@ fn init_tracing(
     otel_endpoint: Option<&str>,
     otel_service_name: &str,
     otel_sampling_percentage: f64,
+    otel_tags: Option<&str>,
 ) -> std::io::Result<bool> {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -242,6 +247,9 @@ fn init_tracing(
             100.0
         };
         let sampling_ratio = sampling_percentage / 100.0;
+        let mut resource_attributes =
+            vec![KeyValue::new("service.name", otel_service_name.to_string())];
+        resource_attributes.extend(parse_otel_tags(otel_tags)?);
         let tracer = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_exporter(
@@ -254,10 +262,7 @@ fn init_tracing(
                     .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
                         sampling_ratio,
                     ))))
-                    .with_resource(Resource::new(vec![KeyValue::new(
-                        "service.name",
-                        otel_service_name.to_string(),
-                    )])),
+                    .with_resource(Resource::new(resource_attributes)),
             )
             .install_batch(opentelemetry_sdk::runtime::Tokio)
             .map_err(|err| std::io::Error::other(format!("initialize OTEL tracing: {err}")))?;
@@ -275,6 +280,18 @@ fn init_tracing(
         registry.init();
         Ok(false)
     }
+}
+
+fn parse_otel_tags(raw: Option<&str>) -> std::io::Result<Vec<KeyValue>> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let tags: std::collections::BTreeMap<String, String> = serde_json::from_str(raw)
+        .map_err(|err| std::io::Error::other(format!("parse DXGATE_OTEL_TAGS: {err}")))?;
+    Ok(tags
+        .into_iter()
+        .map(|(name, value)| KeyValue::new(name, value))
+        .collect())
 }
 
 async fn watch_static_config(path: PathBuf, config_tx: watch::Sender<RuntimeConfig>) {
@@ -348,7 +365,7 @@ fn should_run_xds(args: &Args) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bootstrap, should_run_xds, Args, DxgateMode};
+    use super::{apply_bootstrap, parse_otel_tags, should_run_xds, Args, DxgateMode};
     use dxgate_xds::BootstrapConfig;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -366,6 +383,7 @@ mod tests {
             otel_endpoint: None,
             otel_service_name: "dxgate".to_string(),
             otel_sampling_percentage: 100.0,
+            otel_tags: None,
             print_crds: false,
             listener_names: Vec::new(),
             pod_name: "dxgate".to_string(),
@@ -375,6 +393,16 @@ mod tests {
             cluster_id: "old-cluster".to_string(),
             dns_domain: "cluster.local".to_string(),
         }
+    }
+
+    #[test]
+    fn parses_otel_tags_json() {
+        let tags = parse_otel_tags(Some(r#"{"foo":"bar","userId":"unknown"}"#)).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].key.as_str(), "foo");
+        assert_eq!(tags[0].value.as_str(), "bar");
+        assert_eq!(tags[1].key.as_str(), "userId");
+        assert_eq!(tags[1].value.as_str(), "unknown");
     }
 
     #[test]
