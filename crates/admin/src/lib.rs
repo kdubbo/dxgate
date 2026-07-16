@@ -4,8 +4,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use dxgate_proxy::{
-    HttpRouteMetric, LlmUsageMetric, McpToolMetric, ProxyMetrics, ProxyState, Readiness,
-    RouteMetric,
+    A2aMethodMetric, HttpRouteMetric, LlmUsageMetric, McpToolMetric, ProxyMetrics, ProxyState,
+    Readiness, RouteMetric,
 };
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -230,6 +230,22 @@ fn prometheus_metrics(readiness: Readiness, proxy: ProxyMetrics) -> String {
             tool.failures
         ));
     }
+    out.push_str("# HELP dxgate_a2a_method_calls_total A2A JSON-RPC requests by route, backend, and method\n# TYPE dxgate_a2a_method_calls_total counter\n");
+    for method in &proxy.a2a_methods {
+        let labels = a2a_method_labels(method);
+        out.push_str(&format!(
+            "dxgate_a2a_method_calls_total{{{labels}}} {}\n",
+            method.calls
+        ));
+    }
+    out.push_str("# HELP dxgate_a2a_method_failures_total A2A JSON-RPC requests that did not return a success status\n# TYPE dxgate_a2a_method_failures_total counter\n");
+    for method in &proxy.a2a_methods {
+        let labels = a2a_method_labels(method);
+        out.push_str(&format!(
+            "dxgate_a2a_method_failures_total{{{labels}}} {}\n",
+            method.failures
+        ));
+    }
     out
 }
 
@@ -246,6 +262,14 @@ fn mcp_tool_labels(tool: &McpToolMetric) -> String {
         ("route", tool.route.as_str()),
         ("backend", tool.backend.as_str()),
         ("tool", tool.tool.as_str()),
+    ])
+}
+
+fn a2a_method_labels(method: &A2aMethodMetric) -> String {
+    prometheus_labels(&[
+        ("route", method.route.as_str()),
+        ("backend", method.backend.as_str()),
+        ("method", method.method.as_str()),
     ])
 }
 
@@ -792,7 +816,8 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 mod tests {
     use super::{admin_html, prometheus_metrics};
     use dxgate_proxy::{
-        HttpRouteMetric, LatencyBucket, LlmUsageMetric, McpToolMetric, ProxyMetrics, Readiness,
+        A2aMethodMetric, HttpRouteMetric, LatencyBucket, LlmUsageMetric, McpToolMetric,
+        ProxyMetrics, Readiness,
     };
 
     #[test]
@@ -875,6 +900,13 @@ mod tests {
                     calls: 3,
                     failures: 1,
                 }],
+                a2a_methods: vec![A2aMethodMetric {
+                    route: "a2a".into(),
+                    backend: "planner".into(),
+                    method: "message/send".into(),
+                    calls: 4,
+                    failures: 2,
+                }],
             },
         );
 
@@ -891,6 +923,12 @@ mod tests {
         ));
         assert!(text.contains(
             "dxgate_mcp_tool_failures_total{route=\"mcp\",backend=\"mcp-a\",tool=\"search\"} 1"
+        ));
+        assert!(text.contains(
+            "dxgate_a2a_method_calls_total{route=\"a2a\",backend=\"planner\",method=\"message/send\"} 4"
+        ));
+        assert!(text.contains(
+            "dxgate_a2a_method_failures_total{route=\"a2a\",backend=\"planner\",method=\"message/send\"} 2"
         ));
     }
 }

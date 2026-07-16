@@ -318,14 +318,14 @@ fn read_u64(value: &Value, pointer: &str) -> u64 {
 // SSE stream transcoding
 // ---------------------------------------------------------------------------
 
-trait Transcode: Send + 'static {
+pub(crate) trait Transcode: Send + 'static {
     // Consumes an upstream chunk and returns bytes to emit downstream.
     fn push(&mut self, chunk: &[u8]) -> Vec<u8>;
     // Called once when the upstream body ends.
     fn finish(&mut self) -> Vec<u8>;
 }
 
-fn wrap_body<T: Transcode>(upstream: Body, transcoder: T) -> Body {
+pub(crate) fn wrap_body<T: Transcode>(upstream: Body, transcoder: T) -> Body {
     use hyper::body::HttpBody;
 
     struct State<T> {
@@ -373,12 +373,12 @@ fn wrap_body<T: Transcode>(upstream: Body, transcoder: T) -> Body {
 
 // Splits an SSE byte stream into complete `data:` payload lines.
 #[derive(Default)]
-struct SseLines {
+pub(crate) struct SseLines {
     buf: Vec<u8>,
 }
 
 impl SseLines {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(chunk);
         let mut lines = Vec::new();
         while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {

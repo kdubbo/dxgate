@@ -1,3 +1,4 @@
+mod a2a;
 mod llm;
 mod mcp;
 mod server;

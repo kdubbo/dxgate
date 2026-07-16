@@ -599,6 +599,18 @@ impl Backend {
             _ => true,
         }
     }
+
+    pub fn supports_agent(&self, agent: Option<&str>) -> bool {
+        match &self.kind {
+            BackendKind::A2a {
+                agent: declared, ..
+            } => match declared {
+                Some(declared) => agent.map(|a| declared == a).unwrap_or(true),
+                None => true,
+            },
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1160,6 +1172,18 @@ mod tests {
         assert!(backend.supports_tool(None));
         assert!(backend.supports_tool(Some("search")));
         assert!(!backend.supports_tool(Some("calendar")));
+
+        let backend = Backend {
+            name: "planner".into(),
+            kind: BackendKind::A2a {
+                endpoint: "http://planner.svc:8080".into(),
+                agent: Some("planner".into()),
+            },
+            policies: vec![],
+        };
+        assert!(backend.supports_agent(None));
+        assert!(backend.supports_agent(Some("planner")));
+        assert!(!backend.supports_agent(Some("coder")));
     }
 
     #[test]

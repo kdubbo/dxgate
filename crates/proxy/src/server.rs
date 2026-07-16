@@ -1,3 +1,4 @@
+use crate::a2a;
 use crate::llm::{self, LlmDialect, LlmUsage, UsageSink};
 use crate::mcp;
 use crate::ProxyState;
@@ -582,6 +583,7 @@ async fn forward_agent(
             if backend_matches_protocol(backend, context.protocol)
                 && backend.supports_model(context.model.as_deref())
                 && backend.supports_tool(context.tool.as_deref())
+                && backend.supports_agent(context.agent.as_deref())
                 && backend_supports_llm_request(&cfg, backend, &context)
                 && alias_backend
                     .as_deref()
@@ -603,11 +605,19 @@ async fn forward_agent(
 
     let primary = if let Some(bound) = mcp_session_backend(&server, &context, &eligible) {
         bound
+    } else if let Some(bound) = a2a_task_bound_backend(&server, &context, &eligible) {
+        // A2A tasks are stateful: follow-ups referencing a task id must reach
+        // the backend that owns the task.
+        bound
     } else if context.protocol == AgentProtocol::Mcp && context.tool.is_some() {
         // Calls naming a tool/prompt must land on the backend that list
         // federation credited with the bare name: the first eligible backend
         // in route-declared order. Round-robin would let a colliding name
         // resolve to a different backend than the one whose item was listed.
+        eligible[0].clone()
+    } else if context.protocol == AgentProtocol::A2a && context.path == a2a::AGENT_CARD_PATH {
+        // An agent card is one agent's identity; serve it deterministically
+        // instead of rotating between backends' cards.
         eligible[0].clone()
     } else {
         server
@@ -732,6 +742,7 @@ async fn request_agent_with_failover(
                     upstream_span.record("http.status_code", status.as_u16());
                     update_mcp_session(&server.state, backend, context, response.headers(), status);
                     record_mcp_tool_call(server, route, backend, context, status.is_success());
+                    record_a2a_method_call(server, route, backend, context, status.is_success());
                     server.state.record_agent_request(
                         protocol_name(context.protocol),
                         &route.name,
@@ -743,7 +754,7 @@ async fn request_agent_with_failover(
                         response.headers_mut(),
                         &policy_runtime.response_headers,
                     );
-                    apply_mcp_stream_headers(response.headers_mut(), context);
+                    apply_stream_headers(response.headers_mut(), context);
                     if attempt + 1 < attempts && retry.statuses.contains(&status.as_u16()) {
                         last_error = Some((
                             status,
@@ -751,11 +762,15 @@ async fn request_agent_with_failover(
                         ));
                         continue;
                     }
+                    if context.protocol == AgentProtocol::A2a {
+                        response = process_a2a_response(server, backend, context, response).await?;
+                    }
                     return Ok(response);
                 }
                 Err(err) => {
                     upstream_span.record("http.status_code", err.0.as_u16());
                     record_mcp_tool_call(server, route, backend, context, false);
+                    record_a2a_method_call(server, route, backend, context, false);
                     server.state.record_agent_request(
                         protocol_name(context.protocol),
                         &route.name,
@@ -795,6 +810,90 @@ fn record_mcp_tool_call(
             .state
             .record_mcp_tool_call(&route.name, &backend.name, tool, success);
     }
+}
+
+fn record_a2a_method_call(
+    server: &ProxyServer,
+    route: &AgentRoute,
+    backend: &Backend,
+    context: &AgentRequestContext,
+    success: bool,
+) {
+    if context.protocol != AgentProtocol::A2a {
+        return;
+    }
+    if let Some(method) = &context.a2a_method {
+        server
+            .state
+            .record_a2a_method_call(&route.name, &backend.name, method, success);
+    }
+}
+
+// Post-processes an A2A upstream response: binds task ids to the owning
+// backend for follow-up affinity, and rewrites agent-card URLs so clients
+// keep talking to the gateway instead of the backend directly.
+async fn process_a2a_response(
+    server: &ProxyServer,
+    backend: &Backend,
+    context: &AgentRequestContext,
+    response: Response<Body>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+
+    if is_event_stream(response.headers()) {
+        // Streamed task creation (message/stream): bind affinity as soon as
+        // the first task id appears in the stream.
+        let state = server.state.clone();
+        let backend_name = backend.name.clone();
+        let (parts, body) = response.into_parts();
+        let sniffed = a2a::sniff_task_stream(
+            body,
+            Box::new(move |task_id| state.bind_a2a_task(task_id, backend_name)),
+        );
+        return Ok(Response::from_parts(parts, sniffed));
+    }
+
+    let is_card = context.path == a2a::AGENT_CARD_PATH;
+    if !is_card && context.a2a_method.is_none() {
+        // Not a JSON-RPC exchange or a card fetch; nothing to learn.
+        return Ok(response);
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = read_body_limited(&parts.headers, body, server.max_body_bytes)
+        .await
+        .map_err(|(_, message)| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("read A2A upstream response: {message}"),
+            )
+        })?;
+    let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(Response::from_parts(parts, Body::from(bytes)));
+    };
+
+    if is_card {
+        let scheme = header_value(&context.headers, "x-forwarded-proto").unwrap_or("http");
+        // context.host is port-stripped for vhost matching; the card needs
+        // the authority exactly as the client addressed the gateway.
+        let authority = header_value(&context.headers, "host").unwrap_or(&context.host);
+        if a2a::rewrite_card_urls(&mut value, scheme, authority) {
+            let body = value.to_string();
+            parts.headers.insert(
+                http::header::CONTENT_LENGTH,
+                HttpHeaderValue::from(body.len()),
+            );
+            return Ok(Response::from_parts(parts, Body::from(body)));
+        }
+        return Ok(Response::from_parts(parts, Body::from(bytes)));
+    }
+
+    if let Some(task_id) = a2a::response_task_id(&value) {
+        server.state.bind_a2a_task(task_id, backend.name.clone());
+    }
+    Ok(Response::from_parts(parts, Body::from(bytes)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1400,7 +1499,9 @@ struct AgentRequestContext {
     agent: Option<String>,
     mcp_method: Option<String>,
     mcp_session_id: Option<String>,
-    mcp_stream: bool,
+    a2a_method: Option<String>,
+    a2a_task_id: Option<String>,
+    stream_hint: bool,
     headers: Vec<(String, String)>,
 }
 
@@ -1460,9 +1561,31 @@ impl AgentRequestContext {
         } else {
             None
         };
-        let mcp_stream = protocol == AgentProtocol::Mcp
-            && (parts.method == Method::GET
-                || header_contains(&parts.headers, http::header::ACCEPT, "text/event-stream"));
+        let a2a_method = if protocol == AgentProtocol::A2a {
+            json.as_ref()
+                .and_then(|value| value.get("method"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let a2a_task_id = if protocol == AgentProtocol::A2a {
+            json.as_ref()
+                .and_then(a2a::request_task_id)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        // MCP and A2A both stream over SSE; the hint drives anti-buffering
+        // response headers. A GET only implies a stream for MCP (its
+        // Streamable HTTP listen channel) — an A2A GET is a card fetch.
+        let accepts_sse =
+            header_contains(&parts.headers, http::header::ACCEPT, "text/event-stream");
+        let stream_hint = match protocol {
+            AgentProtocol::Mcp => parts.method == Method::GET || accepts_sse,
+            AgentProtocol::A2a => accepts_sse,
+            _ => false,
+        };
 
         Self {
             protocol,
@@ -1475,7 +1598,9 @@ impl AgentRequestContext {
             agent,
             mcp_method,
             mcp_session_id,
-            mcp_stream,
+            a2a_method,
+            a2a_task_id,
+            stream_hint,
             headers: header_pairs(&parts.headers),
         }
     }
@@ -1492,6 +1617,24 @@ impl AgentRequestContext {
             headers: &self.headers,
         }
     }
+}
+
+fn a2a_task_bound_backend(
+    server: &ProxyServer,
+    context: &AgentRequestContext,
+    eligible: &[WeightedBackend],
+) -> Option<WeightedBackend> {
+    if context.protocol != AgentProtocol::A2a {
+        return None;
+    }
+    let backend_name = context
+        .a2a_task_id
+        .as_deref()
+        .and_then(|task_id| server.state.a2a_task_backend(task_id))?;
+    eligible
+        .iter()
+        .find(|weighted| weighted.name == backend_name)
+        .cloned()
 }
 
 fn mcp_session_backend(
@@ -1534,8 +1677,8 @@ fn update_mcp_session(
     }
 }
 
-fn apply_mcp_stream_headers(headers: &mut HeaderMap, context: &AgentRequestContext) {
-    if !context.mcp_stream {
+fn apply_stream_headers(headers: &mut HeaderMap, context: &AgentRequestContext) {
+    if !context.stream_hint {
         return;
     }
     headers

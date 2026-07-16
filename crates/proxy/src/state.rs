@@ -24,7 +24,8 @@ struct Inner {
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
     token_usage: Mutex<HashMap<String, TokenBucket>>,
     circuit_breakers: Mutex<HashMap<String, CircuitBreakerBucket>>,
-    mcp_sessions: Mutex<HashMap<String, McpSession>>,
+    mcp_sessions: Mutex<BindingMap>,
+    a2a_tasks: Mutex<BindingMap>,
     metrics: Mutex<MetricsStore>,
 }
 
@@ -45,6 +46,7 @@ pub struct ProxyMetrics {
     pub routes: Vec<RouteMetric>,
     pub llm_usage: Vec<LlmUsageMetric>,
     pub mcp_tools: Vec<McpToolMetric>,
+    pub a2a_methods: Vec<A2aMethodMetric>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -66,15 +68,73 @@ pub struct McpToolMetric {
     pub failures: u64,
 }
 
-// MCP session-affinity bindings are bounded so abandoned sessions cannot grow
-// proxy memory without limit; last_used refreshes on every routed request.
-const MCP_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
-const MCP_SESSION_CAP: usize = 10_000;
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct A2aMethodMetric {
+    pub route: String,
+    pub backend: String,
+    pub method: String,
+    pub calls: u64,
+    pub failures: u64,
+}
+
+// Affinity bindings (MCP session -> backend, A2A task -> backend) are bounded
+// so abandoned keys cannot grow proxy memory without limit; last_used
+// refreshes on every routed request.
+const BINDING_TTL: Duration = Duration::from_secs(60 * 60);
+const BINDING_CAP: usize = 10_000;
 
 #[derive(Debug)]
-struct McpSession {
+struct Binding {
     backend: String,
     last_used: Instant,
+}
+
+#[derive(Debug, Default)]
+struct BindingMap {
+    entries: HashMap<String, Binding>,
+}
+
+impl BindingMap {
+    fn bind(&mut self, key: String, backend: String) {
+        // The O(n) sweeps only run once the map is actually full.
+        if self.entries.len() >= BINDING_CAP {
+            self.entries
+                .retain(|_, binding| binding.last_used.elapsed() < BINDING_TTL);
+        }
+        if self.entries.len() >= BINDING_CAP {
+            // Bindings are an affinity optimization; dropping the idlest one
+            // only costs that key its stickiness, not correctness.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, binding)| binding.last_used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            key,
+            Binding {
+                backend,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    fn lookup(&mut self, key: &str) -> Option<String> {
+        let binding = self.entries.get_mut(key)?;
+        if binding.last_used.elapsed() >= BINDING_TTL {
+            self.entries.remove(key);
+            return None;
+        }
+        binding.last_used = Instant::now();
+        Some(binding.backend.clone())
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +178,7 @@ struct MetricsStore {
     routes: HashMap<String, RouteMetricCounter>,
     llm_usage: HashMap<String, LlmUsageMetric>,
     mcp_tools: HashMap<String, McpToolMetric>,
+    a2a_methods: HashMap<String, A2aMethodMetric>,
 }
 
 #[derive(Debug, Default)]
@@ -194,7 +255,8 @@ impl ProxyState {
                 rate_limits: Mutex::new(HashMap::new()),
                 token_usage: Mutex::new(HashMap::new()),
                 circuit_breakers: Mutex::new(HashMap::new()),
-                mcp_sessions: Mutex::new(HashMap::new()),
+                mcp_sessions: Mutex::new(BindingMap::default()),
+                a2a_tasks: Mutex::new(BindingMap::default()),
                 metrics: Mutex::new(MetricsStore::default()),
             }),
         }
@@ -472,41 +534,49 @@ impl ProxyState {
     }
 
     pub fn bind_mcp_session(&self, session_id: impl Into<String>, backend: impl Into<String>) {
-        let mut sessions = self.inner.mcp_sessions.lock().unwrap();
-        sessions.retain(|_, session| session.last_used.elapsed() < MCP_SESSION_TTL);
-        if sessions.len() >= MCP_SESSION_CAP {
-            // Bindings are an affinity optimization; dropping the idlest one
-            // only costs that session its stickiness, not correctness.
-            if let Some(oldest) = sessions
-                .iter()
-                .min_by_key(|(_, session)| session.last_used)
-                .map(|(id, _)| id.clone())
-            {
-                sessions.remove(&oldest);
-            }
-        }
-        sessions.insert(
-            session_id.into(),
-            McpSession {
-                backend: backend.into(),
-                last_used: Instant::now(),
-            },
-        );
+        self.inner
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .bind(session_id.into(), backend.into());
     }
 
     pub fn mcp_session_backend(&self, session_id: &str) -> Option<String> {
-        let mut sessions = self.inner.mcp_sessions.lock().unwrap();
-        let session = sessions.get_mut(session_id)?;
-        if session.last_used.elapsed() >= MCP_SESSION_TTL {
-            sessions.remove(session_id);
-            return None;
-        }
-        session.last_used = Instant::now();
-        Some(session.backend.clone())
+        self.inner.mcp_sessions.lock().unwrap().lookup(session_id)
     }
 
     pub fn remove_mcp_session(&self, session_id: &str) {
         self.inner.mcp_sessions.lock().unwrap().remove(session_id);
+    }
+
+    pub fn bind_a2a_task(&self, task_id: impl Into<String>, backend: impl Into<String>) {
+        self.inner
+            .a2a_tasks
+            .lock()
+            .unwrap()
+            .bind(task_id.into(), backend.into());
+    }
+
+    pub fn a2a_task_backend(&self, task_id: &str) -> Option<String> {
+        self.inner.a2a_tasks.lock().unwrap().lookup(task_id)
+    }
+
+    pub fn record_a2a_method_call(&self, route: &str, backend: &str, method: &str, success: bool) {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        let key = format!("{route}|{backend}|{method}");
+        let counter = metrics
+            .a2a_methods
+            .entry(key)
+            .or_insert_with(|| A2aMethodMetric {
+                route: route.to_string(),
+                backend: backend.to_string(),
+                method: method.to_string(),
+                ..A2aMethodMetric::default()
+            });
+        counter.calls += 1;
+        if !success {
+            counter.failures += 1;
+        }
     }
 
     pub fn record_mcp_tool_call(&self, route: &str, backend: &str, tool: &str, success: bool) {
@@ -601,6 +671,13 @@ impl ProxyState {
                 .then_with(|| a.backend.cmp(&b.backend))
                 .then_with(|| a.tool.cmp(&b.tool))
         });
+        let mut a2a_methods = metrics.a2a_methods.values().cloned().collect::<Vec<_>>();
+        a2a_methods.sort_by(|a, b| {
+            a.route
+                .cmp(&b.route)
+                .then_with(|| a.backend.cmp(&b.backend))
+                .then_with(|| a.method.cmp(&b.method))
+        });
         ProxyMetrics {
             total_requests: metrics.total_requests,
             agent_requests: metrics.agent_requests,
@@ -610,6 +687,7 @@ impl ProxyState {
             routes,
             llm_usage,
             mcp_tools,
+            a2a_methods,
         }
     }
 }
@@ -669,15 +747,26 @@ mod tests {
     #[test]
     fn mcp_session_bindings_are_capped() {
         let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-        for i in 0..=MCP_SESSION_CAP {
+        for i in 0..=BINDING_CAP {
             state.bind_mcp_session(format!("session-{i}"), "backend");
         }
         // The idlest binding (the first inserted) was evicted to stay at cap.
         assert_eq!(state.mcp_session_backend("session-0"), None);
         assert_eq!(
-            state.mcp_session_backend(&format!("session-{MCP_SESSION_CAP}")),
+            state.mcp_session_backend(&format!("session-{BINDING_CAP}")),
             Some("backend".to_string())
         );
+    }
+
+    #[test]
+    fn a2a_task_bindings_round_trip() {
+        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
+        state.bind_a2a_task("task-1", "planner");
+        assert_eq!(
+            state.a2a_task_backend("task-1"),
+            Some("planner".to_string())
+        );
+        assert_eq!(state.a2a_task_backend("task-2"), None);
     }
 
     #[test]

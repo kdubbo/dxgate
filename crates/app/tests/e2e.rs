@@ -367,16 +367,28 @@ async fn oversized_request_body_is_rejected_before_buffering() {
     let (proxy_addr, _state) = spawn_proxy(agent_config(upstream)).await;
     let client = Client::new();
 
-    // 11 MiB exceeds the 10 MiB default DXGATE_MAX_BODY_BYTES cap.
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(format!("http://{proxy_addr}/api/upload"))
-        .header("authorization", "Bearer e2e")
-        .body(Body::from(vec![0u8; 11 * 1024 * 1024]))
-        .unwrap();
-
-    let response = client.request(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // 11 MiB exceeds the 10 MiB default DXGATE_MAX_BODY_BYTES cap. The proxy
+    // rejects from the content-length alone and may close the connection
+    // while the client is still writing the body; retry the raced attempts
+    // until the 413 is observed.
+    let mut status = None;
+    for _ in 0..5 {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{proxy_addr}/api/upload"))
+            .header("authorization", "Bearer e2e")
+            .body(Body::from(vec![0u8; 11 * 1024 * 1024]))
+            .unwrap();
+        match client.request(request).await {
+            Ok(response) => {
+                status = Some(response.status());
+                break;
+            }
+            // A raced reset while writing; try again on a fresh connection.
+            Err(_) => continue,
+        }
+    }
+    assert_eq!(status, Some(StatusCode::PAYLOAD_TOO_LARGE));
 }
 
 #[tokio::test]
