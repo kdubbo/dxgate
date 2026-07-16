@@ -369,6 +369,10 @@ pub struct Cluster {
     pub name: String,
     #[serde(default)]
     pub endpoints: Vec<Endpoint>,
+    // Forces HTTP/2 to this cluster (h2c on plaintext, ALPN h2 over TLS) even when
+    // the request is not gRPC/Triple; gRPC and Triple requests always use HTTP/2.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub http2: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<UpstreamTls>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -440,6 +444,10 @@ pub enum UpstreamTlsMode {
     Simple,
     #[default]
     DubboMutual,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_default_tls_mode(mode: &UpstreamTlsMode) -> bool {
@@ -948,6 +956,7 @@ mod tests {
                 Cluster {
                     name: "admin".into(),
                     endpoints: vec![],
+                    http2: false,
                     tls: None,
                     circuit_breaker: None,
                     outlier_detection: None,
@@ -955,6 +964,7 @@ mod tests {
                 Cluster {
                     name: "default".into(),
                     endpoints: vec![],
+                    http2: false,
                     tls: None,
                     circuit_breaker: None,
                     outlier_detection: None,

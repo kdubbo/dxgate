@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{
     HeaderMap, HeaderName, HeaderValue as HttpHeaderValue, Method, Request, Response, StatusCode,
-    Uri,
+    Uri, Version,
 };
 use axum::routing::any;
 use axum::Router;
@@ -219,6 +219,12 @@ async fn forward(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let cfg = server.state.config().await;
+    // gRPC and Dubbo Triple require end-to-end HTTP/2 with streaming bodies and
+    // trailer propagation; buffering the body here would break both, so they skip
+    // the agent path and stream straight through cluster routing.
+    if is_grpc_request(req.headers()) {
+        return forward_http(server, cfg, req).await;
+    }
     let protocol = detect_agent_protocol(req.uri().path()).or_else(|| {
         cfg.routes
             .iter()
@@ -412,17 +418,30 @@ async fn forward_http(
         "forwarding request"
     );
 
+    let use_h2 = cluster.http2 || is_grpc_request(req.headers());
     *req.uri_mut() = upstream_uri;
     req.headers_mut().remove(http::header::HOST);
+    // The downstream and upstream HTTP versions are independent: pin the upstream
+    // request version to the negotiated client protocol instead of echoing the
+    // downstream version, and drop HTTP/1-only connection headers before h2.
+    *req.version_mut() = if use_h2 {
+        remove_connection_headers(req.headers_mut());
+        Version::HTTP_2
+    } else {
+        Version::HTTP_11
+    };
     inject_trace_context(req.headers_mut());
 
     let started = Instant::now();
-    let result = match request_mode {
-        UpstreamRequestMode::PlainHttp => server.clients.request_plain(req).await,
-        UpstreamRequestMode::SimpleTls => server.clients.request_web(req).await,
-        UpstreamRequestMode::DubboMutual => {
+    let result = match (request_mode, use_h2) {
+        (UpstreamRequestMode::PlainHttp, false) => server.clients.request_plain(req).await,
+        (UpstreamRequestMode::PlainHttp, true) | (UpstreamRequestMode::SimpleTls, true) => {
+            server.clients.request_h2(req).await
+        }
+        (UpstreamRequestMode::SimpleTls, false) => server.clients.request_web(req).await,
+        (UpstreamRequestMode::DubboMutual, h2) => {
             let tls = tls.expect("dubbo mutual request mode requires TLS config");
-            server.clients.request_mtls(&cluster, tls, req).await
+            server.clients.request_mtls(&cluster, tls, req, h2).await
         }
     };
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -708,10 +727,12 @@ async fn request_agent_backend(
     headers.remove(http::header::HOST);
     inject_trace_context(&mut headers);
 
+    // Agent upstreams are reached over the HTTP/1.1 client pool; echoing the
+    // downstream version would break h2c callers of a buffered agent route.
     let mut builder = Request::builder()
         .method(parts.method.clone())
         .uri(uri)
-        .version(parts.version);
+        .version(Version::HTTP_11);
     *builder.headers_mut().unwrap() = headers;
     let request = builder.body(Body::from(body.clone())).map_err(|e| {
         (
@@ -847,6 +868,54 @@ async fn federate_mcp_tools(
         })?;
     apply_response_headers(response.headers_mut(), &policy_runtime.response_headers);
     Ok(response)
+}
+
+// gRPC and Dubbo Triple mark themselves via content-type and only run over
+// HTTP/2. grpc-web is excluded on purpose: it is designed to cross HTTP/1
+// intermediaries with trailers encoded in the body.
+fn is_grpc_request(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    content_type == "application/grpc"
+        || content_type.starts_with("application/grpc+")
+        || content_type == "application/triple"
+        || content_type.starts_with("application/triple+")
+}
+
+fn remove_connection_headers(headers: &mut HeaderMap) {
+    let named: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    for name in named {
+        if let Ok(name) = HeaderName::try_from(name.as_str()) {
+            headers.remove(name);
+        }
+    }
+    for name in [
+        http::header::CONNECTION,
+        http::header::PROXY_AUTHENTICATE,
+        http::header::PROXY_AUTHORIZATION,
+        http::header::TRANSFER_ENCODING,
+        http::header::UPGRADE,
+    ] {
+        headers.remove(name);
+    }
+    headers.remove(HeaderName::from_static("keep-alive"));
+    headers.remove(HeaderName::from_static("proxy-connection"));
+    headers.remove(HeaderName::from_static("http2-settings"));
 }
 
 fn detect_agent_protocol(path: &str) -> Option<AgentProtocol> {
@@ -1493,6 +1562,8 @@ fn access_log_line(format: AccessLogFormat, event: &AccessLogEvent<'_>) -> Strin
 struct UpstreamClients {
     plaintext: PlainClient,
     web: WebClient,
+    // HTTP/2-only client: h2c prior knowledge on http:// and ALPN h2 on https://.
+    h2: WebClient,
     mtls: MtlsSupport,
 }
 
@@ -1516,11 +1587,26 @@ impl UpstreamClients {
             .https_or_http()
             .enable_http1()
             .build();
+        let h2_connector = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http2()
+            .build();
         Self {
             plaintext: Client::new(),
             web: Client::builder().build::<_, Body>(web_connector),
+            h2: Client::builder()
+                .http2_only(true)
+                .build::<_, Body>(h2_connector),
             mtls,
         }
+    }
+
+    async fn request_h2(&self, req: Request<Body>) -> Result<Response<Body>, (StatusCode, String)> {
+        self.h2
+            .request(req)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
     }
 
     async fn request_plain(
@@ -1548,9 +1634,10 @@ impl UpstreamClients {
         cluster: &Cluster,
         tls: &UpstreamTls,
         req: Request<Body>,
+        h2: bool,
     ) -> Result<Response<Body>, (StatusCode, String)> {
         let client = match &self.mtls {
-            MtlsSupport::Available(pool) => pool.client_for(tls).map_err(|err| {
+            MtlsSupport::Available(pool) => pool.client_for(tls, h2).map_err(|err| {
                 (
                     StatusCode::BAD_GATEWAY,
                     format!("cluster {} mTLS setup failed: {err}", cluster.name),
@@ -1606,8 +1693,8 @@ impl MtlsClientPool {
         })
     }
 
-    fn client_for(&self, tls: &UpstreamTls) -> Result<MtlsClient, String> {
-        let key = mtls_cache_key(tls);
+    fn client_for(&self, tls: &UpstreamTls, h2: bool) -> Result<MtlsClient, String> {
+        let key = format!("{}|h2={h2}", mtls_cache_key(tls));
         let mut clients = self
             .clients
             .lock()
@@ -1624,8 +1711,15 @@ impl MtlsClientPool {
             Some(sni) if !sni.is_empty() => builder.with_server_name(sni.clone()),
             _ => builder,
         };
-        let connector = builder.enable_http1().build();
-        let client = Client::builder().build::<_, Body>(connector);
+        let client = if h2 {
+            let connector = builder.enable_http2().build();
+            Client::builder()
+                .http2_only(true)
+                .build::<_, Body>(connector)
+        } else {
+            let connector = builder.enable_http1().build();
+            Client::builder().build::<_, Body>(connector)
+        };
         clients.insert(key, client.clone());
         Ok(client)
     }
@@ -1971,13 +2065,16 @@ mod tests {
 
         let pool = MtlsClientPool::from_bootstrap(bootstrap.to_str().unwrap()).unwrap();
         let client = pool
-            .client_for(&UpstreamTls {
-                mode: UpstreamTlsMode::DubboMutual,
-                sni: Some("nginx.app.svc.cluster.local".into()),
-                certificate_provider: None,
-                validation_provider: None,
-                alpn_protocols: vec!["h2".into()],
-            })
+            .client_for(
+                &UpstreamTls {
+                    mode: UpstreamTlsMode::DubboMutual,
+                    sni: Some("nginx.app.svc.cluster.local".into()),
+                    certificate_provider: None,
+                    validation_provider: None,
+                    alpn_protocols: vec!["h2".into()],
+                },
+                false,
+            )
             .unwrap();
         let uri = format!("https://127.0.0.1:{}/", addr.port())
             .parse()

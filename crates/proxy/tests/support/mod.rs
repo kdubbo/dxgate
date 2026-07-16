@@ -172,6 +172,7 @@ fn runtime_config(backend_addr: SocketAddr) -> RuntimeConfig {
                 healthy: true,
                 node_name: None,
             }],
+            http2: false,
             tls: None,
             circuit_breaker: None,
             outlier_detection: None,

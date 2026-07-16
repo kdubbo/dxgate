@@ -369,6 +369,7 @@ impl AdsState {
                     .get(&cluster.eds_service_name)
                     .cloned()
                     .unwrap_or_default(),
+                http2: false,
                 tls: cluster.tls.clone(),
                 circuit_breaker: cluster.circuit_breaker.clone(),
                 outlier_detection: cluster.outlier_detection.clone(),
