@@ -480,11 +480,29 @@ pub struct Provider {
     pub name: String,
     #[serde(default = "default_openai_compatible")]
     pub kind: ProviderKind,
+    // Optional for well-known kinds, which fall back to the vendor's public API
+    // endpoint via effective_base_url(); required for openai-compatible.
+    #[serde(default)]
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_headers: Vec<HeaderValue>,
+}
+
+impl Provider {
+    pub fn effective_base_url(&self) -> &str {
+        if !self.base_url.is_empty() {
+            return &self.base_url;
+        }
+        match self.kind {
+            ProviderKind::OpenAiCompatible => "",
+            ProviderKind::OpenAi => "https://api.openai.com/v1",
+            ProviderKind::Anthropic => "https://api.anthropic.com",
+            ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+            ProviderKind::DeepSeek => "https://api.deepseek.com/v1",
+        }
+    }
 }
 
 fn default_openai_compatible() -> ProviderKind {
@@ -495,6 +513,10 @@ fn default_openai_compatible() -> ProviderKind {
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     OpenAiCompatible,
+    OpenAi,
+    Anthropic,
+    Gemini,
+    DeepSeek,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,6 +540,11 @@ pub enum BackendKind {
         models: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         endpoint: Option<String>,
+        // Rewrites the request's model name before forwarding (alias -> upstream
+        // name, e.g. an Azure deployment). Matching for backend selection runs
+        // on the original name.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        model_rewrites: BTreeMap<String, String>,
     },
     Mcp {
         endpoint: String,
@@ -539,7 +566,17 @@ impl Backend {
             | BackendKind::A2a { endpoint, .. } => Some(endpoint),
             BackendKind::Llm { endpoint, .. } => endpoint
                 .as_deref()
-                .or_else(|| provider.map(|provider| provider.base_url.as_str())),
+                .or_else(|| provider.map(|provider| provider.effective_base_url()))
+                .filter(|endpoint| !endpoint.is_empty()),
+        }
+    }
+
+    pub fn rewrite_model<'a>(&'a self, model: &str) -> Option<&'a str> {
+        match &self.kind {
+            BackendKind::Llm { model_rewrites, .. } => {
+                model_rewrites.get(model).map(String::as_str)
+            }
+            _ => None,
         }
     }
 
@@ -656,6 +693,8 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<TokenLimitPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
@@ -749,6 +788,17 @@ fn default_authorization_header() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitPolicy {
     pub requests: u32,
+    pub window_seconds: u64,
+    #[serde(default)]
+    pub key: RateLimitKey,
+}
+
+// LLM token budget over a sliding window. Accounting is post-hoc: a request is
+// admitted while the window's recorded usage is below the limit, and its own
+// usage (from the provider's usage stats) is added after the response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLimitPolicy {
+    pub tokens: u64,
     pub window_seconds: u64,
     #[serde(default)]
     pub key: RateLimitKey,
@@ -1034,6 +1084,7 @@ mod tests {
                     provider: "openai".into(),
                     models: vec!["gpt-4o-mini".into()],
                     endpoint: None,
+                    model_rewrites: Default::default(),
                 },
                 policies: vec!["auth".into()],
             }],
@@ -1065,6 +1116,7 @@ mod tests {
                     value_env: None,
                 }),
                 rate_limit: None,
+                token_limit: None,
                 timeout_ms: None,
                 retry: None,
                 max_body_bytes: None,
@@ -1126,6 +1178,7 @@ mod tests {
             }),
             auth: None,
             rate_limit: None,
+            token_limit: None,
             timeout_ms: None,
             retry: None,
             max_body_bytes: None,

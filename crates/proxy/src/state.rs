@@ -1,6 +1,6 @@
 use dxgate_core::{
     Cluster, ConfigConflict, DxgateError, Endpoint, RateLimitPolicy, Result, RuntimeConfig,
-    WeightedBackend, WeightedCluster,
+    TokenLimitPolicy, WeightedBackend, WeightedCluster,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ struct Inner {
     ready: AtomicBool,
     picker_counter: AtomicU64,
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
+    token_usage: Mutex<HashMap<String, TokenBucket>>,
     circuit_breakers: Mutex<HashMap<String, CircuitBreakerBucket>>,
     mcp_sessions: Mutex<HashMap<String, String>>,
     metrics: Mutex<MetricsStore>,
@@ -42,6 +43,17 @@ pub struct ProxyMetrics {
     pub upstream_failures: u64,
     pub http_routes: Vec<HttpRouteMetric>,
     pub routes: Vec<RouteMetric>,
+    pub llm_usage: Vec<LlmUsageMetric>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LlmUsageMetric {
+    pub route: String,
+    pub backend: String,
+    pub model: String,
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +95,7 @@ struct MetricsStore {
     upstream_failures: u64,
     http_routes: HashMap<String, HttpRouteMetricCounter>,
     routes: HashMap<String, RouteMetricCounter>,
+    llm_usage: HashMap<String, LlmUsageMetric>,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +129,22 @@ struct RateLimitBucket {
     used: u32,
 }
 
+#[derive(Debug)]
+struct TokenBucket {
+    window_started: Instant,
+    window: Duration,
+    used: u64,
+}
+
+impl TokenBucket {
+    fn roll_window(&mut self) {
+        if self.window_started.elapsed() >= self.window {
+            self.window_started = Instant::now();
+            self.used = 0;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CircuitBreakerBucket {
     active: u32,
@@ -141,6 +170,7 @@ impl ProxyState {
                 ready: AtomicBool::new(false),
                 picker_counter: AtomicU64::new(0),
                 rate_limits: Mutex::new(HashMap::new()),
+                token_usage: Mutex::new(HashMap::new()),
                 circuit_breakers: Mutex::new(HashMap::new()),
                 mcp_sessions: Mutex::new(HashMap::new()),
                 metrics: Mutex::new(MetricsStore::default()),
@@ -253,6 +283,33 @@ impl ProxyState {
         true
     }
 
+    // Token accounting is post-hoc: admission checks the window's recorded
+    // usage, and each response's usage is added once the provider reports it.
+    pub fn check_token_limit(&self, key: &str, limit: &TokenLimitPolicy) -> bool {
+        let mut buckets = self.inner.token_usage.lock().unwrap();
+        let Some(bucket) = buckets.get_mut(key) else {
+            return true;
+        };
+        bucket.roll_window();
+        bucket.used < limit.tokens
+    }
+
+    pub fn add_token_usage(&self, key: &str, window_seconds: u64, tokens: u64) {
+        // Tracks the policy's current window even if its config changed.
+        let window = Duration::from_secs(window_seconds.max(1));
+        let mut buckets = self.inner.token_usage.lock().unwrap();
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| TokenBucket {
+                window_started: Instant::now(),
+                window,
+                used: 0,
+            });
+        bucket.window = window;
+        bucket.roll_window();
+        bucket.used = bucket.used.saturating_add(tokens);
+    }
+
     // Err(()) means the breaker is open; there is no failure detail to carry.
     #[allow(clippy::result_unit_err)]
     pub fn try_acquire_circuit_breaker(
@@ -362,6 +419,30 @@ impl ProxyState {
         }
     }
 
+    pub fn record_llm_usage(
+        &self,
+        route: &str,
+        backend: &str,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        let key = format!("{route}|{backend}|{model}");
+        let counter = metrics
+            .llm_usage
+            .entry(key)
+            .or_insert_with(|| LlmUsageMetric {
+                route: route.to_string(),
+                backend: backend.to_string(),
+                model: model.to_string(),
+                ..LlmUsageMetric::default()
+            });
+        counter.requests += 1;
+        counter.prompt_tokens += prompt_tokens;
+        counter.completion_tokens += completion_tokens;
+    }
+
     pub fn record_policy_denied(&self) {
         let mut metrics = self.inner.metrics.lock().unwrap();
         metrics.total_requests += 1;
@@ -449,6 +530,13 @@ impl ProxyState {
                 .then_with(|| a.route.cmp(&b.route))
                 .then_with(|| a.backend.cmp(&b.backend))
         });
+        let mut llm_usage = metrics.llm_usage.values().cloned().collect::<Vec<_>>();
+        llm_usage.sort_by(|a, b| {
+            a.route
+                .cmp(&b.route)
+                .then_with(|| a.backend.cmp(&b.backend))
+                .then_with(|| a.model.cmp(&b.model))
+        });
         ProxyMetrics {
             total_requests: metrics.total_requests,
             agent_requests: metrics.agent_requests,
@@ -456,6 +544,7 @@ impl ProxyState {
             upstream_failures: metrics.upstream_failures,
             http_routes,
             routes,
+            llm_usage,
         }
     }
 }

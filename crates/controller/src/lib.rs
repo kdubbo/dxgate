@@ -474,6 +474,7 @@ mod tests {
                         provider: "openai".into(),
                         models: vec!["gpt-test".into()],
                         endpoint: None,
+                        model_rewrites: Default::default(),
                     },
                     policies: vec![],
                 })

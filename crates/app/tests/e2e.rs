@@ -195,6 +195,7 @@ fn agent_config(upstream: SocketAddr) -> RuntimeConfig {
             window_seconds: 60,
             key: RateLimitKey::Route,
         }),
+        token_limit: None,
         timeout_ms: None,
         retry: None,
         max_body_bytes: None,
@@ -219,6 +220,7 @@ fn llm_config(upstream: SocketAddr) -> RuntimeConfig {
             provider: "local".into(),
             models: vec![],
             endpoint: None,
+            model_rewrites: Default::default(),
         },
         policies: vec![],
     }];

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 dxgate-core = { path = "../core" }
 axum.workspace = true
+futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true

@@ -433,6 +433,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dxgate-core",
+ "futures-util",
  "http 0.2.12",
  "hyper 0.14.32",
  "hyper-rustls 0.24.2",

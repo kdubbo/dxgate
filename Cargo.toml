@@ -20,7 +20,7 @@ async-trait = "0.1"
 axum = "0.6"
 clap = { version = "4.5", features = ["derive", "env"] }
 http = "0.2"
-hyper = { version = "0.14", features = ["client", "http1", "http2", "server", "tcp"] }
+hyper = { version = "0.14", features = ["client", "http1", "http2", "server", "stream", "tcp"] }
 hyper-rustls = { version = "0.24", default-features = false, features = ["http1", "http2", "logging", "tls12", "tokio-runtime", "webpki-roots"] }
 futures-util = "0.3"
 jsonwebtoken = "9"

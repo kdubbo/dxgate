@@ -44,6 +44,7 @@ async fn llm_route_enforces_api_key_and_forwards_to_provider() {
                 value_env: None,
             }),
             rate_limit: None,
+            token_limit: None,
             timeout_ms: Some(1000),
             retry: None,
             max_body_bytes: None,
@@ -276,6 +277,7 @@ async fn agent_route_applies_local_rate_limit() {
                 window_seconds: 60,
                 key: RateLimitKey::Route,
             }),
+            token_limit: None,
             timeout_ms: None,
             retry: None,
             max_body_bytes: None,
@@ -440,6 +442,7 @@ fn llm_backend(addr: SocketAddr) -> Backend {
             provider: "openai".into(),
             models: vec!["gpt-test".into()],
             endpoint: Some(format!("http://{addr}")),
+            model_rewrites: Default::default(),
         },
         policies: vec![],
     }

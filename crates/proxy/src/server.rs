@@ -1,3 +1,4 @@
+use crate::llm::{self, LlmDialect, LlmUsage, UsageSink};
 use crate::ProxyState;
 use axum::body::Body;
 use axum::extract::State;
@@ -9,8 +10,8 @@ use axum::routing::any;
 use axum::Router;
 use dxgate_core::{
     AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, BackendKind, Cluster,
-    Endpoint, HeaderTransform, MatchInput, PolicyAction, Provider, RateLimitKey, RetryPolicy,
-    UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
+    Endpoint, HeaderTransform, MatchInput, PolicyAction, Provider, ProviderKind, RateLimitKey,
+    RetryPolicy, UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
 };
 use hyper::body::{self, Bytes};
 use hyper::client::HttpConnector;
@@ -554,6 +555,7 @@ async fn forward_agent(
             if backend_matches_protocol(backend, context.protocol)
                 && backend.supports_model(context.model.as_deref())
                 && backend.supports_tool(context.tool.as_deref())
+                && backend_supports_llm_request(&cfg, backend, &context)
             {
                 Some(weighted.clone())
             } else {
@@ -652,9 +654,18 @@ async fn request_agent_with_failover(
                 backend = %backend.name,
                 http.status_code = tracing::field::Empty
             );
-            match request_agent_backend(server, cfg, backend, parts, body, context, policy_runtime)
-                .instrument(upstream_span.clone())
-                .await
+            match request_agent_backend(
+                server,
+                cfg,
+                route,
+                backend,
+                parts,
+                body,
+                context,
+                policy_runtime,
+            )
+            .instrument(upstream_span.clone())
+            .await
             {
                 Ok(mut response) => {
                     let status = response.status();
@@ -704,9 +715,11 @@ async fn request_agent_with_failover(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn request_agent_backend(
     server: &ProxyServer,
     cfg: &dxgate_core::RuntimeConfig,
+    route: &AgentRoute,
     backend: &Backend,
     parts: &http::request::Parts,
     body: &Bytes,
@@ -720,9 +733,39 @@ async fn request_agent_backend(
             format!("backend {} has no endpoint", backend.name),
         )
     })?;
-    let uri = compose_upstream_uri(endpoint, &context.path_and_query)?;
+
+    let exchange = if context.protocol == AgentProtocol::Llm {
+        Some(prepare_llm_exchange(
+            backend, provider, endpoint, context, body,
+        )?)
+    } else {
+        None
+    };
+
+    let (uri, out_body) = match &exchange {
+        Some(exchange) => (exchange.uri.clone(), exchange.body.clone()),
+        None => (
+            compose_upstream_uri(endpoint, &context.path_and_query)?,
+            body.clone(),
+        ),
+    };
+
     let mut headers = parts.headers.clone();
     apply_request_headers(&mut headers, &policy_runtime.request_headers);
+    if let Some(exchange) = &exchange {
+        if exchange.dialect != LlmDialect::OpenAi {
+            // The caller's gateway credential must not leak to a foreign-dialect
+            // provider; provider auth is injected below.
+            headers.remove(http::header::AUTHORIZATION);
+        }
+        if exchange.body_rewritten {
+            headers.remove(http::header::CONTENT_LENGTH);
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HttpHeaderValue::from_static("application/json"),
+            );
+        }
+    }
     apply_provider_headers(&mut headers, provider);
     headers.remove(http::header::HOST);
     inject_trace_context(&mut headers);
@@ -734,7 +777,7 @@ async fn request_agent_backend(
         .uri(uri)
         .version(Version::HTTP_11);
     *builder.headers_mut().unwrap() = headers;
-    let request = builder.body(Body::from(body.clone())).map_err(|e| {
+    let request = builder.body(Body::from(out_body)).map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
             format!("build upstream request: {e}"),
@@ -742,15 +785,268 @@ async fn request_agent_backend(
     })?;
 
     let fut = server.clients.request_web(request);
-    if let Some(timeout) = policy_runtime.timeout {
-        return time::timeout(timeout, fut).await.map_err(|_| {
+    let response = if let Some(timeout) = policy_runtime.timeout {
+        time::timeout(timeout, fut).await.map_err(|_| {
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("backend {} timed out", backend.name),
             )
-        })?;
+        })??
+    } else {
+        fut.await?
+    };
+
+    match exchange {
+        Some(exchange) => {
+            let sink = usage_sink(server, route, backend, &exchange.model, policy_runtime);
+            finalize_llm_response(server, response, exchange, sink).await
+        }
+        None => Ok(response),
     }
-    fut.await
+}
+
+struct LlmExchange {
+    uri: Uri,
+    body: Bytes,
+    dialect: LlmDialect,
+    streaming: bool,
+    body_rewritten: bool,
+    model: String,
+}
+
+// Builds the upstream request for an LLM backend: translates the body for
+// native-dialect providers and applies per-backend model rewrites.
+fn prepare_llm_exchange(
+    backend: &Backend,
+    provider: Option<&Provider>,
+    endpoint: &str,
+    context: &AgentRequestContext,
+    body: &Bytes,
+) -> Result<LlmExchange, (StatusCode, String)> {
+    let dialect = provider
+        .map(|provider| llm::dialect_for(provider.kind))
+        .unwrap_or(LlmDialect::OpenAi);
+    let request_json = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<Value>(body).ok()
+    };
+    let streaming = request_json
+        .as_ref()
+        .map(llm::is_streaming_request)
+        .unwrap_or(false);
+    let requested_model = context.model.as_deref();
+    let effective_model =
+        requested_model.map(|model| backend.rewrite_model(model).unwrap_or(model).to_string());
+    let model_label = effective_model
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+
+    if dialect != LlmDialect::OpenAi {
+        if context.path != llm::OPENAI_CHAT_COMPLETIONS_PATH {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "backend {} only supports {} for its provider dialect",
+                    backend.name,
+                    llm::OPENAI_CHAT_COMPLETIONS_PATH
+                ),
+            ));
+        }
+        let Some(request_json) = &request_json else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "LLM request body must be JSON".to_string(),
+            ));
+        };
+        let Some(model) = effective_model else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "LLM request must name a model".to_string(),
+            ));
+        };
+        let (url, translated) = match dialect {
+            LlmDialect::Anthropic => (
+                llm::anthropic_messages_url(endpoint),
+                llm::anthropic_request(request_json, &model),
+            ),
+            LlmDialect::Gemini => (
+                llm::gemini_generate_url(endpoint, &model, streaming),
+                llm::gemini_request(request_json),
+            ),
+            LlmDialect::OpenAi => unreachable!("openai dialect is not translated"),
+        };
+        let uri = url.parse::<Uri>().map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("invalid upstream uri for backend {}: {e}", backend.name),
+            )
+        })?;
+        return Ok(LlmExchange {
+            uri,
+            body: Bytes::from(translated.to_string()),
+            dialect,
+            streaming,
+            body_rewritten: true,
+            model,
+        });
+    }
+
+    let uri = compose_upstream_uri(endpoint, &context.path_and_query)?;
+    let rewritten = match (&request_json, requested_model, &effective_model) {
+        (Some(json), Some(original), Some(effective)) if original != effective => {
+            let mut json = json.clone();
+            json["model"] = Value::String(effective.clone());
+            Some(Bytes::from(json.to_string()))
+        }
+        _ => None,
+    };
+    let body_rewritten = rewritten.is_some();
+    Ok(LlmExchange {
+        uri,
+        body: rewritten.unwrap_or_else(|| body.clone()),
+        dialect,
+        streaming,
+        body_rewritten,
+        model: model_label,
+    })
+}
+
+fn usage_sink(
+    server: &ProxyServer,
+    route: &AgentRoute,
+    backend: &Backend,
+    model: &str,
+    policy_runtime: &PolicyRuntime,
+) -> UsageSink {
+    let state = server.state.clone();
+    let route = route.name.clone();
+    let backend = backend.name.clone();
+    let model = model.to_string();
+    let charges = policy_runtime.token_charges.clone();
+    Arc::new(move |usage: LlmUsage| {
+        state.record_llm_usage(
+            &route,
+            &backend,
+            &model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
+        for charge in &charges {
+            state.add_token_usage(&charge.key, charge.window_seconds, usage.total());
+        }
+    })
+}
+
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    header_contains(headers, http::header::CONTENT_TYPE, "text/event-stream")
+}
+
+fn declared_content_length(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+async fn read_llm_upstream_body(
+    server: &ProxyServer,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Bytes, (StatusCode, String)> {
+    read_body_limited(headers, body, server.max_body_bytes)
+        .await
+        .map_err(|(_, message)| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("read LLM upstream response: {message}"),
+            )
+        })
+}
+
+// Rewrites the upstream response back into the OpenAI dialect and hooks token
+// usage extraction into the body.
+async fn finalize_llm_response(
+    server: &ProxyServer,
+    response: Response<Body>,
+    exchange: LlmExchange,
+    sink: UsageSink,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let (mut parts, body) = response.into_parts();
+    match exchange.dialect {
+        LlmDialect::OpenAi => {
+            if is_event_stream(&parts.headers) {
+                // SSE responses carry no content-length, so hyper polls the
+                // wrapped stream to its end and the usage hook always runs.
+                return Ok(Response::from_parts(
+                    parts,
+                    llm::observe_openai_body(body, true, sink),
+                ));
+            }
+            match declared_content_length(&parts.headers) {
+                // With a content-length, hyper stops polling once those bytes
+                // are written, so a stream wrapper would never observe the end
+                // of the body. Buffer instead: the bytes are returned unchanged
+                // and usage is extracted synchronously.
+                Some(length) if length <= server.max_body_bytes => {
+                    let bytes = read_llm_upstream_body(server, &parts.headers, body).await?;
+                    llm::extract_openai_usage(&bytes, &sink);
+                    Ok(Response::from_parts(parts, Body::from(bytes)))
+                }
+                // Too large to buffer for usage extraction; pass the response
+                // through unmetered rather than failing it.
+                Some(_) => Ok(Response::from_parts(parts, body)),
+                // No declared length: hyper polls the wrapper to end-of-stream,
+                // so usage can be observed without buffering.
+                None => Ok(Response::from_parts(
+                    parts,
+                    llm::observe_openai_body(body, false, sink),
+                )),
+            }
+        }
+        LlmDialect::Anthropic | LlmDialect::Gemini => {
+            if parts.status.is_success() && exchange.streaming && is_event_stream(&parts.headers) {
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                let translated = match exchange.dialect {
+                    LlmDialect::Anthropic => {
+                        llm::transcode_anthropic_stream(body, exchange.model, sink)
+                    }
+                    _ => llm::transcode_gemini_stream(body, exchange.model, sink),
+                };
+                return Ok(Response::from_parts(parts, translated));
+            }
+
+            let bytes = read_llm_upstream_body(server, &parts.headers, body).await?;
+            let value = serde_json::from_slice::<Value>(&bytes).map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("parse LLM upstream response: {e}"),
+                )
+            })?;
+            let translated = if parts.status.is_success() {
+                let (translated, usage) = match exchange.dialect {
+                    LlmDialect::Anthropic => llm::openai_from_anthropic_response(&value),
+                    _ => llm::openai_from_gemini_response(&value, &exchange.model),
+                };
+                sink(usage);
+                translated
+            } else if exchange.dialect == LlmDialect::Anthropic {
+                llm::openai_error_from_anthropic(&value, "upstream request failed")
+            } else {
+                // Gemini errors already use an {"error": {...}} envelope.
+                value
+            };
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            parts.headers.insert(
+                http::header::CONTENT_TYPE,
+                HttpHeaderValue::from_static("application/json"),
+            );
+            Ok(Response::from_parts(
+                parts,
+                Body::from(translated.to_string()),
+            ))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -780,9 +1076,18 @@ async fn federate_mcp_tools(
             backend = %backend.name,
             http.status_code = tracing::field::Empty
         );
-        match request_agent_backend(server, cfg, backend, parts, body, context, policy_runtime)
-            .instrument(upstream_span.clone())
-            .await
+        match request_agent_backend(
+            server,
+            cfg,
+            route,
+            backend,
+            parts,
+            body,
+            context,
+            policy_runtime,
+        )
+        .instrument(upstream_span.clone())
+        .await
         {
             Ok(response) => {
                 let status = response.status();
@@ -918,8 +1223,16 @@ fn remove_connection_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("http2-settings"));
 }
 
+const LLM_API_PATHS: [&str; 5] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/models",
+    "/v1/responses",
+];
+
 fn detect_agent_protocol(path: &str) -> Option<AgentProtocol> {
-    if path == "/v1/chat/completions" {
+    if LLM_API_PATHS.contains(&path) || path.starts_with("/v1/models/") {
         Some(AgentProtocol::Llm)
     } else if path == "/mcp" || path.starts_with("/mcp/") {
         Some(AgentProtocol::Mcp)
@@ -1104,6 +1417,14 @@ struct PolicyRuntime {
     response_headers: HeaderTransform,
     timeout: Option<Duration>,
     retry: Option<RetryPolicy>,
+    token_charges: Vec<TokenCharge>,
+}
+
+// A token-limit bucket this request's usage must be charged against.
+#[derive(Debug, Clone)]
+struct TokenCharge {
+    key: String,
+    window_seconds: u64,
 }
 
 fn evaluate_policies(
@@ -1129,6 +1450,7 @@ fn evaluate_policies(
         response_headers: HeaderTransform::default(),
         timeout: None,
         retry: None,
+        token_charges: Vec::new(),
     };
 
     for name in names {
@@ -1172,6 +1494,23 @@ fn evaluate_policies(
                     format!("rate limit exceeded by policy {}", policy.name),
                 ));
             }
+        }
+        if let Some(token_limit) = &policy.token_limit {
+            let key = format!(
+                "tokens:{}",
+                rate_limit_key(token_limit.key, &policy.name, route, backend, context)
+            );
+            if !server.state.check_token_limit(&key, token_limit) {
+                server.state.record_policy_denied();
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("token limit exceeded by policy {}", policy.name),
+                ));
+            }
+            runtime.token_charges.push(TokenCharge {
+                key,
+                window_seconds: token_limit.window_seconds,
+            });
         }
         merge_header_transform(&mut runtime.request_headers, &policy.request_headers);
         merge_header_transform(&mut runtime.response_headers, &policy.response_headers);
@@ -1326,10 +1665,41 @@ fn apply_provider_headers(headers: &mut HeaderMap, provider: Option<&Provider>) 
     }
     if let Some(env_name) = &provider.api_key_env {
         if let Ok(key) = env::var(env_name) {
-            if let Ok(value) = HttpHeaderValue::from_str(&format!("Bearer {key}")) {
-                headers.insert(http::header::AUTHORIZATION, value);
+            let credential = match provider.kind {
+                ProviderKind::Anthropic => HttpHeaderValue::from_str(&key)
+                    .map(|v| (HeaderName::from_static("x-api-key"), v)),
+                ProviderKind::Gemini => HttpHeaderValue::from_str(&key)
+                    .map(|v| (HeaderName::from_static("x-goog-api-key"), v)),
+                _ => HttpHeaderValue::from_str(&format!("Bearer {key}"))
+                    .map(|v| (http::header::AUTHORIZATION, v)),
+            };
+            if let Ok((name, value)) = credential {
+                headers.insert(name, value);
             }
         }
+    }
+    if provider.kind == ProviderKind::Anthropic {
+        headers
+            .entry(HeaderName::from_static("anthropic-version"))
+            .or_insert_with(|| HttpHeaderValue::from_static("2023-06-01"));
+    }
+}
+
+fn backend_supports_llm_request(
+    cfg: &dxgate_core::RuntimeConfig,
+    backend: &Backend,
+    context: &AgentRequestContext,
+) -> bool {
+    if context.protocol != AgentProtocol::Llm {
+        return true;
+    }
+    let Some(provider) = backend_provider(cfg, backend) else {
+        return true;
+    };
+    match llm::dialect_for(provider.kind) {
+        LlmDialect::OpenAi => true,
+        // Native dialects are only translated for chat completions.
+        _ => context.path == llm::OPENAI_CHAT_COMPLETIONS_PATH,
     }
 }
 

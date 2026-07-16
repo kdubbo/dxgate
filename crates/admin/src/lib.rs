@@ -3,7 +3,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use dxgate_proxy::{HttpRouteMetric, ProxyMetrics, ProxyState, Readiness, RouteMetric};
+use dxgate_proxy::{
+    HttpRouteMetric, LlmUsageMetric, ProxyMetrics, ProxyState, Readiness, RouteMetric,
+};
 use serde::Serialize;
 use std::net::SocketAddr;
 
@@ -191,7 +193,35 @@ fn prometheus_metrics(readiness: Readiness, proxy: ProxyMetrics) -> String {
             route.requests
         ));
     }
+    out.push_str("# HELP dxgate_llm_requests_total LLM requests with recorded token usage\n# TYPE dxgate_llm_requests_total counter\n");
+    for usage in &proxy.llm_usage {
+        let labels = llm_usage_labels(usage);
+        out.push_str(&format!(
+            "dxgate_llm_requests_total{{{labels}}} {}\n",
+            usage.requests
+        ));
+    }
+    out.push_str("# HELP dxgate_llm_tokens_total LLM tokens observed by route, backend, and model\n# TYPE dxgate_llm_tokens_total counter\n");
+    for usage in &proxy.llm_usage {
+        let labels = llm_usage_labels(usage);
+        out.push_str(&format!(
+            "dxgate_llm_tokens_total{{{labels},type=\"prompt\"}} {}\n",
+            usage.prompt_tokens
+        ));
+        out.push_str(&format!(
+            "dxgate_llm_tokens_total{{{labels},type=\"completion\"}} {}\n",
+            usage.completion_tokens
+        ));
+    }
     out
+}
+
+fn llm_usage_labels(usage: &LlmUsageMetric) -> String {
+    prometheus_labels(&[
+        ("route", usage.route.as_str()),
+        ("backend", usage.backend.as_str()),
+        ("model", usage.model.as_str()),
+    ])
 }
 
 fn http_route_labels(route: &HttpRouteMetric) -> String {
@@ -736,7 +766,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 #[cfg(test)]
 mod tests {
     use super::{admin_html, prometheus_metrics};
-    use dxgate_proxy::{HttpRouteMetric, LatencyBucket, ProxyMetrics, Readiness};
+    use dxgate_proxy::{HttpRouteMetric, LatencyBucket, LlmUsageMetric, ProxyMetrics, Readiness};
 
     #[test]
     fn admin_ui_contains_runtime_panels() {
@@ -803,6 +833,14 @@ mod tests {
                     ],
                 }],
                 routes: vec![],
+                llm_usage: vec![LlmUsageMetric {
+                    route: "llm".into(),
+                    backend: "claude".into(),
+                    model: "claude-3".into(),
+                    requests: 2,
+                    prompt_tokens: 30,
+                    completion_tokens: 12,
+                }],
             },
         );
 
