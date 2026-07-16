@@ -1,4 +1,5 @@
 use crate::llm::{self, LlmDialect, LlmUsage, UsageSink};
+use crate::mcp;
 use crate::ProxyState;
 use axum::body::Body;
 use axum::extract::State;
@@ -13,7 +14,7 @@ use dxgate_core::{
     Endpoint, HeaderTransform, MatchInput, PolicyAction, Provider, ProviderKind, RateLimitKey,
     RetryPolicy, UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
 };
-use hyper::body::{self, Bytes};
+use hyper::body::Bytes;
 use hyper::client::HttpConnector;
 use hyper::Client;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -543,10 +544,36 @@ async fn forward_agent(
     server: ProxyServer,
     cfg: dxgate_core::RuntimeConfig,
     parts: http::request::Parts,
-    body: Bytes,
-    context: AgentRequestContext,
+    mut body: Bytes,
+    mut context: AgentRequestContext,
     route: AgentRoute,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    // A backend-prefixed name minted by list federation ("mcp-b__search")
+    // pins the request to that backend and is rewritten back to the upstream
+    // name before matching or forwarding.
+    let mut alias_backend: Option<String> = None;
+    if context.protocol == AgentProtocol::Mcp {
+        let alias = context
+            .tool
+            .as_deref()
+            .and_then(mcp::split_alias)
+            .map(|(backend, original)| (backend.to_string(), original.to_string()));
+        if let Some((backend_name, original)) = alias {
+            if route
+                .weighted_backends
+                .iter()
+                .any(|weighted| weighted.name == backend_name)
+            {
+                if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
+                    json["params"]["name"] = Value::String(original.clone());
+                    body = Bytes::from(json.to_string());
+                    context.tool = Some(original);
+                    alias_backend = Some(backend_name);
+                }
+            }
+        }
+    }
+
     let eligible = route
         .weighted_backends
         .iter()
@@ -556,6 +583,9 @@ async fn forward_agent(
                 && backend.supports_model(context.model.as_deref())
                 && backend.supports_tool(context.tool.as_deref())
                 && backend_supports_llm_request(&cfg, backend, &context)
+                && alias_backend
+                    .as_deref()
+                    .is_none_or(|name| weighted.name == name)
             {
                 Some(weighted.clone())
             } else {
@@ -573,6 +603,12 @@ async fn forward_agent(
 
     let primary = if let Some(bound) = mcp_session_backend(&server, &context, &eligible) {
         bound
+    } else if context.protocol == AgentProtocol::Mcp && context.tool.is_some() {
+        // Calls naming a tool/prompt must land on the backend that list
+        // federation credited with the bare name: the first eligible backend
+        // in route-declared order. Round-robin would let a colliding name
+        // resolve to a different backend than the one whose item was listed.
+        eligible[0].clone()
     } else {
         server
             .state
@@ -582,7 +618,7 @@ async fn forward_agent(
             .unwrap_or_else(|| eligible[0].clone())
     };
     let mut ordered = vec![primary.clone()];
-    ordered.extend(eligible.into_iter().filter(|b| b.name != primary.name));
+    ordered.extend(eligible.iter().filter(|b| b.name != primary.name).cloned());
 
     let primary_backend = cfg.backend(&primary.name).ok_or_else(|| {
         (
@@ -593,24 +629,37 @@ async fn forward_agent(
     let policy_runtime =
         evaluate_policies(&server, &cfg, &route, primary_backend, &context, body.len())?;
 
-    if context.protocol == AgentProtocol::Mcp
-        && context.mcp_method.as_deref() == Some("tools/list")
-        && ordered.len() > 1
-    {
-        return federate_mcp_tools(
-            &server,
-            &cfg,
-            &route,
-            &ordered,
-            &parts,
-            &body,
-            &context,
-            &policy_runtime,
-        )
-        .await;
+    if context.protocol == AgentProtocol::Mcp && eligible.len() > 1 {
+        if let Some(spec) = context.mcp_method.as_deref().and_then(mcp::list_spec) {
+            // Cursors are opaque to the gateway and only valid against the
+            // backend that issued them, so paged follow-ups skip federation —
+            // federated responses never carry a cursor, making this reachable
+            // only for clients paging a single backend directly.
+            let has_cursor = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .as_ref()
+                .and_then(|json| mcp::request_cursor(json).map(ToString::to_string))
+                .is_some();
+            if !has_cursor {
+                // Federation walks backends in route-declared order so alias
+                // assignment on name collisions is stable across requests.
+                return federate_mcp_list(
+                    &server,
+                    &cfg,
+                    &route,
+                    &eligible,
+                    &parts,
+                    &body,
+                    &context,
+                    &policy_runtime,
+                    &spec,
+                )
+                .await;
+            }
+        }
     }
 
-    request_agent_with_failover(
+    let response = request_agent_with_failover(
         &server,
         &cfg,
         &route,
@@ -620,7 +669,18 @@ async fn forward_agent(
         &context,
         &policy_runtime,
     )
-    .await
+    .await?;
+
+    // On multi-backend routes, list calls are answered by federation, so the
+    // initialize handshake must advertise those capabilities even when the
+    // session's own backend lacks them.
+    if context.protocol == AgentProtocol::Mcp
+        && context.mcp_method.as_deref() == Some("initialize")
+        && eligible.len() > 1
+    {
+        return augment_initialize_response(&server, response).await;
+    }
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -671,6 +731,7 @@ async fn request_agent_with_failover(
                     let status = response.status();
                     upstream_span.record("http.status_code", status.as_u16());
                     update_mcp_session(&server.state, backend, context, response.headers(), status);
+                    record_mcp_tool_call(server, route, backend, context, status.is_success());
                     server.state.record_agent_request(
                         protocol_name(context.protocol),
                         &route.name,
@@ -694,6 +755,7 @@ async fn request_agent_with_failover(
                 }
                 Err(err) => {
                     upstream_span.record("http.status_code", err.0.as_u16());
+                    record_mcp_tool_call(server, route, backend, context, false);
                     server.state.record_agent_request(
                         protocol_name(context.protocol),
                         &route.name,
@@ -713,6 +775,26 @@ async fn request_agent_with_failover(
             format!("agent route {} had no reachable backends", route.name),
         )
     }))
+}
+
+// Per-tool call accounting; success tracks the HTTP status only, since
+// JSON-RPC-level errors would require buffering every response body.
+fn record_mcp_tool_call(
+    server: &ProxyServer,
+    route: &AgentRoute,
+    backend: &Backend,
+    context: &AgentRequestContext,
+    success: bool,
+) {
+    if context.protocol != AgentProtocol::Mcp || context.mcp_method.as_deref() != Some("tools/call")
+    {
+        return;
+    }
+    if let Some(tool) = &context.tool {
+        server
+            .state
+            .record_mcp_tool_call(&route.name, &backend.name, tool, success);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -759,7 +841,6 @@ async fn request_agent_backend(
             headers.remove(http::header::AUTHORIZATION);
         }
         if exchange.body_rewritten {
-            headers.remove(http::header::CONTENT_LENGTH);
             headers.insert(
                 http::header::CONTENT_TYPE,
                 HttpHeaderValue::from_static("application/json"),
@@ -768,6 +849,16 @@ async fn request_agent_backend(
     }
     apply_provider_headers(&mut headers, provider);
     headers.remove(http::header::HOST);
+    // The agent path forwards a fully buffered body that may have been
+    // rewritten (LLM translation, MCP alias/cursor pages); make the framing
+    // headers describe the bytes actually sent.
+    headers.remove(http::header::TRANSFER_ENCODING);
+    if !out_body.is_empty() || headers.contains_key(http::header::CONTENT_LENGTH) {
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HttpHeaderValue::from(out_body.len()),
+        );
+    }
     inject_trace_context(&mut headers);
 
     // Agent upstreams are reached over the HTTP/1.1 client pool; echoing the
@@ -1049,8 +1140,15 @@ async fn finalize_llm_response(
     }
 }
 
+// Caps how many pages of one backend's list a single federated call drains,
+// bounding fan-out amplification from a misbehaving cursor loop.
+const MCP_FEDERATION_MAX_PAGES: usize = 32;
+
+// Fans a JSON-RPC list call out to every eligible backend (route-declared
+// order), draining each backend's pagination, and returns the merged result.
+// The merged list carries no cursor, so clients never page the aggregate.
 #[allow(clippy::too_many_arguments)]
-async fn federate_mcp_tools(
+async fn federate_mcp_list(
     server: &ProxyServer,
     cfg: &dxgate_core::RuntimeConfig,
     route: &AgentRoute,
@@ -1059,8 +1157,10 @@ async fn federate_mcp_tools(
     body: &Bytes,
     context: &AgentRequestContext,
     policy_runtime: &PolicyRuntime,
+    spec: &mcp::ListSpec,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let mut tools = Vec::new();
+    let request_json = serde_json::from_slice::<Value>(body).ok();
+    let mut merged = Vec::new();
     let mut seen = BTreeSet::new();
     let mut failures = Vec::new();
 
@@ -1068,92 +1168,104 @@ async fn federate_mcp_tools(
         let Some(backend) = cfg.backend(&weighted.name) else {
             continue;
         };
-        let started = Instant::now();
-        let upstream_span = tracing::info_span!(
-            "dxgate.agent.upstream",
-            protocol = protocol_name(context.protocol),
-            route = %route.name,
-            backend = %backend.name,
-            http.status_code = tracing::field::Empty
-        );
-        match request_agent_backend(
-            server,
-            cfg,
-            route,
-            backend,
-            parts,
-            body,
-            context,
-            policy_runtime,
-        )
-        .instrument(upstream_span.clone())
-        .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                upstream_span.record("http.status_code", status.as_u16());
-                let bytes = body::to_bytes(response.into_body()).await.map_err(|e| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!("read MCP tools/list response from {}: {e}", backend.name),
-                    )
-                })?;
-                server.state.record_agent_request(
-                    protocol_name(context.protocol),
-                    &route.name,
-                    &backend.name,
-                    status.as_u16(),
-                    started.elapsed().as_millis() as u64,
-                );
-                if !status.is_success() {
-                    failures.push(format!("{} returned {}", backend.name, status));
-                    continue;
+        let mut cursor: Option<String> = None;
+        for _ in 0..MCP_FEDERATION_MAX_PAGES {
+            let page_body = match (&cursor, &request_json) {
+                (Some(cursor), Some(json)) => {
+                    Bytes::from(mcp::with_cursor(json, cursor).to_string())
                 }
-                let value = serde_json::from_slice::<Value>(&bytes).map_err(|e| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!("parse MCP tools/list response from {}: {e}", backend.name),
-                    )
-                })?;
-                if let Some(items) = value
-                    .get("result")
-                    .and_then(|result| result.get("tools"))
-                    .and_then(Value::as_array)
-                {
-                    for item in items {
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        if seen.insert(name) {
-                            tools.push(item.clone());
-                        }
-                    }
+                _ => body.clone(),
+            };
+            let started = Instant::now();
+            let upstream_span = tracing::info_span!(
+                "dxgate.agent.upstream",
+                protocol = protocol_name(context.protocol),
+                route = %route.name,
+                backend = %backend.name,
+                http.status_code = tracing::field::Empty
+            );
+            let outcome = request_agent_backend(
+                server,
+                cfg,
+                route,
+                backend,
+                parts,
+                &page_body,
+                context,
+                policy_runtime,
+            )
+            .instrument(upstream_span.clone())
+            .await;
+            let response = match outcome {
+                Ok(response) => response,
+                Err(err) => {
+                    upstream_span.record("http.status_code", err.0.as_u16());
+                    server.state.record_agent_request(
+                        protocol_name(context.protocol),
+                        &route.name,
+                        &backend.name,
+                        err.0.as_u16(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                    failures.push(format!("{}: {}", backend.name, err.1));
+                    break;
                 }
+            };
+            let status = response.status();
+            upstream_span.record("http.status_code", status.as_u16());
+            server.state.record_agent_request(
+                protocol_name(context.protocol),
+                &route.name,
+                &backend.name,
+                status.as_u16(),
+                started.elapsed().as_millis() as u64,
+            );
+            let (response_parts, response_body) = response.into_parts();
+            let bytes = match read_body_limited(
+                &response_parts.headers,
+                response_body,
+                server.max_body_bytes,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err((_, message)) => {
+                    failures.push(format!("{}: {message}", backend.name));
+                    break;
+                }
+            };
+            if !status.is_success() {
+                failures.push(format!("{} returned {}", backend.name, status));
+                break;
             }
-            Err(err) => {
-                upstream_span.record("http.status_code", err.0.as_u16());
-                server.state.record_agent_request(
-                    protocol_name(context.protocol),
-                    &route.name,
-                    &backend.name,
-                    err.0.as_u16(),
-                    started.elapsed().as_millis() as u64,
-                );
-                failures.push(format!("{}: {}", backend.name, err.1));
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                failures.push(format!("{}: response is not JSON", backend.name));
+                break;
+            };
+            if let Some(items) = value
+                .pointer(&format!("/result/{}", spec.result_key))
+                .and_then(Value::as_array)
+            {
+                mcp::merge_list_items(&mut merged, &mut seen, items, spec, &backend.name);
+            }
+            match mcp::next_cursor(&value) {
+                // Paging rewrites the request body, which requires it to be JSON.
+                Some(next) if request_json.is_some() => cursor = Some(next),
+                _ => break,
             }
         }
     }
 
-    if tools.is_empty() && !failures.is_empty() {
+    if merged.is_empty() && !failures.is_empty() {
         return Err((StatusCode::BAD_GATEWAY, failures.join("; ")));
     }
 
-    let id = serde_json::from_slice::<Value>(body)
-        .ok()
+    let id = request_json
+        .as_ref()
         .and_then(|value| value.get("id").cloned())
         .unwrap_or(Value::Null);
+    let mut result = serde_json::Map::new();
+    result.insert(spec.result_key.to_string(), Value::Array(merged));
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "application/json")
@@ -1161,7 +1273,7 @@ async fn federate_mcp_tools(
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "tools": tools }
+                "result": Value::Object(result)
             })
             .to_string(),
         ))
@@ -1173,6 +1285,38 @@ async fn federate_mcp_tools(
         })?;
     apply_response_headers(response.headers_mut(), &policy_runtime.response_headers);
     Ok(response)
+}
+
+// Buffers a successful initialize response and fills in the capability keys
+// that federation makes true at the gateway level.
+async fn augment_initialize_response(
+    server: &ProxyServer,
+    response: Response<Body>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    if !response.status().is_success() || is_event_stream(response.headers()) {
+        return Ok(response);
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = read_body_limited(&parts.headers, body, server.max_body_bytes)
+        .await
+        .map_err(|(_, message)| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("read MCP initialize response: {message}"),
+            )
+        })?;
+    let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(Response::from_parts(parts, Body::from(bytes)));
+    };
+    if !mcp::augment_initialize_capabilities(&mut value) {
+        return Ok(Response::from_parts(parts, Body::from(bytes)));
+    }
+    let body = value.to_string();
+    parts.headers.insert(
+        http::header::CONTENT_LENGTH,
+        HttpHeaderValue::from(body.len()),
+    );
+    Ok(Response::from_parts(parts, Body::from(body)))
 }
 
 // gRPC and Dubbo Triple mark themselves via content-type and only run over

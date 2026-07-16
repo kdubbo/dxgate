@@ -1,4 +1,5 @@
 mod llm;
+mod mcp;
 mod server;
 mod state;
 

@@ -24,7 +24,7 @@ struct Inner {
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
     token_usage: Mutex<HashMap<String, TokenBucket>>,
     circuit_breakers: Mutex<HashMap<String, CircuitBreakerBucket>>,
-    mcp_sessions: Mutex<HashMap<String, String>>,
+    mcp_sessions: Mutex<HashMap<String, McpSession>>,
     metrics: Mutex<MetricsStore>,
 }
 
@@ -44,6 +44,7 @@ pub struct ProxyMetrics {
     pub http_routes: Vec<HttpRouteMetric>,
     pub routes: Vec<RouteMetric>,
     pub llm_usage: Vec<LlmUsageMetric>,
+    pub mcp_tools: Vec<McpToolMetric>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -54,6 +55,26 @@ pub struct LlmUsageMetric {
     pub requests: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct McpToolMetric {
+    pub route: String,
+    pub backend: String,
+    pub tool: String,
+    pub calls: u64,
+    pub failures: u64,
+}
+
+// MCP session-affinity bindings are bounded so abandoned sessions cannot grow
+// proxy memory without limit; last_used refreshes on every routed request.
+const MCP_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+const MCP_SESSION_CAP: usize = 10_000;
+
+#[derive(Debug)]
+struct McpSession {
+    backend: String,
+    last_used: Instant,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +117,7 @@ struct MetricsStore {
     http_routes: HashMap<String, HttpRouteMetricCounter>,
     routes: HashMap<String, RouteMetricCounter>,
     llm_usage: HashMap<String, LlmUsageMetric>,
+    mcp_tools: HashMap<String, McpToolMetric>,
 }
 
 #[derive(Debug, Default)]
@@ -450,24 +472,59 @@ impl ProxyState {
     }
 
     pub fn bind_mcp_session(&self, session_id: impl Into<String>, backend: impl Into<String>) {
-        self.inner
-            .mcp_sessions
-            .lock()
-            .unwrap()
-            .insert(session_id.into(), backend.into());
+        let mut sessions = self.inner.mcp_sessions.lock().unwrap();
+        sessions.retain(|_, session| session.last_used.elapsed() < MCP_SESSION_TTL);
+        if sessions.len() >= MCP_SESSION_CAP {
+            // Bindings are an affinity optimization; dropping the idlest one
+            // only costs that session its stickiness, not correctness.
+            if let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_used)
+                .map(|(id, _)| id.clone())
+            {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions.insert(
+            session_id.into(),
+            McpSession {
+                backend: backend.into(),
+                last_used: Instant::now(),
+            },
+        );
     }
 
     pub fn mcp_session_backend(&self, session_id: &str) -> Option<String> {
-        self.inner
-            .mcp_sessions
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
+        let mut sessions = self.inner.mcp_sessions.lock().unwrap();
+        let session = sessions.get_mut(session_id)?;
+        if session.last_used.elapsed() >= MCP_SESSION_TTL {
+            sessions.remove(session_id);
+            return None;
+        }
+        session.last_used = Instant::now();
+        Some(session.backend.clone())
     }
 
     pub fn remove_mcp_session(&self, session_id: &str) {
         self.inner.mcp_sessions.lock().unwrap().remove(session_id);
+    }
+
+    pub fn record_mcp_tool_call(&self, route: &str, backend: &str, tool: &str, success: bool) {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        let key = format!("{route}|{backend}|{tool}");
+        let counter = metrics
+            .mcp_tools
+            .entry(key)
+            .or_insert_with(|| McpToolMetric {
+                route: route.to_string(),
+                backend: backend.to_string(),
+                tool: tool.to_string(),
+                ..McpToolMetric::default()
+            });
+        counter.calls += 1;
+        if !success {
+            counter.failures += 1;
+        }
     }
 
     pub fn metrics(&self) -> ProxyMetrics {
@@ -537,6 +594,13 @@ impl ProxyState {
                 .then_with(|| a.backend.cmp(&b.backend))
                 .then_with(|| a.model.cmp(&b.model))
         });
+        let mut mcp_tools = metrics.mcp_tools.values().cloned().collect::<Vec<_>>();
+        mcp_tools.sort_by(|a, b| {
+            a.route
+                .cmp(&b.route)
+                .then_with(|| a.backend.cmp(&b.backend))
+                .then_with(|| a.tool.cmp(&b.tool))
+        });
         ProxyMetrics {
             total_requests: metrics.total_requests,
             agent_requests: metrics.agent_requests,
@@ -545,6 +609,7 @@ impl ProxyState {
             http_routes,
             routes,
             llm_usage,
+            mcp_tools,
         }
     }
 }
@@ -599,6 +664,38 @@ mod tests {
             routes: vec![],
             policies: vec![],
         }
+    }
+
+    #[test]
+    fn mcp_session_bindings_are_capped() {
+        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
+        for i in 0..=MCP_SESSION_CAP {
+            state.bind_mcp_session(format!("session-{i}"), "backend");
+        }
+        // The idlest binding (the first inserted) was evicted to stay at cap.
+        assert_eq!(state.mcp_session_backend("session-0"), None);
+        assert_eq!(
+            state.mcp_session_backend(&format!("session-{MCP_SESSION_CAP}")),
+            Some("backend".to_string())
+        );
+    }
+
+    #[test]
+    fn mcp_tool_calls_aggregate_per_tool() {
+        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
+        state.record_mcp_tool_call("mcp", "mcp-a", "search", true);
+        state.record_mcp_tool_call("mcp", "mcp-a", "search", false);
+        state.record_mcp_tool_call("mcp", "mcp-b", "calendar", true);
+
+        let metrics = state.metrics();
+        assert_eq!(metrics.mcp_tools.len(), 2);
+        let search = metrics
+            .mcp_tools
+            .iter()
+            .find(|tool| tool.tool == "search")
+            .unwrap();
+        assert_eq!(search.calls, 2);
+        assert_eq!(search.failures, 1);
     }
 
     #[tokio::test]

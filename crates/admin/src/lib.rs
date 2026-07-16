@@ -4,7 +4,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use dxgate_proxy::{
-    HttpRouteMetric, LlmUsageMetric, ProxyMetrics, ProxyState, Readiness, RouteMetric,
+    HttpRouteMetric, LlmUsageMetric, McpToolMetric, ProxyMetrics, ProxyState, Readiness,
+    RouteMetric,
 };
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -213,6 +214,22 @@ fn prometheus_metrics(readiness: Readiness, proxy: ProxyMetrics) -> String {
             usage.completion_tokens
         ));
     }
+    out.push_str("# HELP dxgate_mcp_tool_calls_total MCP tools/call requests by route, backend, and tool\n# TYPE dxgate_mcp_tool_calls_total counter\n");
+    for tool in &proxy.mcp_tools {
+        let labels = mcp_tool_labels(tool);
+        out.push_str(&format!(
+            "dxgate_mcp_tool_calls_total{{{labels}}} {}\n",
+            tool.calls
+        ));
+    }
+    out.push_str("# HELP dxgate_mcp_tool_failures_total MCP tools/call requests that did not return a success status\n# TYPE dxgate_mcp_tool_failures_total counter\n");
+    for tool in &proxy.mcp_tools {
+        let labels = mcp_tool_labels(tool);
+        out.push_str(&format!(
+            "dxgate_mcp_tool_failures_total{{{labels}}} {}\n",
+            tool.failures
+        ));
+    }
     out
 }
 
@@ -221,6 +238,14 @@ fn llm_usage_labels(usage: &LlmUsageMetric) -> String {
         ("route", usage.route.as_str()),
         ("backend", usage.backend.as_str()),
         ("model", usage.model.as_str()),
+    ])
+}
+
+fn mcp_tool_labels(tool: &McpToolMetric) -> String {
+    prometheus_labels(&[
+        ("route", tool.route.as_str()),
+        ("backend", tool.backend.as_str()),
+        ("tool", tool.tool.as_str()),
     ])
 }
 
@@ -766,7 +791,9 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 #[cfg(test)]
 mod tests {
     use super::{admin_html, prometheus_metrics};
-    use dxgate_proxy::{HttpRouteMetric, LatencyBucket, LlmUsageMetric, ProxyMetrics, Readiness};
+    use dxgate_proxy::{
+        HttpRouteMetric, LatencyBucket, LlmUsageMetric, McpToolMetric, ProxyMetrics, Readiness,
+    };
 
     #[test]
     fn admin_ui_contains_runtime_panels() {
@@ -841,6 +868,13 @@ mod tests {
                     prompt_tokens: 30,
                     completion_tokens: 12,
                 }],
+                mcp_tools: vec![McpToolMetric {
+                    route: "mcp".into(),
+                    backend: "mcp-a".into(),
+                    tool: "search".into(),
+                    calls: 3,
+                    failures: 1,
+                }],
             },
         );
 
@@ -852,5 +886,11 @@ mod tests {
         assert!(text.contains("dxgate_http_route_latency_ms_sum{"));
         assert!(text.contains("dxgate_http_route_latency_ms_count{"));
         assert!(text.contains("le=\"+Inf\""));
+        assert!(text.contains(
+            "dxgate_mcp_tool_calls_total{route=\"mcp\",backend=\"mcp-a\",tool=\"search\"} 3"
+        ));
+        assert!(text.contains(
+            "dxgate_mcp_tool_failures_total{route=\"mcp\",backend=\"mcp-a\",tool=\"search\"} 1"
+        ));
     }
 }
