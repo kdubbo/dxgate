@@ -11,36 +11,32 @@ use axum::http::{
 use axum::routing::any;
 use axum::Router;
 use dxgate_core::{
-    AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, BackendKind, Cluster,
-    Endpoint, HeaderTransform, MatchInput, PolicyAction, Provider, ProviderKind, RateLimitKey,
-    RetryPolicy, UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
+    AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, BackendKind, Endpoint,
+    HeaderTransform, MatchInput, PolicyAction, Provider, ProviderKind, RateLimitKey, RetryPolicy,
+    UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
 };
 use hyper::body::Bytes;
-use hyper::client::HttpConnector;
-use hyper::Client;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::TraceContextExt;
-use rustls::client::{ServerCertVerified, ServerCertVerifier, WebPkiVerifier};
-use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{debug, info, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-type PlainClient = Client<HttpConnector, Body>;
-type WebClient = Client<HttpsConnector<HttpConnector>, Body>;
-type MtlsClient = Client<HttpsConnector<HttpConnector>, Body>;
+mod access_log;
+mod trace;
+mod upstream;
+
+use access_log::{access_log_line, AccessLogConfig, AccessLogEvent};
+use trace::{extract_trace_context, inject_trace_context};
+use upstream::UpstreamClients;
+
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
@@ -89,51 +85,6 @@ impl MetricsIdentity {
                 .or_else(|_| env::var("GATEWAY_NAME"))
                 .unwrap_or_else(|_| "unknown".to_string()),
         }
-    }
-}
-
-#[derive(Clone)]
-struct AccessLogConfig {
-    enabled: bool,
-    format: AccessLogFormat,
-}
-
-impl AccessLogConfig {
-    fn from_env() -> Self {
-        let enabled = env::var("DXGATE_ACCESS_LOG").ok();
-        let format = env::var("DXGATE_ACCESS_LOG_FORMAT").ok();
-        Self::from_values(enabled.as_deref(), format.as_deref())
-    }
-
-    fn from_values(enabled: Option<&str>, format: Option<&str>) -> Self {
-        Self {
-            enabled: parse_access_log_enabled(enabled),
-            format: parse_access_log_format(format),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AccessLogFormat {
-    Text,
-    Json,
-}
-
-fn parse_access_log_enabled(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(str::trim).filter(|value| !value.is_empty()),
-        Some(value)
-            if value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("0")
-                || value.eq_ignore_ascii_case("no")
-                || value.eq_ignore_ascii_case("off")
-    )
-}
-
-fn parse_access_log_format(value: Option<&str>) -> AccessLogFormat {
-    match value.map(str::trim) {
-        Some(value) if value.eq_ignore_ascii_case("json") => AccessLogFormat::Json,
-        _ => AccessLogFormat::Text,
     }
 }
 
@@ -2091,44 +2042,6 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-fn extract_trace_context(headers: &HeaderMap) -> opentelemetry::Context {
-    let extractor = HeaderExtractor(headers);
-    opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor))
-}
-
-fn inject_trace_context(headers: &mut HeaderMap) {
-    let context = tracing::Span::current().context();
-    let mut injector = HeaderInjector(headers);
-    opentelemetry::global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&context, &mut injector)
-    });
-}
-
-struct HeaderExtractor<'a>(&'a HeaderMap);
-
-impl Extractor for HeaderExtractor<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|value| value.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(HeaderName::as_str).collect()
-    }
-}
-
-struct HeaderInjector<'a>(&'a mut HeaderMap);
-
-impl Injector for HeaderInjector<'_> {
-    fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::try_from(key),
-            HttpHeaderValue::from_str(value.as_str()),
-        ) {
-            self.0.insert(name, value);
-        }
-    }
-}
-
 fn emit_http_access_log(server: &ProxyServer, observation: &HttpObservation<'_>) {
     if !server.access_log.enabled {
         return;
@@ -2165,407 +2078,19 @@ fn current_trace_ids() -> (String, String) {
     }
 }
 
-struct AccessLogEvent<'a> {
-    namespace: &'a str,
-    gateway: &'a str,
-    route: &'a str,
-    cluster: &'a str,
-    method: &'a str,
-    host: &'a str,
-    path: &'a str,
-    status_code: u16,
-    latency_ms: u64,
-    upstream: &'a str,
-    trace_id: &'a str,
-    span_id: &'a str,
-}
-
-fn access_log_line(format: AccessLogFormat, event: &AccessLogEvent<'_>) -> String {
-    match format {
-        AccessLogFormat::Text => format!(
-            "namespace={} gateway={} route={} cluster={} method={} host={} path={} status_code={} latency_ms={} upstream={} trace_id={} span_id={}",
-            event.namespace,
-            event.gateway,
-            event.route,
-            event.cluster,
-            event.method,
-            event.host,
-            event.path,
-            event.status_code,
-            event.latency_ms,
-            event.upstream,
-            event.trace_id,
-            event.span_id
-        ),
-        AccessLogFormat::Json => serde_json::json!({
-            "namespace": event.namespace,
-            "gateway": event.gateway,
-            "route": event.route,
-            "cluster": event.cluster,
-            "method": event.method,
-            "host": event.host,
-            "path": event.path,
-            "status_code": event.status_code,
-            "latency_ms": event.latency_ms,
-            "upstream": event.upstream,
-            "trace_id": event.trace_id,
-            "span_id": event.span_id,
-        })
-        .to_string(),
-    }
-}
-
-#[derive(Clone)]
-struct UpstreamClients {
-    plaintext: PlainClient,
-    web: WebClient,
-    // HTTP/2-only client: h2c prior knowledge on http:// and ALPN h2 on https://.
-    h2: WebClient,
-    mtls: MtlsSupport,
-}
-
-impl UpstreamClients {
-    fn from_env() -> Self {
-        let mtls = match env::var("GRPC_XDS_BOOTSTRAP") {
-            Ok(path) if !path.is_empty() => match MtlsClientPool::from_bootstrap(&path) {
-                Ok(pool) => {
-                    info!(bootstrap = %path, "loaded dxgate upstream mTLS bootstrap");
-                    MtlsSupport::Available(Arc::new(pool))
-                }
-                Err(err) => {
-                    warn!(bootstrap = %path, %err, "failed loading dxgate upstream mTLS bootstrap");
-                    MtlsSupport::Error(Arc::from(err))
-                }
-            },
-            _ => MtlsSupport::Disabled,
-        };
-        let web_connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let h2_connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http2()
-            .build();
-        Self {
-            plaintext: Client::new(),
-            web: Client::builder().build::<_, Body>(web_connector),
-            h2: Client::builder()
-                .http2_only(true)
-                .build::<_, Body>(h2_connector),
-            mtls,
-        }
-    }
-
-    async fn request_h2(&self, req: Request<Body>) -> Result<Response<Body>, (StatusCode, String)> {
-        self.h2
-            .request(req)
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
-    }
-
-    async fn request_plain(
-        &self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, (StatusCode, String)> {
-        self.plaintext
-            .request(req)
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
-    }
-
-    async fn request_web(
-        &self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, (StatusCode, String)> {
-        self.web
-            .request(req)
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
-    }
-
-    async fn request_mtls(
-        &self,
-        cluster: &Cluster,
-        tls: &UpstreamTls,
-        req: Request<Body>,
-        h2: bool,
-    ) -> Result<Response<Body>, (StatusCode, String)> {
-        let client = match &self.mtls {
-            MtlsSupport::Available(pool) => pool.client_for(tls, h2).map_err(|err| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("cluster {} mTLS setup failed: {err}", cluster.name),
-                )
-            })?,
-            MtlsSupport::Disabled => {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "cluster {} requires mTLS but GRPC_XDS_BOOTSTRAP is not configured",
-                        cluster.name
-                    ),
-                ));
-            }
-            MtlsSupport::Error(err) => {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "cluster {} requires mTLS but bootstrap loading failed: {err}",
-                        cluster.name
-                    ),
-                ));
-            }
-        };
-        client
-            .request(req)
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
-    }
-}
-
-#[derive(Clone)]
-enum MtlsSupport {
-    Disabled,
-    Available(Arc<MtlsClientPool>),
-    Error(Arc<str>),
-}
-
-struct MtlsClientPool {
-    bootstrap: GrpcBootstrap,
-    clients: Mutex<HashMap<String, MtlsClient>>,
-}
-
-impl MtlsClientPool {
-    fn from_bootstrap(path: &str) -> Result<Self, String> {
-        let file =
-            File::open(path).map_err(|e| format!("open gRPC xDS bootstrap {}: {e}", path))?;
-        let bootstrap: GrpcBootstrap = serde_json::from_reader(file)
-            .map_err(|e| format!("parse gRPC xDS bootstrap {}: {e}", path))?;
-        Ok(Self {
-            bootstrap,
-            clients: Mutex::new(HashMap::new()),
-        })
-    }
-
-    fn client_for(&self, tls: &UpstreamTls, h2: bool) -> Result<MtlsClient, String> {
-        let key = format!("{}|h2={h2}", mtls_cache_key(tls));
-        let mut clients = self
-            .clients
-            .lock()
-            .map_err(|_| "mTLS client cache lock poisoned".to_string())?;
-        if let Some(client) = clients.get(&key) {
-            return Ok(client.clone());
-        }
-
-        let config = self.tls_config(tls)?;
-        let builder = HttpsConnectorBuilder::new()
-            .with_tls_config(config)
-            .https_only();
-        let builder = match &tls.sni {
-            Some(sni) if !sni.is_empty() => builder.with_server_name(sni.clone()),
-            _ => builder,
-        };
-        let client = if h2 {
-            let connector = builder.enable_http2().build();
-            Client::builder()
-                .http2_only(true)
-                .build::<_, Body>(connector)
-        } else {
-            let connector = builder.enable_http1().build();
-            Client::builder().build::<_, Body>(connector)
-        };
-        clients.insert(key, client.clone());
-        Ok(client)
-    }
-
-    fn tls_config(&self, tls: &UpstreamTls) -> Result<ClientConfig, String> {
-        let cert_provider = tls.certificate_provider.as_deref().unwrap_or("default");
-        let root_provider = tls.validation_provider.as_deref().unwrap_or("default");
-        let cert_config = self.bootstrap.provider(cert_provider)?;
-        let root_config = self.bootstrap.provider(root_provider)?;
-        let cert_file = cert_config.required_path("certificate_file", cert_provider)?;
-        let key_file = cert_config.required_path("private_key_file", cert_provider)?;
-        let ca_file = root_config.required_path("ca_certificate_file", root_provider)?;
-
-        let certs = load_certs(cert_file, "data-plane client certificate")?;
-        let key = load_private_key(key_file)?;
-        let roots = load_roots(ca_file)?;
-        let verifier = Arc::new(SpiffeCompatibleVerifier {
-            inner: WebPkiVerifier::new(roots, None),
-        });
-        ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| format!("build data-plane mTLS client config: {e}"))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct GrpcBootstrap {
-    #[serde(default)]
-    certificate_providers: HashMap<String, CertificateProvider>,
-}
-
-impl GrpcBootstrap {
-    fn provider(&self, name: &str) -> Result<&FileWatcherConfig, String> {
-        self.certificate_providers
-            .get(name)
-            .map(|provider| &provider.config)
-            .ok_or_else(|| format!("certificate_providers[{name:?}] not found"))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CertificateProvider {
-    config: FileWatcherConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileWatcherConfig {
-    certificate_file: Option<PathBuf>,
-    private_key_file: Option<PathBuf>,
-    ca_certificate_file: Option<PathBuf>,
-}
-
-impl FileWatcherConfig {
-    fn required_path(&self, field: &str, provider: &str) -> Result<&Path, String> {
-        let path = match field {
-            "certificate_file" => &self.certificate_file,
-            "private_key_file" => &self.private_key_file,
-            "ca_certificate_file" => &self.ca_certificate_file,
-            _ => return Err(format!("unknown file watcher field {field}")),
-        };
-        path.as_deref().ok_or_else(|| {
-            format!("certificate_providers[{provider:?}].config.{field} is required")
-        })
-    }
-}
-
-fn mtls_cache_key(tls: &UpstreamTls) -> String {
-    format!(
-        "{}|{}|{}|{}",
-        tls.sni.as_deref().unwrap_or_default(),
-        tls.certificate_provider.as_deref().unwrap_or("default"),
-        tls.validation_provider.as_deref().unwrap_or("default"),
-        tls.alpn_protocols.join(",")
-    )
-}
-
-fn load_certs(path: &Path, label: &str) -> Result<Vec<Certificate>, String> {
-    let file = File::open(path).map_err(|e| format!("open {label} {}: {e}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .map_err(|e| format!("parse {label} {}: {e}", path.display()))?
-        .into_iter()
-        .map(Certificate)
-        .collect::<Vec<_>>();
-    if certs.is_empty() {
-        return Err(format!(
-            "parse {label} {}: no certificates found",
-            path.display()
-        ));
-    }
-    Ok(certs)
-}
-
-fn load_roots(path: &Path) -> Result<RootCertStore, String> {
-    let certs = load_certs(path, "data-plane CA certificate")?;
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots
-            .add(&cert)
-            .map_err(|e| format!("add data-plane CA certificate {}: {e}", path.display()))?;
-    }
-    Ok(roots)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKey, String> {
-    if let Some(key) = load_private_keys(path, KeyFormat::Pkcs8)?
-        .into_iter()
-        .next()
-    {
-        return Ok(PrivateKey(key));
-    }
-    if let Some(key) = load_private_keys(path, KeyFormat::Rsa)?.into_iter().next() {
-        return Ok(PrivateKey(key));
-    }
-    Err(format!(
-        "parse data-plane client private key {}: no PKCS8 or RSA keys found",
-        path.display()
-    ))
-}
-
-enum KeyFormat {
-    Pkcs8,
-    Rsa,
-}
-
-fn load_private_keys(path: &Path, format: KeyFormat) -> Result<Vec<Vec<u8>>, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("open data-plane client private key {}: {e}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    match format {
-        KeyFormat::Pkcs8 => rustls_pemfile::pkcs8_private_keys(&mut reader),
-        KeyFormat::Rsa => rustls_pemfile::rsa_private_keys(&mut reader),
-    }
-    .map_err(|e| {
-        format!(
-            "parse data-plane client private key {}: {e}",
-            path.display()
-        )
-    })
-}
-
-struct SpiffeCompatibleVerifier {
-    inner: WebPkiVerifier,
-}
-
-impl std::fmt::Debug for SpiffeCompatibleVerifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpiffeCompatibleVerifier").finish()
-    }
-}
-
-impl ServerCertVerifier for SpiffeCompatibleVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        server_name: &rustls::ServerName,
-        scts: &mut dyn Iterator<Item = &[u8]>,
-        ocsp_response: &[u8],
-        now: SystemTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        match self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            scts,
-            ocsp_response,
-            now,
-        ) {
-            Ok(verified) => Ok(verified),
-            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
-                Ok(ServerCertVerified::assertion())
-            }
-            Err(err) => Err(err),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::access_log::AccessLogFormat;
+    use super::upstream::{mtls_cache_key, GrpcBootstrap, MtlsClientPool};
     use super::*;
     use hyper::body;
     use rcgen::{
         BasicConstraints, Certificate as RcgenCertificate, CertificateParams, DistinguishedName,
         DnType, IsCa,
     };
+    use rustls::{Certificate, PrivateKey, RootCertStore};
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
