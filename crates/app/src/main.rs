@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn static_only_run_disables_xds_by_default() {
         let mut args = base_args();
-        args.static_config = Some(PathBuf::from("examples/agent-runtime.yaml"));
+        args.static_config = Some(PathBuf::from("examples/config.yaml"));
 
         assert!(!should_run_xds(&args));
 
@@ -448,7 +448,7 @@ mod tests {
         let mut args = base_args();
         assert!(should_run_xds(&args));
 
-        args.static_config = Some(PathBuf::from("examples/agent-runtime.yaml"));
+        args.static_config = Some(PathBuf::from("examples/config.yaml"));
         args.listener_names = vec!["public.example:80".to_string()];
         assert!(should_run_xds(&args));
     }

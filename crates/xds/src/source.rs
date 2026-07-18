@@ -138,9 +138,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_config_loads_agent_runtime_example() {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/agent-runtime.yaml");
+    async fn static_config_loads_config_example() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/config.yaml");
         let cfg = StaticConfigFile::new(path).load().await.unwrap().unwrap();
 
         cfg.validate().unwrap();
