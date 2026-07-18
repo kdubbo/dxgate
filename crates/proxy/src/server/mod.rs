@@ -11,9 +11,8 @@ use axum::http::{
 use axum::routing::any;
 use axum::Router;
 use dxgate_core::{
-    AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, BackendKind, Endpoint,
-    HeaderTransform, MatchInput, PolicyAction, Provider, ProviderKind, RateLimitKey, RetryPolicy,
-    UpstreamTls, UpstreamTlsMode, WeightedBackend, HTTP_LISTENER_PORT,
+    AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, HeaderTransform, MatchInput,
+    PolicyAction, Provider, RateLimitKey, RetryPolicy, WeightedBackend, HTTP_LISTENER_PORT,
 };
 use hyper::body::Bytes;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
@@ -30,10 +29,20 @@ use tracing::{debug, info, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod access_log;
+mod headers;
+mod routing;
 mod trace;
 mod upstream;
 
 use access_log::{access_log_line, AccessLogConfig, AccessLogEvent};
+use headers::{
+    apply_provider_headers, apply_request_headers, apply_response_headers, header_contains,
+    merge_header_transform, remove_connection_headers,
+};
+use routing::{
+    backend_matches_protocol, backend_provider, compose_upstream_uri, endpoint_authority,
+    header_pairs, host_header, protocol_name, upstream_request_mode, UpstreamRequestMode,
+};
 use trace::{extract_trace_context, inject_trace_context};
 use upstream::UpstreamClients;
 
@@ -1390,33 +1399,6 @@ fn is_grpc_request(headers: &HeaderMap) -> bool {
         || content_type.starts_with("application/triple+")
 }
 
-fn remove_connection_headers(headers: &mut HeaderMap) {
-    let named: Vec<String> = headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .collect();
-    for name in named {
-        if let Ok(name) = HeaderName::try_from(name.as_str()) {
-            headers.remove(name);
-        }
-    }
-    for name in [
-        http::header::CONNECTION,
-        http::header::PROXY_AUTHENTICATE,
-        http::header::PROXY_AUTHORIZATION,
-        http::header::TRANSFER_ENCODING,
-        http::header::UPGRADE,
-    ] {
-        headers.remove(name);
-    }
-    headers.remove(HeaderName::from_static("keep-alive"));
-    headers.remove(HeaderName::from_static("proxy-connection"));
-    headers.remove(HeaderName::from_static("http2-settings"));
-}
-
 const LLM_API_PATHS: [&str; 5] = [
     "/v1/chat/completions",
     "/v1/completions",
@@ -1641,14 +1623,6 @@ fn apply_stream_headers(headers: &mut HeaderMap, context: &AgentRequestContext) 
     );
 }
 
-fn header_contains(headers: &HeaderMap, name: HeaderName, needle: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains(needle))
-        .unwrap_or(false)
-}
-
 #[derive(Debug, Clone)]
 struct PolicyRuntime {
     request_headers: HeaderTransform,
@@ -1860,69 +1834,6 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
         .map(|(_, value)| value.as_str())
 }
 
-fn merge_header_transform(target: &mut HeaderTransform, next: &HeaderTransform) {
-    target.add.extend(next.add.clone());
-    target.remove.extend(next.remove.clone());
-}
-
-fn apply_request_headers(headers: &mut HeaderMap, transform: &HeaderTransform) {
-    apply_header_transform(headers, transform);
-}
-
-fn apply_response_headers(headers: &mut HeaderMap, transform: &HeaderTransform) {
-    apply_header_transform(headers, transform);
-}
-
-fn apply_header_transform(headers: &mut HeaderMap, transform: &HeaderTransform) {
-    for name in &transform.remove {
-        if let Ok(name) = HeaderName::try_from(name.as_str()) {
-            headers.remove(name);
-        }
-    }
-    for header in &transform.add {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::try_from(header.name.as_str()),
-            HttpHeaderValue::from_str(&header.value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
-}
-
-fn apply_provider_headers(headers: &mut HeaderMap, provider: Option<&Provider>) {
-    let Some(provider) = provider else {
-        return;
-    };
-    for header in &provider.request_headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::try_from(header.name.as_str()),
-            HttpHeaderValue::from_str(&header.value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
-    if let Some(env_name) = &provider.api_key_env {
-        if let Ok(key) = env::var(env_name) {
-            let credential = match provider.kind {
-                ProviderKind::Anthropic => HttpHeaderValue::from_str(&key)
-                    .map(|v| (HeaderName::from_static("x-api-key"), v)),
-                ProviderKind::Gemini => HttpHeaderValue::from_str(&key)
-                    .map(|v| (HeaderName::from_static("x-goog-api-key"), v)),
-                _ => HttpHeaderValue::from_str(&format!("Bearer {key}"))
-                    .map(|v| (http::header::AUTHORIZATION, v)),
-            };
-            if let Ok((name, value)) = credential {
-                headers.insert(name, value);
-            }
-        }
-    }
-    if provider.kind == ProviderKind::Anthropic {
-        headers
-            .entry(HeaderName::from_static("anthropic-version"))
-            .or_insert_with(|| HttpHeaderValue::from_static("2023-06-01"));
-    }
-}
-
 fn backend_supports_llm_request(
     cfg: &dxgate_core::RuntimeConfig,
     backend: &Backend,
@@ -1941,50 +1852,6 @@ fn backend_supports_llm_request(
     }
 }
 
-fn backend_provider<'a>(
-    cfg: &'a dxgate_core::RuntimeConfig,
-    backend: &'a Backend,
-) -> Option<&'a Provider> {
-    match &backend.kind {
-        BackendKind::Llm { provider, .. } => cfg.provider(provider),
-        _ => None,
-    }
-}
-
-fn backend_matches_protocol(backend: &Backend, protocol: AgentProtocol) -> bool {
-    matches!(
-        (&backend.kind, protocol),
-        (BackendKind::Http { .. }, AgentProtocol::Http)
-            | (BackendKind::Llm { .. }, AgentProtocol::Llm)
-            | (BackendKind::Mcp { .. }, AgentProtocol::Mcp)
-            | (BackendKind::A2a { .. }, AgentProtocol::A2a)
-    )
-}
-
-fn compose_upstream_uri(endpoint: &str, path_and_query: &str) -> Result<Uri, (StatusCode, String)> {
-    let endpoint = endpoint.trim_end_matches('/');
-    let suffix = if endpoint.ends_with("/v1") && path_and_query.starts_with("/v1/") {
-        path_and_query.trim_start_matches("/v1")
-    } else {
-        path_and_query
-    };
-    format!("{endpoint}{suffix}").parse::<Uri>().map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("invalid upstream uri for endpoint {endpoint}: {e}"),
-        )
-    })
-}
-
-fn protocol_name(protocol: AgentProtocol) -> &'static str {
-    match protocol {
-        AgentProtocol::Http => "http",
-        AgentProtocol::Llm => "llm",
-        AgentProtocol::Mcp => "mcp",
-        AgentProtocol::A2a => "a2a",
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyDefault {
     Allow,
@@ -1998,48 +1865,6 @@ impl PolicyDefault {
             _ => Self::Allow,
         }
     }
-}
-
-fn endpoint_authority(endpoint: &Endpoint) -> String {
-    if endpoint.address.contains(':') && !endpoint.address.starts_with('[') {
-        format!("[{}]:{}", endpoint.address, endpoint.port)
-    } else {
-        format!("{}:{}", endpoint.address, endpoint.port)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpstreamRequestMode {
-    PlainHttp,
-    SimpleTls,
-    DubboMutual,
-}
-
-fn upstream_request_mode(tls: Option<&UpstreamTls>) -> UpstreamRequestMode {
-    match tls.map(|tls| tls.mode) {
-        None => UpstreamRequestMode::PlainHttp,
-        Some(UpstreamTlsMode::Simple) => UpstreamRequestMode::SimpleTls,
-        Some(UpstreamTlsMode::DubboMutual) => UpstreamRequestMode::DubboMutual,
-    }
-}
-
-fn host_header(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|host| host.split(':').next().unwrap_or(host))
-}
-
-fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect()
 }
 
 fn emit_http_access_log(server: &ProxyServer, observation: &HttpObservation<'_>) {
@@ -2083,6 +1908,7 @@ mod tests {
     use super::access_log::AccessLogFormat;
     use super::upstream::{mtls_cache_key, GrpcBootstrap, MtlsClientPool};
     use super::*;
+    use dxgate_core::{UpstreamTls, UpstreamTlsMode};
     use hyper::body;
     use rcgen::{
         BasicConstraints, Certificate as RcgenCertificate, CertificateParams, DistinguishedName,

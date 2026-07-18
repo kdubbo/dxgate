@@ -17,7 +17,9 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Split the `proxy` crate's monolithic `server.rs` (2908 lines) into a directory
-  module: extracted `server/upstream.rs` (HTTP clients + data-plane mTLS/cert
-  loading), `server/trace.rs` (W3C trace-context propagation), and
-  `server/access_log.rs` (access-log config + line formatting). No behavioral
-  change; all tests pass.
+  module (`server/mod.rs`, now ~2259 lines) by extracting cohesive, low-coupling
+  concerns into submodules: `server/upstream.rs` (HTTP clients + data-plane
+  mTLS/cert loading), `server/trace.rs` (W3C trace-context propagation),
+  `server/access_log.rs` (access-log config + line formatting), `server/headers.rs`
+  (hop-by-hop/policy/provider header transforms), and `server/routing.rs` (pure
+  backend/upstream routing helpers). No behavioral change; all tests pass.
