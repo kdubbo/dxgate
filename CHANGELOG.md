@@ -24,5 +24,10 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (hop-by-hop/policy/provider header transforms), `server/routing.rs` (pure
   backend/upstream routing helpers), `server/detect.rs` (request
   classification: stream/gRPC detection and agent-protocol routing by path),
-  and `server/auth.rs` (API-key / HMAC-JWT authentication enforcement).
-  No behavioral change; all tests pass.
+  `server/auth.rs` (API-key / HMAC-JWT authentication enforcement), and
+  `server/context.rs` (the parsed per-request agent context and SSE
+  anti-buffering headers), `server/policy.rs` (policy-chain evaluation
+  into a `PolicyRuntime`: deny/body-size/auth/rate/token enforcement), and
+  `server/llm_flow.rs` (OpenAI-compatible LLM exchange building, dialect
+  translation, and token-usage metering). `server/mod.rs` is now ~1615
+  lines (from 2908). No behavioral change; all tests pass.
