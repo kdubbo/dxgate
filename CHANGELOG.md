@@ -22,6 +22,7 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mTLS/cert loading), `server/trace.rs` (W3C trace-context propagation),
   `server/access_log.rs` (access-log config + line formatting), `server/headers.rs`
   (hop-by-hop/policy/provider header transforms), `server/routing.rs` (pure
-  backend/upstream routing helpers), and `server/detect.rs` (request
-  classification: stream/gRPC detection and agent-protocol routing by path).
+  backend/upstream routing helpers), `server/detect.rs` (request
+  classification: stream/gRPC detection and agent-protocol routing by path),
+  and `server/auth.rs` (API-key / HMAC-JWT authentication enforcement).
   No behavioral change; all tests pass.

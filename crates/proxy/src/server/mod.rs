@@ -11,13 +11,11 @@ use axum::http::{
 use axum::routing::any;
 use axum::Router;
 use dxgate_core::{
-    AgentMatchInput, AgentProtocol, AgentRoute, AuthPolicy, Backend, HeaderTransform, MatchInput,
-    PolicyAction, Provider, RateLimitKey, RetryPolicy, WeightedBackend, HTTP_LISTENER_PORT,
+    AgentMatchInput, AgentProtocol, AgentRoute, Backend, HeaderTransform, MatchInput, PolicyAction,
+    Provider, RateLimitKey, RetryPolicy, WeightedBackend, HTTP_LISTENER_PORT,
 };
 use hyper::body::Bytes;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use opentelemetry::trace::TraceContextExt;
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::env;
@@ -29,6 +27,7 @@ use tracing::{debug, info, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod access_log;
+mod auth;
 mod detect;
 mod headers;
 mod routing;
@@ -36,6 +35,7 @@ mod trace;
 mod upstream;
 
 use access_log::{access_log_line, AccessLogConfig, AccessLogEvent};
+use auth::validate_auth;
 use detect::{declared_content_length, detect_agent_protocol, is_event_stream, is_grpc_request};
 use headers::{
     apply_provider_headers, apply_request_headers, apply_response_headers, header_contains,
@@ -1690,73 +1690,6 @@ fn evaluate_policies(
     }
 
     Ok(runtime)
-}
-
-fn validate_auth(auth: &AuthPolicy, headers: &[(String, String)]) -> Result<(), String> {
-    match auth {
-        AuthPolicy::ApiKey {
-            header,
-            values,
-            value_env,
-        } => {
-            let actual = header_value(headers, header)
-                .ok_or_else(|| format!("missing header {}", header))?;
-            let mut accepted = values.clone();
-            if let Some(env_name) = value_env {
-                if let Ok(value) = env::var(env_name) {
-                    accepted.push(value);
-                }
-            }
-            if accepted.iter().any(|value| value == actual) {
-                Ok(())
-            } else {
-                Err("invalid API key".to_string())
-            }
-        }
-        AuthPolicy::Jwt {
-            header,
-            hmac_secret_env,
-            issuer,
-            audiences,
-        } => {
-            let raw = header_value(headers, header)
-                .ok_or_else(|| format!("missing header {}", header))?;
-            let token = raw.strip_prefix("Bearer ").unwrap_or(raw);
-            let Some(secret_env) = hmac_secret_env else {
-                return Err("JWT policy requires hmac_secret_env".to_string());
-            };
-            let secret = env::var(secret_env)
-                .map_err(|_| format!("JWT secret env {} is not set", secret_env))?;
-            let mut validation = Validation::new(Algorithm::HS256);
-            if audiences.is_empty() {
-                validation.validate_aud = false;
-            } else {
-                validation.set_audience(audiences);
-            }
-            if let Some(issuer) = issuer {
-                validation.set_issuer(&[issuer]);
-            }
-            decode::<JwtClaims>(
-                token,
-                &DecodingKey::from_secret(secret.as_bytes()),
-                &validation,
-            )
-            .map(|_| ())
-            .map_err(|e| format!("invalid JWT: {e}"))
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct JwtClaims {
-    #[allow(dead_code)]
-    sub: Option<String>,
-    #[allow(dead_code)]
-    exp: Option<usize>,
-    #[allow(dead_code)]
-    iss: Option<String>,
-    #[allow(dead_code)]
-    aud: Option<Value>,
 }
 
 fn rate_limit_key(
