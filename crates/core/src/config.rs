@@ -603,11 +603,9 @@ impl Backend {
     pub fn supports_agent(&self, agent: Option<&str>) -> bool {
         match &self.kind {
             BackendKind::A2a {
-                agent: declared, ..
-            } => match declared {
-                Some(declared) => agent.map(|a| declared == a).unwrap_or(true),
-                None => true,
-            },
+                agent: Some(declared),
+                ..
+            } => agent.map(|a| declared == a).unwrap_or(true),
             _ => true,
         }
     }

@@ -9,7 +9,20 @@ all-features = true
 # Fail on security vulnerabilities; surface unmaintained/yanked crates.
 version = 2
 yanked = "deny"
-ignore = []
+# These all originate from the pinned rustls 0.21 TLS stack (proxy) and kube's
+# transitive deps. The real fix is a rustls 0.21 -> 0.23 upgrade, which changes
+# the mTLS verifier / ClientConfig API and is tracked as a separate task; these
+# are low-impact in dxgate's usage (see notes) and ignored until then.
+ignore = [
+    # rustls-pemfile is unmaintained (no vuln, no safe upgrade in the 0.21 line).
+    "RUSTSEC-2025-0134",
+    # rustls-webpki name-constraint bugs: reachable only after signature
+    # verification and require a misissued cert to exploit.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    # rustls-webpki CRL-parsing panic: dxgate does not use CRLs, so unreachable.
+    "RUSTSEC-2026-0104",
+]
 
 [licenses]
 version = 2
