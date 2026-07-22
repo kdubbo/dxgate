@@ -13,7 +13,14 @@ message Metadata {
   map<string, google.protobuf.Struct> filter_metadata = 1;
 }
 
-message Locality {}
+message Locality {
+  // The geographic region where the endpoint is located.
+  string region = 1;
+  // The availability zone within the region.
+  string zone = 2;
+  // The deployment-specific sub-zone, such as a rack.
+  string sub_zone = 3;
+}
 
 message Node {
   string id = 1;

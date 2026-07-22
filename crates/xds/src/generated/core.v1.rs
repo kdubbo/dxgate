@@ -66,7 +66,17 @@ pub struct Metadata {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Locality {}
+pub struct Locality {
+    /// The geographic region where the endpoint is located.
+    #[prost(string, tag = "1")]
+    pub region: ::prost::alloc::string::String,
+    /// The availability zone within the region.
+    #[prost(string, tag = "2")]
+    pub zone: ::prost::alloc::string::String,
+    /// The deployment-specific sub-zone, such as a rack.
+    #[prost(string, tag = "3")]
+    pub sub_zone: ::prost::alloc::string::String,
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Node {

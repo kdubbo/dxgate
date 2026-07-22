@@ -70,7 +70,13 @@ func (x *Metadata) GetFilterMetadata() map[string]*structpb.Struct {
 }
 
 type Locality struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The geographic region where the endpoint is located.
+	Region string `protobuf:"bytes,1,opt,name=region,proto3" json:"region,omitempty"`
+	// The availability zone within the region.
+	Zone string `protobuf:"bytes,2,opt,name=zone,proto3" json:"zone,omitempty"`
+	// The deployment-specific sub-zone, such as a rack.
+	SubZone       string `protobuf:"bytes,3,opt,name=sub_zone,json=subZone,proto3" json:"sub_zone,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -103,6 +109,27 @@ func (x *Locality) ProtoReflect() protoreflect.Message {
 // Deprecated: Use Locality.ProtoReflect.Descriptor instead.
 func (*Locality) Descriptor() ([]byte, []int) {
 	return file_core_v1_base_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *Locality) GetRegion() string {
+	if x != nil {
+		return x.Region
+	}
+	return ""
+}
+
+func (x *Locality) GetZone() string {
+	if x != nil {
+		return x.Zone
+	}
+	return ""
+}
+
+func (x *Locality) GetSubZone() string {
+	if x != nil {
+		return x.SubZone
+	}
+	return ""
 }
 
 type Node struct {
@@ -398,9 +425,11 @@ const file_core_v1_base_proto_rawDesc = "" +
 	"\x0ffilter_metadata\x18\x01 \x03(\v2%.core.v1.Metadata.FilterMetadataEntryR\x0efilterMetadata\x1aZ\n" +
 	"\x13FilterMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12-\n" +
-	"\x05value\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x05value:\x028\x01\"\n" +
-	"\n" +
-	"\bLocality\"\x94\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x05value:\x028\x01\"Q\n" +
+	"\bLocality\x12\x16\n" +
+	"\x06region\x18\x01 \x01(\tR\x06region\x12\x12\n" +
+	"\x04zone\x18\x02 \x01(\tR\x04zone\x12\x19\n" +
+	"\bsub_zone\x18\x03 \x01(\tR\asubZone\"\x94\x01\n" +
 	"\x04Node\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\acluster\x18\x02 \x01(\tR\acluster\x123\n" +
