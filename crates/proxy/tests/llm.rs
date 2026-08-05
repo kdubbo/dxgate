@@ -589,8 +589,8 @@ fn llm_config(provider: Provider, backends: Vec<Backend>, policies: Vec<Policy>)
 
 async fn spawn_proxy(cfg: RuntimeConfig) -> TestProxy {
     let addr = unused_addr();
-    let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-    state.apply_config(cfg).await.unwrap();
+    let state = ProxyState::new();
+    state.apply_config(cfg).unwrap();
     let proxy_state = state.clone();
     let task = tokio::spawn(async move {
         ProxyServer::new(proxy_state).serve(addr).await.unwrap();

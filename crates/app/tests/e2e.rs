@@ -4,9 +4,9 @@
 
 use dxgate_core::{
     AgentProtocol, AgentRoute, AgentRouteMatch, AuthPolicy, Backend, BackendKind, Cluster,
-    Endpoint, HeaderTransform, Listener, ListenerProtocol, PathMatch, Policy, PolicyAction,
-    Provider, ProviderKind, RateLimitKey, RateLimitPolicy, Route, RuntimeConfig, VirtualHost,
-    WeightedBackend, WeightedCluster,
+    ConfigStore, Endpoint, HeaderTransform, Listener, ListenerProtocol, PathMatch, Policy,
+    PolicyAction, Provider, ProviderKind, RateLimitKey, RateLimitPolicy, ResourceKey, ResourceKind,
+    Route, RuntimeConfig, SourceId, SourceState, VirtualHost, WeightedBackend, WeightedCluster,
 };
 use dxgate_proxy::{ProxyServer, ProxyState};
 use dxgate_ui::UiServer;
@@ -104,8 +104,8 @@ async fn wait_until_accepting(addr: SocketAddr) {
 }
 
 async fn spawn_proxy(config: RuntimeConfig) -> (SocketAddr, ProxyState) {
-    let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-    state.apply_config(config).await.expect("config accepted");
+    let state = ProxyState::new();
+    state.apply_config(config).expect("config accepted");
     let addr = reserve_port();
     tokio::spawn(ProxyServer::new(state.clone()).serve(addr));
     wait_until_accepting(addr).await;
@@ -458,4 +458,95 @@ async fn llm_sse_response_streams_through_proxy_before_upstream_completes() {
         rest.extend_from_slice(&chunk.unwrap());
     }
     assert!(String::from_utf8_lossy(&rest).contains("[DONE]"));
+}
+
+/// The multi-source contract: xDS owns the Gateway API slice, the Kubernetes
+/// controller owns the agent slice, and neither erases the other. Before the
+/// store existed, whichever source published last wiped out the other's
+/// resources, which is why xDS and agent routing could not run together.
+#[tokio::test]
+async fn independent_sources_serve_disjoint_slices_of_one_store() {
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_upstream(release).await;
+
+    let store = Arc::new(ConfigStore::new());
+    let state = ProxyState::with_store(store.clone());
+
+    // The xDS slice: a listener, its route, and the cluster behind it.
+    let mut xds = SourceState::new();
+    let gateway = base_config(upstream);
+    store.apply(SourceId::Xds, xds.reconcile(gateway.clone()));
+
+    // The Kubernetes slice: an HTTP agent route with its backend and policy.
+    let mut kubernetes = SourceState::new();
+    let agent = agent_config(upstream);
+    let agent_only = RuntimeConfig {
+        version: "crd-1".into(),
+        listeners: vec![],
+        clusters: vec![],
+        secrets: vec![],
+        providers: vec![],
+        backends: agent.backends.clone(),
+        routes: agent.routes.clone(),
+        policies: agent.policies.clone(),
+    };
+    let outcome = store.apply(
+        SourceId::Kubernetes,
+        kubernetes.reconcile(agent_only.clone()),
+    );
+    assert!(outcome.rejected.is_empty(), "{:?}", outcome.rejected);
+    assert!(outcome.ready, "{:?}", outcome.conflicts);
+
+    let addr = reserve_port();
+    tokio::spawn(ProxyServer::new(state.clone()).serve(addr));
+    wait_until_accepting(addr).await;
+    let client = Client::new();
+
+    // Both slices serve at once.
+    assert_eq!(get_hello(&client, addr).await, StatusCode::OK);
+    assert_eq!(post_api(&client, addr).await, StatusCode::OK);
+
+    // An xDS update republishes only its own slice; the agent route survives.
+    store.apply(SourceId::Xds, xds.reconcile(gateway));
+    assert_eq!(post_api(&client, addr).await, StatusCode::OK);
+    assert_eq!(get_hello(&client, addr).await, StatusCode::OK);
+
+    // Retiring the agent route on the Kubernetes side leaves the gateway route
+    // intact, and the request now falls through to cluster routing.
+    let mut without_route = agent_only;
+    without_route.routes.clear();
+    store.apply(SourceId::Kubernetes, kubernetes.reconcile(without_route));
+    assert!(store.snapshot().agent_routes().is_empty());
+    assert!(store.snapshot().cluster("upstream").is_some());
+    assert_eq!(get_hello(&client, addr).await, StatusCode::OK);
+
+    // Provenance is visible for operators debugging "where did this come from".
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot.owner(&ResourceKey::new(ResourceKind::Cluster, "upstream")),
+        Some(SourceId::Xds)
+    );
+    assert_eq!(
+        snapshot.owner(&ResourceKey::new(ResourceKind::Backend, "api")),
+        Some(SourceId::Kubernetes)
+    );
+}
+
+async fn get_hello(client: &Client<hyper::client::HttpConnector>, addr: SocketAddr) -> StatusCode {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/hello"))
+        .body(Body::empty())
+        .unwrap();
+    client.request(request).await.unwrap().status()
+}
+
+async fn post_api(client: &Client<hyper::client::HttpConnector>, addr: SocketAddr) -> StatusCode {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{addr}/api/echo"))
+        .header("authorization", "Bearer e2e")
+        .body(Body::from("{}"))
+        .unwrap();
+    client.request(request).await.unwrap().status()
 }

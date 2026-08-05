@@ -1,11 +1,9 @@
 use clap::{Parser, ValueEnum};
 use dxgate_controller::{crds, run_controller};
-use dxgate_core::{RouterIdentity, RuntimeConfig, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
+use dxgate_core::{ConfigStore, RouterIdentity, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
 use dxgate_proxy::{ProxyServer, ProxyState};
 use dxgate_ui::UiServer;
-use dxgate_xds::{
-    BootstrapConfig, RuntimeConfigSource, StaticConfigFile, XdsClient, XdsClientConfig,
-};
+use dxgate_xds::{BootstrapConfig, StaticConfigSource, XdsClient, XdsClientConfig};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -13,6 +11,7 @@ use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::Resource;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time;
@@ -133,39 +132,19 @@ async fn main() -> std::io::Result<()> {
 
     info!(node_id = %identity.node_id(), "starting dxgate router proxy");
 
-    let initial = RuntimeConfig::empty("bootstrap");
-    let state = ProxyState::new(initial.clone());
-    let (config_tx, mut config_rx) = watch::channel(initial);
-
-    let apply_state = state.clone();
-    tokio::spawn(async move {
-        while config_rx.changed().await.is_ok() {
-            let cfg = config_rx.borrow().clone();
-            if let Err(conflicts) = apply_state.apply_config(cfg).await {
-                error!(?conflicts, "runtime config rejected");
-            }
-        }
-    });
+    // Every configuration source writes into this one store, each owning a
+    // disjoint slice of it. There is no fan-in channel and no last-writer-wins:
+    // a source's update only ever touches the resources that source published.
+    let store = Arc::new(ConfigStore::new());
+    let state = ProxyState::with_store(store.clone());
 
     if let Some(path) = args.static_config.clone() {
-        let source = StaticConfigFile::new(path);
-        match source.load().await {
-            Ok(Some(cfg)) => {
-                if let Err(conflicts) = state.apply_config(cfg.clone()).await {
-                    error!(?conflicts, "static config rejected");
-                } else if config_tx.send(cfg).is_err() {
-                    error!("runtime config watcher is closed");
-                }
-            }
-            Ok(None) => {}
-            Err(err) => error!(%err, "failed loading static config"),
+        let mut source = StaticConfigSource::new(path, store.clone());
+        if let Err(err) = source.reload().await {
+            error!(%err, "failed loading static config");
         }
         if args.config_watch {
-            let path = args.static_config.clone().unwrap();
-            let config_tx = config_tx.clone();
-            tokio::spawn(async move {
-                watch_static_config(path, config_tx).await;
-            });
+            tokio::spawn(source.watch());
         }
     }
 
@@ -176,9 +155,9 @@ async fn main() -> std::io::Result<()> {
             listener_names: args.listener_names,
             reconnect_delay: Duration::from_secs(10),
         });
-        let xds_tx = config_tx.clone();
+        let xds_store = store.clone();
         tokio::spawn(async move {
-            if let Err(err) = xds.run(xds_tx).await {
+            if let Err(err) = xds.run(xds_store).await {
                 error!(%err, "xDS client exited");
             }
         });
@@ -187,9 +166,9 @@ async fn main() -> std::io::Result<()> {
     }
 
     if matches!(args.mode, DxgateMode::Controller | DxgateMode::All) {
-        let controller_tx = config_tx.clone();
+        let controller_store = store.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_controller(controller_tx).await {
+            if let Err(err) = run_controller(controller_store).await {
                 error!(%err, "Kubernetes controller exited");
             }
         });
@@ -351,37 +330,6 @@ fn parse_otel_tags(raw: Option<&str>) -> std::io::Result<Vec<KeyValue>> {
         .into_iter()
         .map(|(name, value)| KeyValue::new(name, value))
         .collect())
-}
-
-async fn watch_static_config(path: PathBuf, config_tx: watch::Sender<RuntimeConfig>) {
-    let mut last = None;
-    loop {
-        match tokio::fs::metadata(&path)
-            .await
-            .and_then(|meta| meta.modified())
-        {
-            Ok(modified) if last.map(|seen| seen != modified).unwrap_or(true) => {
-                last = Some(modified);
-                let source = StaticConfigFile::new(path.clone());
-                match source.load().await {
-                    Ok(Some(cfg)) => {
-                        if let Err(err) = config_tx.send(cfg) {
-                            error!(%err, "static config watcher channel closed");
-                            return;
-                        }
-                        info!(path = %path.display(), "reloaded static config");
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        error!(%err, path = %path.display(), "failed reloading static config")
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(err) => error!(%err, path = %path.display(), "failed checking static config"),
-        }
-        time::sleep(Duration::from_secs(2)).await;
-    }
 }
 
 fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {

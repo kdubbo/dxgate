@@ -282,8 +282,8 @@ async fn spawn_app(addr: SocketAddr, app: Router) -> TestServer {
 
 async fn spawn_proxy(cfg: RuntimeConfig) -> (TestServer, ProxyState) {
     let addr = unused_addr();
-    let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-    state.apply_config(cfg).await.unwrap();
+    let state = ProxyState::new();
+    state.apply_config(cfg).unwrap();
     let server_state = state.clone();
     let task = tokio::spawn(async move {
         ProxyServer::new(server_state).serve(addr).await.unwrap();

@@ -4,15 +4,18 @@
 
 use axum::http::{HeaderMap, StatusCode, Uri};
 use dxgate_core::{
-    AgentProtocol, Backend, BackendKind, Endpoint, Provider, UpstreamTls, UpstreamTlsMode,
+    AgentProtocol, Backend, BackendKind, ConfigSnapshot, Endpoint, Provider, UpstreamTls,
+    UpstreamTlsMode,
 };
 
 pub(super) fn backend_provider<'a>(
-    cfg: &'a dxgate_core::RuntimeConfig,
+    snapshot: &'a ConfigSnapshot,
     backend: &'a Backend,
 ) -> Option<&'a Provider> {
     match &backend.kind {
-        BackendKind::Llm { provider, .. } => cfg.provider(provider),
+        BackendKind::Llm { provider, .. } => {
+            snapshot.provider(provider).map(|provider| &**provider)
+        }
         _ => None,
     }
 }

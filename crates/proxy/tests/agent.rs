@@ -308,8 +308,8 @@ async fn agent_route_applies_local_rate_limit() {
 
 async fn spawn_proxy(cfg: RuntimeConfig) -> TestServer {
     let addr = unused_addr();
-    let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-    state.apply_config(cfg).await.unwrap();
+    let state = ProxyState::new();
+    state.apply_config(cfg).unwrap();
     let task = tokio::spawn(async move {
         ProxyServer::new(state).serve(addr).await.unwrap();
     });

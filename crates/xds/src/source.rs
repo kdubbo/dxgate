@@ -1,9 +1,13 @@
 use async_trait::async_trait;
-use dxgate_core::{DxgateError, Result, RuntimeConfig};
+use dxgate_core::{ConfigStore, DxgateError, Result, RuntimeConfig, SourceId, SourceState};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
+use tokio::time;
+use tracing::{error, info, warn};
 
 #[async_trait]
 pub trait RuntimeConfigSource: Send + Sync {
@@ -19,6 +23,10 @@ impl StaticConfigFile {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 #[async_trait]
@@ -33,6 +41,83 @@ impl RuntimeConfigSource for StaticConfigFile {
                 .map_err(|e| dxgate_core::DxgateError::InvalidConfig(e.to_string()))?
         };
         Ok(Some(cfg))
+    }
+}
+
+/// How often the file watcher restats the configuration file.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The static-file configuration source.
+///
+/// A file is a state-of-the-world source: it says what exists, never what was
+/// removed. [`SourceState`] closes that gap by diffing each load against the
+/// previous one, so a resource deleted from the file is retired from the store
+/// instead of lingering forever. Only the [`SourceId::Static`] slice is touched;
+/// resources owned by xDS or the Kubernetes controller are left alone.
+pub struct StaticConfigSource {
+    file: StaticConfigFile,
+    store: Arc<ConfigStore>,
+    published: SourceState,
+    last_modified: Option<SystemTime>,
+}
+
+impl StaticConfigSource {
+    pub fn new(path: impl Into<PathBuf>, store: Arc<ConfigStore>) -> Self {
+        Self {
+            file: StaticConfigFile::new(path),
+            store,
+            published: SourceState::new(),
+            last_modified: None,
+        }
+    }
+
+    /// Loads the file and applies it. Returns whether the store changed.
+    pub async fn reload(&mut self) -> Result<bool> {
+        let Some(config) = self.file.load().await? else {
+            return Ok(false);
+        };
+        let version = config.version.clone();
+        let delta = self.published.reconcile(config);
+        let removes = delta.removes.len();
+        let outcome = self.store.apply(SourceId::Static, delta);
+        for rejected in &outcome.rejected {
+            warn!(kind = %rejected.kind, message = %rejected.message, "static config resource rejected");
+        }
+        if outcome.changed {
+            info!(
+                path = %self.file.path().display(),
+                revision = outcome.revision,
+                version = %version,
+                removes,
+                ready = outcome.ready,
+                "applied static config"
+            );
+        }
+        Ok(outcome.changed)
+    }
+
+    /// Polls the file's modification time and reloads it when it moves. Runs
+    /// until the task is dropped.
+    pub async fn watch(mut self) {
+        loop {
+            match fs::metadata(self.file.path())
+                .await
+                .and_then(|meta| meta.modified())
+            {
+                Ok(modified) => {
+                    if self.last_modified != Some(modified) {
+                        self.last_modified = Some(modified);
+                        if let Err(err) = self.reload().await {
+                            error!(%err, path = %self.file.path().display(), "failed reloading static config");
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!(%err, path = %self.file.path().display(), "failed checking static config")
+                }
+            }
+            time::sleep(CONFIG_POLL_INTERVAL).await;
+        }
     }
 }
 

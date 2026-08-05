@@ -1,13 +1,13 @@
 use dxgate_core::{
-    Cluster, ConfigConflict, DxgateError, Endpoint, OutlierDetectionConfig, RateLimitPolicy,
-    Result, RuntimeConfig, TokenLimitPolicy, WeightedBackend, WeightedCluster,
+    ApplyOutcome, Cluster, ConfigConflict, ConfigDelta, ConfigSnapshot, ConfigStore, DxgateError,
+    Endpoint, OutlierDetectionConfig, RateLimitPolicy, Result, RuntimeConfig, SourceId,
+    SourceState, TokenLimitPolicy, WeightedBackend, WeightedCluster,
 };
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 const LATENCY_BUCKETS_MS: [u64; 7] = [5, 10, 25, 50, 100, 250, 1000];
 
@@ -17,9 +17,15 @@ pub struct ProxyState {
 }
 
 struct Inner {
-    config: RwLock<RuntimeConfig>,
-    conflicts: RwLock<Vec<ConfigConflict>>,
-    ready: AtomicBool,
+    /// Shared with every configuration source. Sources write deltas into it
+    /// directly; the proxy only ever reads published snapshots.
+    store: Arc<ConfigStore>,
+    /// Store revision whose stale hot-state keys have already been pruned.
+    /// Pruning is driven from the read path rather than the write path because
+    /// sources write to the store without going through `ProxyState`.
+    pruned_revision: AtomicU64,
+    /// Backs the state-of-the-world [`ProxyState::apply_config`] helper.
+    static_source: Mutex<SourceState>,
     // Round-robin cursors, one per selection domain: routes rotate over their
     // weighted clusters/backends, clusters rotate over their endpoints. A single
     // shared counter made each domain's sequence depend on unrelated traffic, so
@@ -39,7 +45,12 @@ struct Inner {
 #[derive(Debug, Clone, Serialize)]
 pub struct Readiness {
     pub ready: bool,
+    /// Monotonic store revision, bumped once per applied delta.
+    pub revision: u64,
+    /// `source=version` labels joined by commas.
     pub version: String,
+    /// Version label reported by each source that has published.
+    pub source_versions: BTreeMap<SourceId, String>,
     pub conflicts: Vec<ConfigConflict>,
 }
 
@@ -319,13 +330,26 @@ impl Drop for CircuitBreakerPermit {
     }
 }
 
+impl Default for ProxyState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyState {
-    pub fn new(initial: RuntimeConfig) -> Self {
+    /// A proxy over a fresh, empty store. Configuration arrives when a source
+    /// applies its first delta.
+    pub fn new() -> Self {
+        Self::with_store(Arc::new(ConfigStore::new()))
+    }
+
+    /// A proxy over a store shared with the configuration sources.
+    pub fn with_store(store: Arc<ConfigStore>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                config: RwLock::new(initial),
-                conflicts: RwLock::new(Vec::new()),
-                ready: AtomicBool::new(false),
+                store,
+                pruned_revision: AtomicU64::new(0),
+                static_source: Mutex::new(SourceState::new()),
                 route_pickers: Mutex::new(HashMap::new()),
                 endpoint_pickers: Mutex::new(HashMap::new()),
                 rate_limits: Mutex::new(HashMap::new()),
@@ -339,82 +363,111 @@ impl ProxyState {
         }
     }
 
-    pub async fn apply_config(
-        &self,
-        cfg: RuntimeConfig,
-    ) -> std::result::Result<(), Vec<ConfigConflict>> {
-        match cfg.validate() {
-            Ok(()) => {
-                let cluster_names: std::collections::HashSet<String> = cfg
-                    .clusters
-                    .iter()
-                    .map(|cluster| cluster.name.clone())
-                    .collect();
-                self.inner
-                    .circuit_breakers
-                    .lock()
-                    .unwrap()
-                    .retain(|name, bucket| cluster_names.contains(name) || bucket.active > 0);
-                // Cursors for routes/clusters the new config dropped would otherwise
-                // linger for the process lifetime.
-                self.inner
-                    .endpoint_pickers
-                    .lock()
-                    .unwrap()
-                    .retain(|name, _| cluster_names.contains(name));
-                // Outlier keys are "{cluster}|{addr}:{port}"; drop those whose cluster
-                // is gone, and those whose endpoint no longer appears in it.
-                let endpoint_keys: std::collections::HashSet<String> = cfg
-                    .clusters
-                    .iter()
-                    .flat_map(|cluster| {
-                        cluster
-                            .endpoints
-                            .iter()
-                            .map(|endpoint| outlier_key(&cluster.name, endpoint))
-                    })
-                    .collect();
-                self.inner
-                    .outliers
-                    .lock()
-                    .unwrap()
-                    .retain(|key, _| endpoint_keys.contains(key));
-                let route_names: std::collections::HashSet<&str> = cfg
-                    .listeners
-                    .iter()
-                    .flat_map(|listener| &listener.virtual_hosts)
-                    .flat_map(|host| &host.routes)
-                    .map(|route| route.name.as_str())
-                    .chain(cfg.routes.iter().map(|route| route.name.as_str()))
-                    .collect();
-                self.inner
-                    .route_pickers
-                    .lock()
-                    .unwrap()
-                    .retain(|name, _| route_names.contains(name.as_str()));
-                *self.inner.config.write().await = cfg;
-                self.inner.conflicts.write().await.clear();
-                self.inner.ready.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(conflicts) => {
-                *self.inner.conflicts.write().await = conflicts.clone();
-                self.inner.ready.store(false, Ordering::SeqCst);
-                Err(conflicts)
-            }
+    /// The store every configuration source writes into.
+    pub fn store(&self) -> &Arc<ConfigStore> {
+        &self.inner.store
+    }
+
+    /// The current published configuration. One atomic refcount bump: nothing
+    /// in the configuration is copied, so the request path can hold it for the
+    /// whole request.
+    pub fn snapshot(&self) -> Arc<ConfigSnapshot> {
+        let snapshot = self.inner.store.snapshot();
+        self.prune_stale_state(&snapshot);
+        snapshot
+    }
+
+    /// Applies a delta on behalf of `source`.
+    pub fn apply_delta(&self, source: SourceId, delta: ConfigDelta) -> ApplyOutcome {
+        let outcome = self.inner.store.apply(source, delta);
+        self.prune_stale_state(&self.inner.store.snapshot());
+        outcome
+    }
+
+    /// Publishes a whole configuration document as the [`SourceId::Static`]
+    /// source, diffing it against what that source published last so removals
+    /// are explicit. Returns the merged store's conflicts, if any.
+    pub fn apply_config(&self, cfg: RuntimeConfig) -> std::result::Result<(), Vec<ConfigConflict>> {
+        let delta = {
+            let mut source = self.inner.static_source.lock().unwrap();
+            source.reconcile(cfg)
+        };
+        let outcome = self.apply_delta(SourceId::Static, delta);
+        let problems = outcome.problems();
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems)
         }
     }
 
-    pub async fn config(&self) -> RuntimeConfig {
-        self.inner.config.read().await.clone()
-    }
-
-    pub async fn readiness(&self) -> Readiness {
+    pub fn readiness(&self) -> Readiness {
+        let snapshot = self.inner.store.snapshot();
         Readiness {
-            ready: self.inner.ready.load(Ordering::SeqCst),
-            version: self.inner.config.read().await.version.clone(),
-            conflicts: self.inner.conflicts.read().await.clone(),
+            ready: snapshot.ready(),
+            revision: snapshot.revision(),
+            version: snapshot.version().to_string(),
+            source_versions: snapshot.source_versions().clone(),
+            conflicts: snapshot.conflicts().to_vec(),
         }
+    }
+
+    /// Drops hot-state keyed on resources the current configuration no longer
+    /// contains: round-robin cursors, circuit-breaker counters, and outlier
+    /// buckets would otherwise linger for the process lifetime.
+    ///
+    /// Runs at most once per store revision. Sources write to the store without
+    /// going through `ProxyState`, so this is driven from the read path; the
+    /// revision check makes the steady-state cost one relaxed atomic load.
+    fn prune_stale_state(&self, snapshot: &ConfigSnapshot) {
+        let revision = snapshot.revision();
+        let pruned = self.inner.pruned_revision.load(Ordering::Acquire);
+        if pruned == revision
+            || self
+                .inner
+                .pruned_revision
+                .compare_exchange(pruned, revision, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+
+        let cluster_names: std::collections::HashSet<&str> = snapshot
+            .clusters()
+            .map(|cluster| cluster.name.as_str())
+            .collect();
+        self.inner
+            .circuit_breakers
+            .lock()
+            .unwrap()
+            .retain(|name, bucket| cluster_names.contains(name.as_str()) || bucket.active > 0);
+        self.inner
+            .endpoint_pickers
+            .lock()
+            .unwrap()
+            .retain(|name, _| cluster_names.contains(name.as_str()));
+        // Outlier keys are "{cluster}|{addr}:{port}"; drop those whose cluster
+        // is gone, and those whose endpoint no longer appears in it.
+        let endpoint_keys: std::collections::HashSet<String> = snapshot
+            .clusters()
+            .flat_map(|cluster| {
+                cluster
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| outlier_key(&cluster.name, endpoint))
+            })
+            .collect();
+        self.inner
+            .outliers
+            .lock()
+            .unwrap()
+            .retain(|key, _| endpoint_keys.contains(key));
+        let route_names: std::collections::HashSet<&str> = snapshot.route_names().collect();
+        self.inner
+            .route_pickers
+            .lock()
+            .unwrap()
+            .retain(|name, _| route_names.contains(name.as_str()));
     }
 
     pub async fn pick_cluster<'a>(
@@ -969,7 +1022,7 @@ mod tests {
 
     #[test]
     fn mcp_session_bindings_are_capped() {
-        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
+        let state = ProxyState::new();
         for i in 0..=BINDING_CAP {
             state.bind_mcp_session(format!("session-{i}"), "backend");
         }
@@ -983,7 +1036,7 @@ mod tests {
 
     #[test]
     fn a2a_task_bindings_round_trip() {
-        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
+        let state = ProxyState::new();
         state.bind_a2a_task("task-1", "planner");
         assert_eq!(
             state.a2a_task_backend("task-1"),
@@ -994,7 +1047,7 @@ mod tests {
 
     #[test]
     fn mcp_tool_calls_aggregate_per_tool() {
-        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
+        let state = ProxyState::new();
         state.record_mcp_tool_call("mcp", "mcp-a", "search", true);
         state.record_mcp_tool_call("mcp", "mcp-a", "search", false);
         state.record_mcp_tool_call("mcp", "mcp-b", "calendar", true);
@@ -1012,19 +1065,19 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_updates_readiness_and_conflicts() {
-        let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-        state.apply_config(valid_config("ok")).await.unwrap();
+        let state = ProxyState::new();
+        state.apply_config(valid_config("ok")).unwrap();
 
-        let readiness = state.readiness().await;
+        let readiness = state.readiness();
         assert!(readiness.ready);
-        assert_eq!(readiness.version, "ok");
+        assert_eq!(readiness.version, "static=ok");
         assert!(readiness.conflicts.is_empty());
 
         let mut invalid = valid_config("bad");
         invalid.clusters.clear();
-        let conflicts = state.apply_config(invalid).await.unwrap_err();
+        let conflicts = state.apply_config(invalid).unwrap_err();
 
-        let readiness = state.readiness().await;
+        let readiness = state.readiness();
         assert!(!readiness.ready);
         assert_eq!(readiness.conflicts, conflicts);
         assert_eq!(readiness.conflicts[0].kind, "missing-cluster");
@@ -1032,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn weighted_cluster_picker_is_deterministic() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
         let clusters = vec![
             WeightedCluster {
                 name: "a".into(),
@@ -1061,7 +1114,7 @@ mod tests {
 
     #[test]
     fn circuit_breaker_enforces_concurrent_limit() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
         let cluster = Cluster {
             name: "backend".into(),
             endpoints: vec![],
@@ -1091,7 +1144,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_picker_skips_unhealthy_endpoints() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
         let endpoints = vec![
             Endpoint {
                 address: "10.0.0.1".into(),
@@ -1126,7 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_robin_cursors_are_per_cluster() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
         let a = test_cluster("a", vec![endpoint("10.0.0.1"), endpoint("10.0.0.2")], None);
         let b = test_cluster("b", vec![endpoint("10.1.0.1"), endpoint("10.1.0.2")], None);
 
@@ -1144,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn outlier_detection_ejects_after_consecutive_failures() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
         let cluster = test_cluster(
             "backend",
             vec![endpoint("10.0.0.1"), endpoint("10.0.0.2")],
@@ -1183,7 +1236,7 @@ mod tests {
 
     #[test]
     fn outlier_detection_success_clears_the_failure_run() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
         let cluster = test_cluster(
             "backend",
             vec![endpoint("10.0.0.1"), endpoint("10.0.0.2")],
@@ -1264,7 +1317,7 @@ mod tests {
 
     #[test]
     fn records_http_route_metrics() {
-        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let state = ProxyState::new();
 
         state.record_http_request("app", "public", "default", "reviews", "GET", 200, 12);
         state.record_http_request("app", "public", "default", "reviews", "GET", 502, 260);

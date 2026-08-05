@@ -23,7 +23,7 @@ It also ships an additional proxy gateway runtime for OpenAI-compatible LLM rout
 - **Reusable policies** — API-key / JWT auth, rate limiting, retries, timeouts, request/response header transforms, body-size limits, allow/deny.
 - **Resilience** — per-cluster circuit breakers, consecutive-5xx outlier ejection, and retry with failover across weighted backends; SIGTERM drains in-flight requests before exit.
 - **Observability** — Prometheus metrics, W3C trace propagation with OTLP export, structured access logs, and a built-in web UI.
-- **Three config sources** — xDS from `dubbod` (default), static YAML file (optionally watched), and Kubernetes CRDs (`Dxgate`, `DxgateBackend`, `DxgateRoute`, `DxgatePolicy`).
+- **Composable config sources** — xDS from `dubbod` (default, delta ADS with a state-of-the-world fallback), static YAML file (optionally watched), and Kubernetes CRDs (`Dxgate`, `DxgateBackend`, `DxgateRoute`, `DxgatePolicy`) driven by informers. Every resource records the source that owns it, so the sources compose instead of overwriting one another: xDS can own listeners and clusters while the CRD controller owns backends, routes, and policies. `/debug/sources` reports the ownership map.
 
 ## License
 

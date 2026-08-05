@@ -62,6 +62,7 @@ impl UiServer {
             .route("/debug/clusters", get(debug_clusters))
             .route("/debug/backends", get(debug_backends))
             .route("/debug/policies", get(debug_policies))
+            .route("/debug/sources", get(debug_sources))
             .with_state(self);
 
         axum::Server::bind(&addr)
@@ -89,7 +90,7 @@ async fn healthz(State(ui): State<UiServer>) -> Json<BuildInfo> {
 }
 
 async fn readyz(State(ui): State<UiServer>) -> Response {
-    let readiness = ui.state.readiness().await;
+    let readiness = ui.state.readiness();
     let status = if readiness.ready {
         StatusCode::OK
     } else {
@@ -99,7 +100,7 @@ async fn readyz(State(ui): State<UiServer>) -> Response {
 }
 
 async fn metrics(State(ui): State<UiServer>) -> Response {
-    let readiness = ui.state.readiness().await;
+    let readiness = ui.state.readiness();
     let proxy = ui.state.metrics();
     (
         [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
@@ -322,25 +323,20 @@ fn prometheus_label_value(value: &str) -> String {
 }
 
 async fn debug_config(State(ui): State<UiServer>) -> Json<dxgate_core::RuntimeConfig> {
-    Json(ui.state.config().await)
+    Json(ui.state.snapshot().to_runtime_config())
 }
 
 async fn debug_routes(State(ui): State<UiServer>) -> Json<serde_json::Value> {
-    let cfg = ui.state.config().await;
-    let routes: Vec<_> = cfg
-        .listeners
-        .iter()
-        .flat_map(|listener| {
-            listener.virtual_hosts.iter().flat_map(move |host| {
-                host.routes.iter().map(move |route| {
-                    serde_json::json!({
-                        "listener": listener.name,
-                        "virtualHost": host.name,
-                        "route": route.name,
-                        "domains": host.domains,
-                        "weightedClusters": route.weighted_clusters,
-                    })
-                })
+    let snapshot = ui.state.snapshot();
+    let routes: Vec<_> = snapshot
+        .route_table()
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "listener": entry.listener,
+                "virtualHost": entry.virtual_host,
+                "route": entry.route.name,
+                "weightedClusters": entry.route.weighted_clusters,
             })
         })
         .collect();
@@ -348,12 +344,13 @@ async fn debug_routes(State(ui): State<UiServer>) -> Json<serde_json::Value> {
 }
 
 async fn debug_clusters(State(ui): State<UiServer>) -> Json<serde_json::Value> {
-    let cfg = ui.state.config().await;
-    Json(serde_json::json!(cfg.clusters))
+    Json(serde_json::json!(
+        ui.state.snapshot().to_runtime_config().clusters
+    ))
 }
 
 async fn debug_backends(State(ui): State<UiServer>) -> Json<serde_json::Value> {
-    let cfg = ui.state.config().await;
+    let cfg = ui.state.snapshot().to_runtime_config();
     Json(serde_json::json!({
         "providers": cfg.providers,
         "backends": cfg.backends,
@@ -362,8 +359,44 @@ async fn debug_backends(State(ui): State<UiServer>) -> Json<serde_json::Value> {
 }
 
 async fn debug_policies(State(ui): State<UiServer>) -> Json<serde_json::Value> {
-    let cfg = ui.state.config().await;
-    Json(serde_json::json!(cfg.policies))
+    let snapshot = ui.state.snapshot();
+    let policies: Vec<_> = snapshot
+        .to_runtime_config()
+        .policies
+        .into_iter()
+        .map(|policy| {
+            let attached: Vec<String> = snapshot
+                .policy_refs(&policy.name)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            serde_json::json!({ "policy": policy, "attachedTo": attached })
+        })
+        .collect();
+    Json(serde_json::json!(policies))
+}
+
+/// Which source owns which resource, and the version each source last reported.
+/// Configuration is merged from several sources, so "where did this come from"
+/// is the first question when a resource is missing or unexpected.
+async fn debug_sources(State(ui): State<UiServer>) -> Json<serde_json::Value> {
+    let snapshot = ui.state.snapshot();
+    let owners: Vec<_> = snapshot
+        .owners()
+        .iter()
+        .map(|(key, source)| {
+            serde_json::json!({
+                "kind": key.kind.as_str(),
+                "name": key.name,
+                "source": source.as_str(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "revision": snapshot.revision(),
+        "sourceVersions": snapshot.source_versions(),
+        "resources": owners,
+    }))
 }
 
 fn ui_html(proxy_port: u16) -> String {
@@ -421,7 +454,9 @@ mod tests {
         let text = prometheus_metrics(
             Readiness {
                 ready: true,
-                version: "test".into(),
+                revision: 1,
+                version: "static=test".into(),
+                source_versions: Default::default(),
                 conflicts: vec![],
             },
             ProxyMetrics {

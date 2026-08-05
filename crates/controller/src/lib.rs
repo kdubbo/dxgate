@@ -1,19 +1,21 @@
-use dxgate_core::{Backend, ConfigConflict, Policy, RuntimeConfig};
-use futures_util::TryStreamExt;
+//! The Kubernetes CRD source: custom resource definitions, the projection from
+//! those resources onto dxgate's configuration model, and the informer that
+//! keeps the store in sync with them.
+
+mod informer;
+
+pub use informer::run_controller;
+
+use dxgate_core::{Backend, Policy, RuntimeConfig};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use kube::api::{ListParams, Patch, PatchParams, WatchParams};
-use kube::core::NamespaceResourceScope;
-use kube::{Api, Client, CustomResource, CustomResourceExt, Resource, ResourceExt};
+use kube::api::ListParams;
+use kube::{Api, Client, CustomResource, CustomResourceExt};
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{ArrayValidation, InstanceType, Schema, SchemaObject, SingleOrVec};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::fmt::Debug;
+use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
-use tokio::time::{self, Duration};
-use tracing::{info, warn};
 
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
@@ -118,20 +120,6 @@ pub enum ControllerError {
         field: &'static str,
         source: serde_json::Error,
     },
-
-    #[error("runtime config rejected: {0:?}")]
-    InvalidConfig(Vec<ConfigConflict>),
-
-    #[error("runtime config watcher is closed")]
-    RuntimeConfigClosed,
-}
-
-#[derive(Debug, Clone)]
-struct ControllerResources {
-    dxgates: Vec<Dxgate>,
-    backends: Vec<DxgateBackend>,
-    routes: Vec<DxgateRoute>,
-    policies: Vec<DxgatePolicy>,
 }
 
 fn raw_object_schema(_: &mut SchemaGenerator) -> Schema {
@@ -171,84 +159,9 @@ pub fn crds() -> Vec<CustomResourceDefinition> {
     ]
 }
 
-pub async fn run_controller(
-    config_tx: watch::Sender<RuntimeConfig>,
-) -> Result<(), ControllerError> {
-    let client = Client::try_default().await?;
-    info!("started dxgate Kubernetes controller");
-    if let Err(err) = reconcile_once(client.clone(), &config_tx).await {
-        warn!(%err, "initial Kubernetes dxgate reconcile failed");
-    }
-
-    let (trigger_tx, mut trigger_rx) = mpsc::channel(32);
-    spawn_watch::<Dxgate>(client.clone(), "Dxgate", trigger_tx.clone());
-    spawn_watch::<DxgateBackend>(client.clone(), "DxgateBackend", trigger_tx.clone());
-    spawn_watch::<DxgateRoute>(client.clone(), "DxgateRoute", trigger_tx.clone());
-    spawn_watch::<DxgatePolicy>(client.clone(), "DxgatePolicy", trigger_tx);
-
-    while let Some(reason) = trigger_rx.recv().await {
-        info!(%reason, "reconciling Kubernetes dxgate resources");
-        if let Err(err) = reconcile_once(client.clone(), &config_tx).await {
-            warn!(%err, "failed reconciling Kubernetes dxgate config");
-        }
-    }
-    Ok(())
-}
-
+/// Reads the dxgate CRDs once and projects them onto a configuration document.
+/// Useful for tooling; the running controller uses the informer instead.
 pub async fn load_runtime_config(client: Client) -> Result<RuntimeConfig, ControllerError> {
-    let resources = list_resources(client).await?;
-    runtime_config_from_resources(
-        &resources.dxgates,
-        &resources.backends,
-        &resources.routes,
-        &resources.policies,
-    )
-}
-
-async fn reconcile_once(
-    client: Client,
-    config_tx: &watch::Sender<RuntimeConfig>,
-) -> Result<(), ControllerError> {
-    let resources = list_resources(client.clone()).await?;
-    match runtime_config_from_resources(
-        &resources.dxgates,
-        &resources.backends,
-        &resources.routes,
-        &resources.policies,
-    ) {
-        Ok(cfg) => {
-            let version = cfg.version.clone();
-            if cfg != *config_tx.borrow() {
-                config_tx
-                    .send(cfg)
-                    .map_err(|_| ControllerError::RuntimeConfigClosed)?;
-                info!(%version, "applied Kubernetes dxgate runtime config");
-            }
-            patch_statuses(
-                client,
-                &resources,
-                true,
-                "Accepted",
-                "RuntimeConfig accepted",
-            )
-            .await?;
-            Ok(())
-        }
-        Err(err) => {
-            patch_statuses(
-                client,
-                &resources,
-                false,
-                "Rejected",
-                &format!("RuntimeConfig rejected: {err}"),
-            )
-            .await?;
-            Err(err)
-        }
-    }
-}
-
-async fn list_resources(client: Client) -> Result<ControllerResources, ControllerError> {
     let params = ListParams::default();
     let dxgates = Api::<Dxgate>::all(client.clone())
         .list(&params)
@@ -264,110 +177,7 @@ async fn list_resources(client: Client) -> Result<ControllerResources, Controlle
         .items;
     let policies = Api::<DxgatePolicy>::all(client).list(&params).await?.items;
 
-    Ok(ControllerResources {
-        dxgates,
-        backends,
-        routes,
-        policies,
-    })
-}
-
-fn spawn_watch<K>(client: Client, kind: &'static str, trigger_tx: mpsc::Sender<String>)
-where
-    K: Clone
-        + Debug
-        + DeserializeOwned
-        + Resource<DynamicType = (), Scope = NamespaceResourceScope>
-        + Send
-        + Sync
-        + 'static,
-{
-    tokio::spawn(async move {
-        let api = Api::<K>::all(client);
-        loop {
-            let params = WatchParams::default().timeout(290);
-            match api.watch(&params, "0").await {
-                Ok(stream) => {
-                    futures_util::pin_mut!(stream);
-                    while let Ok(Some(_event)) = stream.try_next().await {
-                        if trigger_tx.send(kind.to_string()).await.is_err() {
-                            return;
-                        }
-                        info!(kind, "observed Kubernetes dxgate resource event");
-                    }
-                }
-                Err(err) => warn!(kind, %err, "Kubernetes watch failed"),
-            }
-            time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-}
-
-async fn patch_statuses(
-    client: Client,
-    resources: &ControllerResources,
-    ready: bool,
-    reason: &str,
-    message: &str,
-) -> Result<(), ControllerError> {
-    for resource in &resources.dxgates {
-        patch_resource_status(client.clone(), resource, ready, reason, message).await?;
-    }
-    for resource in &resources.backends {
-        patch_resource_status(client.clone(), resource, ready, reason, message).await?;
-    }
-    for resource in &resources.routes {
-        patch_resource_status(client.clone(), resource, ready, reason, message).await?;
-    }
-    for resource in &resources.policies {
-        patch_resource_status(client.clone(), resource, ready, reason, message).await?;
-    }
-    Ok(())
-}
-
-async fn patch_resource_status<K>(
-    client: Client,
-    resource: &K,
-    ready: bool,
-    reason: &str,
-    message: &str,
-) -> Result<(), ControllerError>
-where
-    K: Clone
-        + Debug
-        + DeserializeOwned
-        + Resource<DynamicType = (), Scope = NamespaceResourceScope>
-        + Send
-        + Sync
-        + 'static,
-{
-    let Some(namespace) = resource.namespace() else {
-        return Ok(());
-    };
-    let api = Api::<K>::namespaced(client, &namespace);
-    let status = ready_status(resource, ready, reason, message);
-    let patch = Patch::Merge(json!({ "status": status }));
-    api.patch_status(&resource.name_any(), &PatchParams::default(), &patch)
-        .await?;
-    Ok(())
-}
-
-fn ready_status<K>(resource: &K, ready: bool, reason: &str, message: &str) -> DxgateStatus
-where
-    K: Resource,
-{
-    DxgateStatus {
-        ready,
-        message: Some(message.to_string()),
-        observed_generation: resource.meta().generation,
-        conditions: vec![DxgateCondition {
-            type_: "Ready".to_string(),
-            status: if ready { "True" } else { "False" }.to_string(),
-            reason: reason.to_string(),
-            message: message.to_string(),
-            observed_generation: resource.meta().generation,
-        }],
-    }
+    runtime_config_from_resources(&dxgates, &backends, &routes, &policies)
 }
 
 pub fn runtime_config_from_resources(
@@ -416,7 +226,10 @@ pub fn runtime_config_from_resources(
     cfg.backends.sort_by(|a, b| a.name.cmp(&b.name));
     cfg.routes.sort_by(|a, b| a.name.cmp(&b.name));
     cfg.policies.sort_by(|a, b| a.name.cmp(&b.name));
-    cfg.validate().map_err(ControllerError::InvalidConfig)?;
+    // Cross-resource references are deliberately not checked here. A CRD route
+    // may legitimately point at a cluster that arrives over xDS, so only the
+    // store — which sees every source — can tell a dangling reference from one
+    // another source has not delivered yet.
     Ok(cfg)
 }
 
@@ -528,21 +341,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_crd_runtime_config() {
+    fn rejects_specs_that_do_not_parse() {
         let route = DxgateRoute::new(
             "broken",
             DxgateRouteSpec {
-                route: json!({
-                    "name": "broken",
-                    "protocol": "llm",
-                    "weighted_backends": [{ "name": "missing", "weight": 100 }]
-                }),
+                route: json!({ "name": "broken", "protocol": "carrier-pigeon" }),
             },
         );
 
         let err = runtime_config_from_resources(&[], &[], &[route], &[]).unwrap_err();
 
-        assert!(matches!(err, ControllerError::InvalidConfig(_)));
+        assert!(matches!(
+            err,
+            ControllerError::Convert {
+                field: "routes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dangling_references_are_left_for_the_store_to_judge() {
+        // A route may legitimately name a backend that another source owns, so
+        // the projection accepts it and the merged store decides.
+        let route = DxgateRoute::new(
+            "chat",
+            DxgateRouteSpec {
+                route: json!({
+                    "name": "chat",
+                    "protocol": "llm",
+                    "weighted_backends": [{ "name": "elsewhere", "weight": 100 }]
+                }),
+            },
+        );
+
+        let cfg = runtime_config_from_resources(&[], &[], &[route], &[]).unwrap();
+        assert_eq!(cfg.routes[0].name, "chat");
+
+        let store = dxgate_core::ConfigStore::new();
+        let outcome = store.apply(dxgate_core::SourceId::Kubernetes, cfg.into());
+        assert!(!outcome.ready);
+        assert_eq!(outcome.conflicts[0].kind, "missing-backend");
     }
 
     #[test]
@@ -569,7 +408,7 @@ mod tests {
             },
         );
 
-        let status = ready_status(&dxgate, true, "Accepted", "RuntimeConfig accepted");
+        let status = informer::ready_status(&dxgate, true, "Accepted", "RuntimeConfig accepted");
 
         assert!(status.ready);
         assert_eq!(status.message.as_deref(), Some("RuntimeConfig accepted"));

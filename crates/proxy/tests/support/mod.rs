@@ -35,11 +35,8 @@ pub async fn spawn_topology() -> TestTopology {
 
     wait_until_ok(backend_addr, "/health").await;
 
-    let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-    state
-        .apply_config(runtime_config(backend_addr))
-        .await
-        .unwrap();
+    let state = ProxyState::new();
+    state.apply_config(runtime_config(backend_addr)).unwrap();
     let proxy_task = tokio::spawn(async move {
         ProxyServer::new(state).serve(proxy_addr).await.unwrap();
     });

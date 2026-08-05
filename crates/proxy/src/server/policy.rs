@@ -7,7 +7,9 @@ use super::context::AgentRequestContext;
 use super::headers::merge_header_transform;
 use super::{header_value, ProxyServer};
 use axum::http::StatusCode;
-use dxgate_core::{AgentRoute, Backend, HeaderTransform, PolicyAction, RateLimitKey, RetryPolicy};
+use dxgate_core::{
+    AgentRoute, Backend, ConfigSnapshot, HeaderTransform, PolicyAction, RateLimitKey, RetryPolicy,
+};
 use std::env;
 use std::time::Duration;
 
@@ -29,7 +31,7 @@ pub(super) struct TokenCharge {
 
 pub(super) fn evaluate_policies(
     server: &ProxyServer,
-    cfg: &dxgate_core::RuntimeConfig,
+    snapshot: &ConfigSnapshot,
     route: &AgentRoute,
     backend: &Backend,
     context: &AgentRequestContext,
@@ -54,7 +56,7 @@ pub(super) fn evaluate_policies(
     };
 
     for name in names {
-        let Some(policy) = cfg.policy(&name) else {
+        let Some(policy) = snapshot.policy(&name) else {
             continue;
         };
         if !policy.applies_to(&context.input()) {

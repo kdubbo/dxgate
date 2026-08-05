@@ -10,7 +10,7 @@ use axum::http::{
 use axum::routing::any;
 use axum::Router;
 use dxgate_core::{
-    AgentProtocol, AgentRoute, Backend, MatchInput, RetryPolicy, WeightedBackend,
+    AgentProtocol, AgentRoute, Backend, ConfigSnapshot, MatchInput, RetryPolicy, WeightedBackend,
     HTTP_LISTENER_PORT,
 };
 use hyper::body::Bytes;
@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::time;
 use tracing::{debug, info, warn, Instrument};
@@ -199,35 +200,36 @@ async fn forward(
     server: ProxyServer,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let cfg = server.state.config().await;
+    // One atomic refcount bump gives the whole request a stable, indexed view of
+    // the configuration; nothing is copied per request.
+    let snapshot = server.state.snapshot();
     // gRPC and Dubbo Triple require end-to-end HTTP/2 with streaming bodies and
     // trailer propagation; buffering the body here would break both, so they skip
     // the agent path and stream straight through cluster routing.
     if is_grpc_request(req.headers()) {
-        return forward_http(server, cfg, req).await;
+        return forward_http(server, snapshot, req).await;
     }
     let protocol = detect_agent_protocol(req.uri().path()).or_else(|| {
-        cfg.routes
-            .iter()
-            .any(|route| route.protocol == AgentProtocol::Http)
+        snapshot
+            .has_http_agent_route()
             .then_some(AgentProtocol::Http)
     });
     if let Some(protocol) = protocol {
         let (parts, body) = req.into_parts();
         let body_bytes = read_body_limited(&parts.headers, body, server.max_body_bytes).await?;
         let context = AgentRequestContext::new(protocol, &parts, &body_bytes);
-        if let Some(route) = cfg.agent_route_for(&context.input()).cloned() {
-            return forward_agent(server, cfg, parts, body_bytes, context, route).await;
+        if let Some(route) = snapshot.agent_route_for(&context.input()).cloned() {
+            return forward_agent(server, snapshot, parts, body_bytes, context, route).await;
         }
         req = Request::from_parts(parts, Body::from(body_bytes));
     }
 
-    forward_http(server, cfg, req).await
+    forward_http(server, snapshot, req).await
 }
 
 async fn forward_http(
     server: ProxyServer,
-    cfg: dxgate_core::RuntimeConfig,
+    snapshot: Arc<ConfigSnapshot>,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let method = req.method().as_str().to_string();
@@ -245,7 +247,7 @@ async fn forward_http(
         headers: &headers,
     };
 
-    let route = match cfg.route_for(HTTP_LISTENER_PORT, &input) {
+    let route = match snapshot.route_for(HTTP_LISTENER_PORT, &input) {
         Ok(route) => route,
         Err(err) => {
             record_http_observation(
@@ -295,7 +297,7 @@ async fn forward_http(
         }
     };
 
-    let cluster = match cfg.cluster(&weighted.name) {
+    let cluster = match snapshot.cluster(&weighted.name) {
         Some(cluster) => cluster.clone(),
         None => {
             record_http_observation(
@@ -526,11 +528,11 @@ fn record_http_metric(
 
 async fn forward_agent(
     server: ProxyServer,
-    cfg: dxgate_core::RuntimeConfig,
+    snapshot: Arc<ConfigSnapshot>,
     parts: http::request::Parts,
     mut body: Bytes,
     mut context: AgentRequestContext,
-    route: AgentRoute,
+    route: Arc<AgentRoute>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     // A backend-prefixed name minted by list federation ("mcp-b__search")
     // pins the request to that backend and is rewritten back to the upstream
@@ -562,12 +564,12 @@ async fn forward_agent(
         .weighted_backends
         .iter()
         .filter_map(|weighted| {
-            let backend = cfg.backend(&weighted.name)?;
+            let backend = snapshot.backend(&weighted.name)?;
             if backend_matches_protocol(backend, context.protocol)
                 && backend.supports_model(context.model.as_deref())
                 && backend.supports_tool(context.tool.as_deref())
                 && backend.supports_agent(context.agent.as_deref())
-                && backend_supports_llm_request(&cfg, backend, &context)
+                && backend_supports_llm_request(&snapshot, backend, &context)
                 && alias_backend
                     .as_deref()
                     .is_none_or(|name| weighted.name == name)
@@ -613,14 +615,20 @@ async fn forward_agent(
     let mut ordered = vec![primary.clone()];
     ordered.extend(eligible.iter().filter(|b| b.name != primary.name).cloned());
 
-    let primary_backend = cfg.backend(&primary.name).ok_or_else(|| {
+    let primary_backend = snapshot.backend(&primary.name).ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("backend {} not found", primary.name),
         )
     })?;
-    let policy_runtime =
-        evaluate_policies(&server, &cfg, &route, primary_backend, &context, body.len())?;
+    let policy_runtime = evaluate_policies(
+        &server,
+        &snapshot,
+        &route,
+        primary_backend,
+        &context,
+        body.len(),
+    )?;
 
     if context.protocol == AgentProtocol::Mcp && eligible.len() > 1 {
         if let Some(spec) = context.mcp_method.as_deref().and_then(mcp::list_spec) {
@@ -638,7 +646,7 @@ async fn forward_agent(
                 // assignment on name collisions is stable across requests.
                 return federate_mcp_list(
                     &server,
-                    &cfg,
+                    &snapshot,
                     &route,
                     &eligible,
                     &parts,
@@ -654,7 +662,7 @@ async fn forward_agent(
 
     let response = request_agent_with_failover(
         &server,
-        &cfg,
+        &snapshot,
         &route,
         &ordered,
         &parts,
@@ -679,7 +687,7 @@ async fn forward_agent(
 #[allow(clippy::too_many_arguments)]
 async fn request_agent_with_failover(
     server: &ProxyServer,
-    cfg: &dxgate_core::RuntimeConfig,
+    snapshot: &ConfigSnapshot,
     route: &AgentRoute,
     ordered: &[WeightedBackend],
     parts: &http::request::Parts,
@@ -696,7 +704,7 @@ async fn request_agent_with_failover(
 
     for attempt in 0..attempts {
         for weighted in ordered {
-            let Some(backend) = cfg.backend(&weighted.name) else {
+            let Some(backend) = snapshot.backend(&weighted.name) else {
                 continue;
             };
             let started = Instant::now();
@@ -709,7 +717,7 @@ async fn request_agent_with_failover(
             );
             match request_agent_backend(
                 server,
-                cfg,
+                snapshot,
                 route,
                 backend,
                 parts,
@@ -882,7 +890,7 @@ async fn process_a2a_response(
 #[allow(clippy::too_many_arguments)]
 async fn request_agent_backend(
     server: &ProxyServer,
-    cfg: &dxgate_core::RuntimeConfig,
+    snapshot: &ConfigSnapshot,
     route: &AgentRoute,
     backend: &Backend,
     parts: &http::request::Parts,
@@ -890,7 +898,7 @@ async fn request_agent_backend(
     context: &AgentRequestContext,
     policy_runtime: &PolicyRuntime,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let provider = backend_provider(cfg, backend);
+    let provider = backend_provider(snapshot, backend);
     let endpoint = backend.endpoint(provider).ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
@@ -988,7 +996,7 @@ const MCP_FEDERATION_MAX_PAGES: usize = 32;
 #[allow(clippy::too_many_arguments)]
 async fn federate_mcp_list(
     server: &ProxyServer,
-    cfg: &dxgate_core::RuntimeConfig,
+    snapshot: &ConfigSnapshot,
     route: &AgentRoute,
     ordered: &[WeightedBackend],
     parts: &http::request::Parts,
@@ -1003,7 +1011,7 @@ async fn federate_mcp_list(
     let mut failures = Vec::new();
 
     for weighted in ordered {
-        let Some(backend) = cfg.backend(&weighted.name) else {
+        let Some(backend) = snapshot.backend(&weighted.name) else {
             continue;
         };
         let mut cursor: Option<String> = None;
@@ -1024,7 +1032,7 @@ async fn federate_mcp_list(
             );
             let outcome = request_agent_backend(
                 server,
-                cfg,
+                snapshot,
                 route,
                 backend,
                 parts,
@@ -1223,14 +1231,14 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 }
 
 fn backend_supports_llm_request(
-    cfg: &dxgate_core::RuntimeConfig,
+    snapshot: &ConfigSnapshot,
     backend: &Backend,
     context: &AgentRequestContext,
 ) -> bool {
     if context.protocol != AgentProtocol::Llm {
         return true;
     }
-    let Some(provider) = backend_provider(cfg, backend) else {
+    let Some(provider) = backend_provider(snapshot, backend) else {
         return true;
     };
     match llm::dialect_for(provider.kind) {

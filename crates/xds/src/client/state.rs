@@ -1,3 +1,16 @@
+//! The xDS resource cache and its projection onto dxgate's configuration model.
+//!
+//! A dxgate `Cluster` is a join of an xDS `Cluster` with its
+//! `ClusterLoadAssignment`, and a dxgate `Listener` is a join of an xDS
+//! `Listener` with the `RouteConfiguration`s it names over RDS. Neither join can
+//! be computed from a single incoming resource, so the client keeps the raw xDS
+//! resources here and re-projects them after every update.
+//!
+//! [`AdsState`] accepts both wire flavours: `apply_sotw` replaces a type's whole
+//! set (state-of-the-world ADS), `apply_delta` upserts and removes individual
+//! resources (delta ADS). Everything downstream of that is shared.
+
+use super::XdsError;
 use crate::proto::cluster::v1 as xds_cluster;
 use crate::proto::core::v1 as xds_core;
 use crate::proto::endpoint::v1 as xds_endpoint;
@@ -5,345 +18,218 @@ use crate::proto::extensions::filters::network::http_connection_manager::v1 as x
 use crate::proto::extensions::transport_sockets::tls::v1 as xds_tls;
 use crate::proto::listener::v1 as xds_listener;
 use crate::proto::route::v1 as xds_route;
-use crate::proto::service::discovery::v1::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
-use crate::proto::service::discovery::v1::{DiscoveryRequest, DiscoveryResponse};
+use crate::proto::service::discovery::v1::DiscoveryResponse;
 use dxgate_core::{
-    CircuitBreakerConfig, Cluster, Endpoint as RuntimeEndpoint, HeaderMatch, Listener,
-    ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch, RouterIdentity,
-    RuntimeConfig, UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedCluster,
+    CircuitBreakerConfig, Cluster, ConfigDelta, Endpoint as RuntimeEndpoint, HeaderMatch, Listener,
+    ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch, SourceState,
+    UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedCluster,
 };
 use prost::Message;
-use prost_types::{value::Kind, Struct, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
-use thiserror::Error;
-use tokio::sync::{mpsc, watch};
-use tokio::time;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, info, warn};
 
-const CLUSTER_TYPE: &str = "type.googleapis.com/cluster.v1.Cluster";
-const ENDPOINT_TYPE: &str = "type.googleapis.com/endpoint.v1.ClusterLoadAssignment";
-const LISTENER_TYPE: &str = "type.googleapis.com/listener.v1.Listener";
-const ROUTE_TYPE: &str = "type.googleapis.com/route.v1.RouteConfiguration";
-const MAX_DECODING_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+pub(super) const CLUSTER_TYPE: &str = "type.googleapis.com/cluster.v1.Cluster";
+pub(super) const ENDPOINT_TYPE: &str = "type.googleapis.com/endpoint.v1.ClusterLoadAssignment";
+pub(super) const LISTENER_TYPE: &str = "type.googleapis.com/listener.v1.Listener";
+pub(super) const ROUTE_TYPE: &str = "type.googleapis.com/route.v1.RouteConfiguration";
 
-#[derive(Debug, Error)]
-pub enum XdsError {
-    #[error("invalid xDS endpoint {endpoint}: {source}")]
-    InvalidEndpoint {
-        endpoint: String,
-        source: tonic::transport::Error,
-    },
-
-    #[error("failed connecting to xDS endpoint {endpoint}: {source}")]
-    Connect {
-        endpoint: String,
-        source: tonic::transport::Error,
-    },
-
-    #[error("failed opening ADS stream: {0}")]
-    StreamOpen(Box<tonic::Status>),
-
-    #[error("ADS stream receive failed: {0}")]
-    StreamReceive(Box<tonic::Status>),
-
-    #[error("ADS request channel is closed")]
-    RequestChannelClosed,
-
-    #[error("failed decoding {type_url} resource: {source}")]
-    Decode {
-        type_url: String,
-        source: prost::DecodeError,
-    },
-
-    #[error("runtime config watcher is closed")]
-    RuntimeConfigClosed,
+/// A change to what the client is subscribed to for one resource type.
+///
+/// Delta ADS carries the change itself, so both halves are sent as-is.
+/// State-of-the-world ADS carries the full desired set, so `desired` is what
+/// goes on the wire there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubscriptionChange {
+    pub(super) type_url: &'static str,
+    pub(super) desired: Vec<String>,
+    pub(super) subscribe: Vec<String>,
+    pub(super) unsubscribe: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct XdsClientConfig {
-    pub endpoint: String,
-    pub identity: RouterIdentity,
-    pub listener_names: Vec<String>,
-    pub reconnect_delay: Duration,
-}
-
-pub struct XdsClient {
-    cfg: XdsClientConfig,
-}
-
-impl XdsClient {
-    pub fn new(cfg: XdsClientConfig) -> Self {
-        Self { cfg }
-    }
-
-    pub async fn connect_channel(&self) -> Result<Channel, XdsError> {
-        let endpoint = Endpoint::from_shared(self.cfg.endpoint.clone()).map_err(|source| {
-            XdsError::InvalidEndpoint {
-                endpoint: self.cfg.endpoint.clone(),
-                source,
-            }
-        })?;
-
-        endpoint
-            .connect()
-            .await
-            .map_err(|source| XdsError::Connect {
-                endpoint: self.cfg.endpoint.clone(),
-                source,
-            })
-    }
-
-    pub async fn run(self, config_tx: watch::Sender<RuntimeConfig>) -> Result<(), XdsError> {
-        loop {
-            match self.run_once(&config_tx).await {
-                Ok(()) => warn!("ADS stream ended"),
-                Err(err @ XdsError::InvalidEndpoint { .. }) => return Err(err),
-                Err(err) => warn!(%err, "ADS stream failed"),
-            }
-            time::sleep(self.cfg.reconnect_delay).await;
-        }
-    }
-
-    async fn run_once(&self, config_tx: &watch::Sender<RuntimeConfig>) -> Result<(), XdsError> {
-        let channel = self.connect_channel().await?;
-        let node = self.node();
-        let mut ads = AggregatedDiscoveryServiceClient::new(channel)
-            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
-        let (request_tx, request_rx) = mpsc::channel(32);
-        let mut state = AdsState::default();
-
-        let listener_names = sorted_unique(self.cfg.listener_names.clone());
-        state.set_subscription(LISTENER_TYPE, listener_names.clone());
-        send_discovery_request(&request_tx, &node, LISTENER_TYPE, listener_names, "", "").await?;
-
-        let response = ads
-            .stream_aggregated_resources(ReceiverStream::new(request_rx))
-            .await
-            .map_err(|status| XdsError::StreamOpen(Box::new(status)))?;
-        let mut stream = response.into_inner();
-
-        info!(
-            node_id = %self.cfg.identity.node_id(),
-            endpoint = %self.cfg.endpoint,
-            listeners = ?self.cfg.listener_names,
-            "connected dxgate router to dubbod ADS endpoint"
-        );
-
-        while let Some(resp) = stream
-            .message()
-            .await
-            .map_err(|status| XdsError::StreamReceive(Box::new(status)))?
-        {
-            let updates = state.apply_response(&resp)?;
-            send_discovery_request(
-                &request_tx,
-                &node,
-                &resp.type_url,
-                state.subscription(&resp.type_url),
-                &resp.version_info,
-                &resp.nonce,
-            )
-            .await?;
-
-            for (type_url, names) in updates.subscriptions() {
-                if state.set_subscription(type_url, names.clone()) {
-                    send_discovery_request(&request_tx, &node, type_url, names, "", "").await?;
-                }
-            }
-
-            let cfg = state.runtime_config(&resp.version_info);
-            match cfg.validate() {
-                Ok(()) => {
-                    if cfg != *config_tx.borrow() {
-                        let version = cfg.version.clone();
-                        config_tx
-                            .send(cfg)
-                            .map_err(|_| XdsError::RuntimeConfigClosed)?;
-                        info!(version = %version, "applied ADS runtime config");
-                    }
-                }
-                Err(conflicts) => {
-                    debug!(?conflicts, "ADS runtime config is not complete yet");
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn node(&self) -> xds_core::Node {
-        let metadata = self.cfg.identity.metadata();
-        let mut fields = BTreeMap::new();
-        fields.insert("GENERATOR".to_string(), string_value(metadata.generator));
-        fields.insert("CLUSTER_ID".to_string(), string_value(metadata.cluster_id));
-        fields.insert("NAMESPACE".to_string(), string_value(metadata.namespace));
-        if let Some(node_name) = metadata.node_name {
-            fields.insert("KUBE_NODE_NAME".to_string(), string_value(node_name));
-        }
-
-        xds_core::Node {
-            id: self.cfg.identity.node_id(),
-            cluster: self.cfg.identity.cluster_id.clone(),
-            metadata: Some(Struct { fields }),
-            locality: None,
-        }
-    }
-}
-
-async fn send_discovery_request(
-    request_tx: &mpsc::Sender<DiscoveryRequest>,
-    node: &xds_core::Node,
-    type_url: &str,
-    resource_names: Vec<String>,
-    version_info: &str,
-    response_nonce: &str,
-) -> Result<(), XdsError> {
-    request_tx
-        .send(DiscoveryRequest {
-            version_info: version_info.to_string(),
-            node: Some(node.clone()),
-            resource_names,
-            type_url: type_url.to_string(),
-            response_nonce: response_nonce.to_string(),
-            error_detail: None,
-        })
-        .await
-        .map_err(|_| XdsError::RequestChannelClosed)
-}
-
-fn string_value(value: String) -> Value {
-    Value {
-        kind: Some(Kind::StringValue(value)),
+impl SubscriptionChange {
+    fn is_empty(&self) -> bool {
+        self.subscribe.is_empty() && self.unsubscribe.is_empty()
     }
 }
 
 #[derive(Default)]
-struct AdsState {
-    subscriptions: BTreeMap<String, Vec<String>>,
+pub(super) struct AdsState {
+    subscriptions: BTreeMap<String, BTreeSet<String>>,
     listeners: BTreeMap<String, ListenerSnapshot>,
     routes: BTreeMap<String, Vec<VirtualHost>>,
     clusters: BTreeMap<String, ClusterSnapshot>,
     endpoints: BTreeMap<String, Vec<RuntimeEndpoint>>,
+    /// Per-type resource versions, replayed as a delta stream's
+    /// `initial_resource_versions` after a reconnect so the control plane only
+    /// resends what actually changed while the stream was down.
+    versions: BTreeMap<String, BTreeMap<String, String>>,
+    /// Derived resource keys last published to the store, so removals can be
+    /// computed even though a projection cannot say what it stopped producing.
+    published: SourceState,
 }
 
 impl AdsState {
-    fn apply_response(&mut self, resp: &DiscoveryResponse) -> Result<DiscoveryUpdates, XdsError> {
+    /// Prepares the cache for a freshly opened stream and returns the listener
+    /// names to request first. An empty set means the legacy wildcard
+    /// subscription, which is how the client asks `dubbod` for every listener it
+    /// is entitled to.
+    ///
+    /// A new stream carries no subscription state on the server side, so the
+    /// record of what RDS/CDS/EDS resources were already subscribed to is
+    /// cleared: the desired sets have not changed across the reconnect, and
+    /// without this the diff would come out empty and those types would never be
+    /// re-requested. Cached resources and their versions are kept, so a delta
+    /// stream can still replay `initial_resource_versions`.
+    pub(super) fn begin_stream(&mut self, listener_names: Vec<String>) -> Vec<String> {
+        for type_url in [ROUTE_TYPE, CLUSTER_TYPE, ENDPOINT_TYPE] {
+            self.subscriptions.remove(type_url);
+        }
+        let names: BTreeSet<String> = listener_names
+            .into_iter()
+            .filter(|name| !name.is_empty())
+            .collect();
+        let desired = names.iter().cloned().collect();
+        self.subscriptions.insert(LISTENER_TYPE.to_string(), names);
+        desired
+    }
+
+    pub(super) fn subscription(&self, type_url: &str) -> Vec<String> {
+        self.subscriptions
+            .get(type_url)
+            .map(|names| names.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Versions to replay on reconnect for one resource type.
+    pub(super) fn initial_resource_versions(&self, type_url: &str) -> BTreeMap<String, String> {
+        self.versions.get(type_url).cloned().unwrap_or_default()
+    }
+
+    /// Applies a state-of-the-world response: the payload is the complete set
+    /// for that type, so anything the client still holds and the server did not
+    /// send is gone.
+    pub(super) fn apply_sotw(&mut self, resp: &DiscoveryResponse) -> Result<(), XdsError> {
+        let requested = self.subscription(&resp.type_url);
         match resp.type_url.as_str() {
-            LISTENER_TYPE => self.apply_listeners(&resp.resources),
-            ROUTE_TYPE => self.apply_routes(&resp.resources),
-            CLUSTER_TYPE => self.apply_clusters(&resp.resources),
-            ENDPOINT_TYPE => self.apply_endpoints(&resp.resources),
-            _ => Ok(DiscoveryUpdates::default()),
-        }
-    }
-
-    fn apply_listeners(
-        &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<DiscoveryUpdates, XdsError> {
-        let requested = self.subscription(LISTENER_TYPE);
-        prune_requested(&mut self.listeners, &requested);
-        for resource in resources {
-            let listener = decode_resource::<xds_listener::Listener>(LISTENER_TYPE, resource)?;
-            let snapshot = listener_snapshot(listener)?;
-            self.listeners
-                .insert(snapshot.listener.name.clone(), snapshot);
-        }
-
-        Ok(DiscoveryUpdates {
-            route_names: self.route_names(),
-            ..DiscoveryUpdates::default()
-        })
-    }
-
-    fn apply_routes(
-        &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<DiscoveryUpdates, XdsError> {
-        let requested = self.subscription(ROUTE_TYPE);
-        prune_requested(&mut self.routes, &requested);
-        for resource in resources {
-            let route = decode_resource::<xds_route::RouteConfiguration>(ROUTE_TYPE, resource)?;
-            self.routes.insert(
-                route.name.clone(),
-                convert_virtual_hosts(&route.virtual_hosts),
-            );
-        }
-
-        Ok(DiscoveryUpdates {
-            cluster_names: self.cluster_names(),
-            ..DiscoveryUpdates::default()
-        })
-    }
-
-    fn apply_clusters(
-        &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<DiscoveryUpdates, XdsError> {
-        let requested = self.subscription(CLUSTER_TYPE);
-        prune_requested(&mut self.clusters, &requested);
-        for resource in resources {
-            let cluster = decode_resource::<xds_cluster::Cluster>(CLUSTER_TYPE, resource)?;
-            if cluster.name.is_empty() {
-                continue;
+            LISTENER_TYPE => {
+                prune_requested(&mut self.listeners, &requested);
+                let received = self.upsert_listeners(&resp.resources)?;
+                retain_received(&mut self.listeners, &received, &requested);
             }
-            let eds_service_name = cluster
-                .eds_cluster_config
-                .as_ref()
-                .filter(|eds| !eds.service_name.is_empty())
-                .map(|eds| eds.service_name.clone())
-                .unwrap_or_else(|| cluster.name.clone());
-
-            if let Some(load_assignment) = cluster.load_assignment.as_ref() {
-                self.endpoints.insert(
-                    eds_service_name.clone(),
-                    endpoints_from_assignment(load_assignment),
-                );
+            ROUTE_TYPE => {
+                prune_requested(&mut self.routes, &requested);
+                let received = self.upsert_routes(&resp.resources)?;
+                retain_received(&mut self.routes, &received, &requested);
             }
-
-            self.clusters.insert(
-                cluster.name.clone(),
-                ClusterSnapshot {
-                    tls: upstream_tls_from_cluster(&cluster),
-                    circuit_breaker: circuit_breaker_from_cluster(&cluster),
-                    outlier_detection: outlier_detection_from_cluster(&cluster),
-                    name: cluster.name,
-                    eds_service_name,
-                },
-            );
+            CLUSTER_TYPE => {
+                prune_requested(&mut self.clusters, &requested);
+                let received = self.upsert_clusters(&resp.resources)?;
+                retain_received(&mut self.clusters, &received, &requested);
+            }
+            ENDPOINT_TYPE => {
+                prune_requested(&mut self.endpoints, &requested);
+                let received = self.upsert_endpoints(&resp.resources)?;
+                retain_received(&mut self.endpoints, &received, &requested);
+            }
+            _ => {}
         }
-
-        Ok(DiscoveryUpdates {
-            eds_names: self.eds_names(),
-            ..DiscoveryUpdates::default()
-        })
+        Ok(())
     }
 
-    fn apply_endpoints(
+    /// Applies a delta response: only the named resources changed, and
+    /// `removed` names are gone.
+    pub(super) fn apply_delta(
         &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<DiscoveryUpdates, XdsError> {
-        let requested = self.subscription(ENDPOINT_TYPE);
-        prune_requested(&mut self.endpoints, &requested);
-        for resource in resources {
-            let assignment =
-                decode_resource::<xds_endpoint::ClusterLoadAssignment>(ENDPOINT_TYPE, resource)?;
-            if assignment.cluster_name.is_empty() {
-                continue;
+        type_url: &str,
+        resources: &[(String, String, prost_types::Any)],
+        removed: &[String],
+    ) -> Result<(), XdsError> {
+        let payload: Vec<prost_types::Any> = resources
+            .iter()
+            .map(|(_, _, any)| any.clone())
+            .collect::<Vec<_>>();
+        match type_url {
+            LISTENER_TYPE => {
+                self.upsert_listeners(&payload)?;
+                for name in removed {
+                    self.listeners.remove(name);
+                }
             }
-            self.endpoints.insert(
-                assignment.cluster_name.clone(),
-                endpoints_from_assignment(&assignment),
-            );
+            ROUTE_TYPE => {
+                self.upsert_routes(&payload)?;
+                for name in removed {
+                    self.routes.remove(name);
+                }
+            }
+            CLUSTER_TYPE => {
+                self.upsert_clusters(&payload)?;
+                for name in removed {
+                    self.clusters.remove(name);
+                }
+                self.prune_orphan_endpoints();
+            }
+            ENDPOINT_TYPE => {
+                self.upsert_endpoints(&payload)?;
+                for name in removed {
+                    self.endpoints.remove(name);
+                }
+            }
+            _ => return Ok(()),
         }
-        Ok(DiscoveryUpdates::default())
+
+        let versions = self.versions.entry(type_url.to_string()).or_default();
+        for (name, version, _) in resources {
+            versions.insert(name.clone(), version.clone());
+        }
+        for name in removed {
+            versions.remove(name);
+        }
+        Ok(())
     }
 
-    fn runtime_config(&self, version: &str) -> RuntimeConfig {
+    /// Recomputes what the client wants to be subscribed to now that its
+    /// resources changed, and reports the difference.
+    pub(super) fn refresh_subscriptions(&mut self) -> Vec<SubscriptionChange> {
+        [
+            (ROUTE_TYPE, self.route_names()),
+            (CLUSTER_TYPE, self.cluster_names()),
+            (ENDPOINT_TYPE, self.eds_names()),
+        ]
+        .into_iter()
+        .filter_map(|(type_url, desired)| self.set_subscription(type_url, desired))
+        .collect()
+    }
+
+    fn set_subscription(
+        &mut self,
+        type_url: &'static str,
+        desired: BTreeSet<String>,
+    ) -> Option<SubscriptionChange> {
+        let current = self.subscriptions.entry(type_url.to_string()).or_default();
+        let change = SubscriptionChange {
+            type_url,
+            desired: desired.iter().cloned().collect(),
+            subscribe: desired.difference(current).cloned().collect(),
+            unsubscribe: current.difference(&desired).cloned().collect(),
+        };
+        if change.is_empty() {
+            return None;
+        }
+        *current = desired;
+        // A resource we unsubscribed from will never be refreshed again, so its
+        // cached version must not be replayed on the next reconnect.
+        if let Some(versions) = self.versions.get_mut(type_url) {
+            for name in &change.unsubscribe {
+                versions.remove(name);
+            }
+        }
+        Some(change)
+    }
+
+    /// Projects the cached xDS resources onto dxgate's configuration model and
+    /// diffs the result against what was published last, so the store receives
+    /// removals for resources this source stopped producing.
+    pub(super) fn config_delta(&mut self, version: &str) -> ConfigDelta {
         let listeners = self
             .listeners
             .values()
@@ -376,88 +262,155 @@ impl AdsState {
             })
             .collect();
 
-        RuntimeConfig {
-            version: if version.is_empty() {
-                "ads".to_string()
-            } else {
-                version.to_string()
-            },
-            listeners,
-            clusters,
-            secrets: Vec::new(),
-            providers: Vec::new(),
-            backends: Vec::new(),
-            routes: Vec::new(),
-            policies: Vec::new(),
-        }
+        let delta = ConfigDelta::default()
+            .with_version(if version.is_empty() { "ads" } else { version })
+            .with_listeners(listeners)
+            .with_clusters(clusters);
+        self.published.reconcile_delta(delta)
     }
 
-    fn subscription(&self, type_url: &str) -> Vec<String> {
-        self.subscriptions
-            .get(type_url)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn set_subscription(&mut self, type_url: &str, names: Vec<String>) -> bool {
-        let names = sorted_unique(names);
-        if self.subscriptions.get(type_url) == Some(&names) {
-            return false;
-        }
-        self.subscriptions.insert(type_url.to_string(), names);
-        true
-    }
-
-    fn route_names(&self) -> Vec<String> {
-        sorted_unique(
+    fn upsert_listeners(
+        &mut self,
+        resources: &[prost_types::Any],
+    ) -> Result<BTreeSet<String>, XdsError> {
+        let mut received = BTreeSet::new();
+        for resource in resources {
+            let listener = decode_resource::<xds_listener::Listener>(LISTENER_TYPE, resource)?;
+            let snapshot = listener_snapshot(listener)?;
+            received.insert(snapshot.listener.name.clone());
             self.listeners
-                .values()
-                .flat_map(|listener| listener.route_names.iter().cloned()),
-        )
+                .insert(snapshot.listener.name.clone(), snapshot);
+        }
+        Ok(received)
     }
 
-    fn cluster_names(&self) -> Vec<String> {
-        sorted_unique(self.routes.values().flat_map(|vhosts| {
-            vhosts.iter().flat_map(|vh| {
-                vh.routes.iter().flat_map(|route| {
-                    route
-                        .weighted_clusters
-                        .iter()
-                        .map(|cluster| cluster.name.clone())
+    fn upsert_routes(
+        &mut self,
+        resources: &[prost_types::Any],
+    ) -> Result<BTreeSet<String>, XdsError> {
+        let mut received = BTreeSet::new();
+        for resource in resources {
+            let route = decode_resource::<xds_route::RouteConfiguration>(ROUTE_TYPE, resource)?;
+            received.insert(route.name.clone());
+            self.routes.insert(
+                route.name.clone(),
+                convert_virtual_hosts(&route.virtual_hosts),
+            );
+        }
+        Ok(received)
+    }
+
+    fn upsert_clusters(
+        &mut self,
+        resources: &[prost_types::Any],
+    ) -> Result<BTreeSet<String>, XdsError> {
+        let mut received = BTreeSet::new();
+        for resource in resources {
+            let cluster = decode_resource::<xds_cluster::Cluster>(CLUSTER_TYPE, resource)?;
+            if cluster.name.is_empty() {
+                continue;
+            }
+            let eds_service_name = cluster
+                .eds_cluster_config
+                .as_ref()
+                .filter(|eds| !eds.service_name.is_empty())
+                .map(|eds| eds.service_name.clone())
+                .unwrap_or_else(|| cluster.name.clone());
+
+            if let Some(load_assignment) = cluster.load_assignment.as_ref() {
+                self.endpoints.insert(
+                    eds_service_name.clone(),
+                    endpoints_from_assignment(load_assignment),
+                );
+            }
+
+            received.insert(cluster.name.clone());
+            self.clusters.insert(
+                cluster.name.clone(),
+                ClusterSnapshot {
+                    tls: upstream_tls_from_cluster(&cluster),
+                    circuit_breaker: circuit_breaker_from_cluster(&cluster),
+                    outlier_detection: outlier_detection_from_cluster(&cluster),
+                    name: cluster.name,
+                    eds_service_name,
+                },
+            );
+        }
+        Ok(received)
+    }
+
+    fn upsert_endpoints(
+        &mut self,
+        resources: &[prost_types::Any],
+    ) -> Result<BTreeSet<String>, XdsError> {
+        let mut received = BTreeSet::new();
+        for resource in resources {
+            let assignment =
+                decode_resource::<xds_endpoint::ClusterLoadAssignment>(ENDPOINT_TYPE, resource)?;
+            if assignment.cluster_name.is_empty() {
+                continue;
+            }
+            received.insert(assignment.cluster_name.clone());
+            self.endpoints.insert(
+                assignment.cluster_name.clone(),
+                endpoints_from_assignment(&assignment),
+            );
+        }
+        Ok(received)
+    }
+
+    /// Drops endpoint assignments no remaining cluster points at. Only delta
+    /// needs this: the state-of-the-world path prunes against the subscription.
+    fn prune_orphan_endpoints(&mut self) {
+        let live: BTreeSet<&String> = self
+            .clusters
+            .values()
+            .map(|cluster| &cluster.eds_service_name)
+            .collect();
+        self.endpoints.retain(|name, _| live.contains(name));
+    }
+
+    fn route_names(&self) -> BTreeSet<String> {
+        self.listeners
+            .values()
+            .flat_map(|listener| listener.route_names.iter().cloned())
+            .collect()
+    }
+
+    fn cluster_names(&self) -> BTreeSet<String> {
+        self.routes
+            .values()
+            .flat_map(|vhosts| {
+                vhosts.iter().flat_map(|vh| {
+                    vh.routes.iter().flat_map(|route| {
+                        route
+                            .weighted_clusters
+                            .iter()
+                            .map(|cluster| cluster.name.clone())
+                    })
                 })
             })
-        }))
+            .collect()
     }
 
-    fn eds_names(&self) -> Vec<String> {
-        sorted_unique(
-            self.clusters
-                .values()
-                .map(|cluster| cluster.eds_service_name.clone()),
-        )
+    fn eds_names(&self) -> BTreeSet<String> {
+        self.clusters
+            .values()
+            .map(|cluster| cluster.eds_service_name.clone())
+            .collect()
     }
 }
 
-#[derive(Default)]
-struct DiscoveryUpdates {
-    route_names: Vec<String>,
-    cluster_names: Vec<String>,
-    eds_names: Vec<String>,
-}
-
-impl DiscoveryUpdates {
-    fn subscriptions(self) -> Vec<(&'static str, Vec<String>)> {
-        let mut out = Vec::new();
-        if !self.route_names.is_empty() {
-            out.push((ROUTE_TYPE, self.route_names));
-        }
-        if !self.cluster_names.is_empty() {
-            out.push((CLUSTER_TYPE, self.cluster_names));
-        }
-        if !self.eds_names.is_empty() {
-            out.push((ENDPOINT_TYPE, self.eds_names));
-        }
-        out
+/// State-of-the-world semantics for a wildcard subscription: with no requested
+/// names the response itself is the complete set, so anything absent from it is
+/// gone. With an explicit subscription `prune_requested` already did the work.
+fn retain_received<T>(
+    resources: &mut BTreeMap<String, T>,
+    received: &BTreeSet<String>,
+    requested: &[String],
+) {
+    if requested.is_empty() {
+        resources.retain(|name, _| received.contains(name));
     }
 }
 
@@ -847,6 +800,7 @@ fn sorted_unique(names: impl IntoIterator<Item = String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::proto::core::v1::{address, socket_address, Address, SocketAddress};
+    use dxgate_core::{ResourceKey, ResourceKind, RouterIdentity};
     use prost_types::Any;
 
     #[test]
@@ -963,55 +917,218 @@ mod tests {
         };
 
         let mut state = AdsState::default();
-        state.set_subscription(
-            LISTENER_TYPE,
-            vec!["dxgate.app.svc.cluster.local:80".into()],
-        );
-        let updates = state
-            .apply_response(&response(LISTENER_TYPE, vec![any(LISTENER_TYPE, listener)]))
-            .unwrap();
-        assert_eq!(updates.route_names, [route_name]);
-        state.set_subscription(ROUTE_TYPE, updates.route_names);
-
-        let updates = state
-            .apply_response(&response(ROUTE_TYPE, vec![any(ROUTE_TYPE, route)]))
-            .unwrap();
-        assert_eq!(updates.cluster_names, [cluster_name]);
-        state.set_subscription(CLUSTER_TYPE, updates.cluster_names);
-
-        let updates = state
-            .apply_response(&response(CLUSTER_TYPE, vec![any(CLUSTER_TYPE, cluster)]))
-            .unwrap();
-        assert_eq!(updates.eds_names, [cluster_name]);
-        state.set_subscription(ENDPOINT_TYPE, updates.eds_names);
+        state.begin_stream(vec!["dxgate.app.svc.cluster.local:80".into()]);
 
         state
-            .apply_response(&response(
+            .apply_sotw(&response(LISTENER_TYPE, vec![any(LISTENER_TYPE, listener)]))
+            .unwrap();
+        let changes = state.refresh_subscriptions();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].type_url, ROUTE_TYPE);
+        assert_eq!(changes[0].subscribe, [route_name]);
+
+        state
+            .apply_sotw(&response(ROUTE_TYPE, vec![any(ROUTE_TYPE, route)]))
+            .unwrap();
+        let changes = state.refresh_subscriptions();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].type_url, CLUSTER_TYPE);
+        assert_eq!(changes[0].subscribe, [cluster_name]);
+
+        state
+            .apply_sotw(&response(CLUSTER_TYPE, vec![any(CLUSTER_TYPE, cluster)]))
+            .unwrap();
+        let changes = state.refresh_subscriptions();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].type_url, ENDPOINT_TYPE);
+        assert_eq!(changes[0].subscribe, [cluster_name]);
+
+        state
+            .apply_sotw(&response(
                 ENDPOINT_TYPE,
                 vec![any(ENDPOINT_TYPE, assignment)],
             ))
             .unwrap();
+        assert!(state.refresh_subscriptions().is_empty());
 
-        let cfg = state.runtime_config("v1");
-        cfg.validate().unwrap();
-        assert_eq!(cfg.listeners[0].bind, "0.0.0.0:80".parse().unwrap());
+        let delta = state.config_delta("v1");
+        assert_eq!(delta.version.as_deref(), Some("v1"));
+        assert!(delta.removes.is_empty());
+        assert_eq!(delta.listeners[0].bind, "0.0.0.0:80".parse().unwrap());
         assert_eq!(
-            cfg.listeners[0].virtual_hosts[0].domains,
+            delta.listeners[0].virtual_hosts[0].domains,
             ["orders.example.com"]
         );
-        assert_eq!(cfg.clusters[0].endpoints[0].address, "10.244.0.20");
-        assert_eq!(
-            cfg.clusters[0]
-                .tls
-                .as_ref()
-                .and_then(|tls| tls.sni.as_deref()),
-            Some("orders.app.svc.cluster.local")
-        );
-        let tls = cfg.clusters[0].tls.as_ref().unwrap();
+        assert_eq!(delta.clusters[0].endpoints[0].address, "10.244.0.20");
+        let tls = delta.clusters[0].tls.as_ref().unwrap();
+        assert_eq!(tls.sni.as_deref(), Some("orders.app.svc.cluster.local"));
         assert_eq!(tls.mode, UpstreamTlsMode::DubboMutual);
         assert_eq!(tls.certificate_provider.as_deref(), Some("workload"));
         assert_eq!(tls.validation_provider.as_deref(), Some("roots"));
         assert_eq!(tls.alpn_protocols, ["h2"]);
+
+        // Everything the projection produced is now attributed to this source,
+        // which is what lets the next update express a removal.
+        let republished = state.config_delta("v1");
+        assert!(republished.removes.is_empty());
+        assert_eq!(republished.listeners.len(), 1);
+    }
+
+    #[test]
+    fn a_reconnect_re_requests_the_derived_subscriptions() {
+        let mut state = AdsState::default();
+        state.begin_stream(vec![]);
+        state
+            .apply_delta(
+                CLUSTER_TYPE,
+                &[(
+                    "orders".to_string(),
+                    "1".to_string(),
+                    any(
+                        CLUSTER_TYPE,
+                        xds_cluster::Cluster {
+                            name: "orders".into(),
+                            ..xds_cluster::Cluster::default()
+                        },
+                    ),
+                )],
+                &[],
+            )
+            .unwrap();
+        let changes = state.refresh_subscriptions();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].type_url, ENDPOINT_TYPE);
+        // Steady state: nothing to change.
+        assert!(state.refresh_subscriptions().is_empty());
+
+        // The stream drops and comes back. The desired set is identical, but the
+        // server has no memory of it, so it must be sent again.
+        state.begin_stream(vec![]);
+        let changes = state.refresh_subscriptions();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].type_url, ENDPOINT_TYPE);
+        assert_eq!(changes[0].subscribe, ["orders"]);
+        // Cached versions survive so the delta stream can skip unchanged resources.
+        assert_eq!(
+            state.initial_resource_versions(CLUSTER_TYPE),
+            BTreeMap::from([("orders".to_string(), "1".to_string())])
+        );
+    }
+
+    #[test]
+    fn delta_removals_retire_the_derived_resources() {
+        let mut state = AdsState::default();
+        let cluster = |name: &str| xds_cluster::Cluster {
+            name: name.into(),
+            ..xds_cluster::Cluster::default()
+        };
+
+        state
+            .apply_delta(
+                CLUSTER_TYPE,
+                &[
+                    (
+                        "orders".to_string(),
+                        "1".to_string(),
+                        any(CLUSTER_TYPE, cluster("orders")),
+                    ),
+                    (
+                        "ratings".to_string(),
+                        "1".to_string(),
+                        any(CLUSTER_TYPE, cluster("ratings")),
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+        let delta = state.config_delta("v1");
+        assert_eq!(delta.clusters.len(), 2);
+        assert!(delta.removes.is_empty());
+
+        // A reconnect replays exactly the versions the server acknowledged.
+        assert_eq!(
+            state.initial_resource_versions(CLUSTER_TYPE),
+            BTreeMap::from([
+                ("orders".to_string(), "1".to_string()),
+                ("ratings".to_string(), "1".to_string()),
+            ])
+        );
+
+        state
+            .apply_delta(CLUSTER_TYPE, &[], &["ratings".to_string()])
+            .unwrap();
+        let delta = state.config_delta("v2");
+        assert_eq!(delta.clusters.len(), 1);
+        assert_eq!(delta.clusters[0].name, "orders");
+        assert_eq!(
+            delta.removes,
+            vec![ResourceKey::new(ResourceKind::Cluster, "ratings")]
+        );
+        assert!(!state
+            .initial_resource_versions(CLUSTER_TYPE)
+            .contains_key("ratings"));
+    }
+
+    #[test]
+    fn delta_endpoint_updates_do_not_disturb_other_clusters() {
+        let mut state = AdsState::default();
+        for name in ["orders", "ratings"] {
+            state
+                .apply_delta(
+                    CLUSTER_TYPE,
+                    &[(
+                        name.to_string(),
+                        "1".to_string(),
+                        any(
+                            CLUSTER_TYPE,
+                            xds_cluster::Cluster {
+                                name: name.into(),
+                                ..xds_cluster::Cluster::default()
+                            },
+                        ),
+                    )],
+                    &[],
+                )
+                .unwrap();
+        }
+        state
+            .apply_delta(
+                ENDPOINT_TYPE,
+                &[(
+                    "orders".to_string(),
+                    "1".to_string(),
+                    any(
+                        ENDPOINT_TYPE,
+                        xds_endpoint::ClusterLoadAssignment {
+                            cluster_name: "orders".into(),
+                            endpoints: vec![xds_endpoint::LocalityLbEndpoints {
+                                lb_endpoints: vec![lb_endpoint(
+                                    "10.244.0.20",
+                                    8080,
+                                    xds_core::HealthStatus::Healthy,
+                                )],
+                                ..xds_endpoint::LocalityLbEndpoints::default()
+                            }],
+                        },
+                    ),
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let delta = state.config_delta("v1");
+        let orders = delta
+            .clusters
+            .iter()
+            .find(|cluster| cluster.name == "orders")
+            .unwrap();
+        let ratings = delta
+            .clusters
+            .iter()
+            .find(|cluster| cluster.name == "ratings")
+            .unwrap();
+        assert_eq!(orders.endpoints.len(), 1);
+        assert!(ratings.endpoints.is_empty());
     }
 
     #[test]

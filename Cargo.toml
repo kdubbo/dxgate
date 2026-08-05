@@ -25,7 +25,7 @@ hyper-rustls = { version = "0.24", default-features = false, features = ["http1"
 futures-util = "0.3"
 jsonwebtoken = "9"
 k8s-openapi = { version = "0.22", features = ["v1_29"] }
-kube = { version = "0.91", default-features = false, features = ["client", "derive", "rustls-tls"] }
+kube = { version = "0.91", default-features = false, features = ["client", "derive", "runtime", "rustls-tls"] }
 opentelemetry = "0.23"
 opentelemetry-otlp = { version = "0.16", features = ["tonic"] }
 opentelemetry_sdk = { version = "0.23", features = ["rt-tokio"] }

@@ -150,11 +150,8 @@ async fn spawn_version_echo_server() -> TestServer {
 }
 
 async fn spawn_proxy(upstream: SocketAddr, http2: bool) -> TestServer {
-    let state = ProxyState::new(RuntimeConfig::empty("bootstrap"));
-    state
-        .apply_config(runtime_config(upstream, http2))
-        .await
-        .unwrap();
+    let state = ProxyState::new();
+    state.apply_config(runtime_config(upstream, http2)).unwrap();
     let addr = unused_addr();
     let task = tokio::spawn(async move {
         ProxyServer::new(state).serve(addr).await.unwrap();
