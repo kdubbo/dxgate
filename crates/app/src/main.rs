@@ -1,8 +1,8 @@
 use clap::{Parser, ValueEnum};
-use dxgate_admin::AdminServer;
 use dxgate_controller::{crds, run_controller};
 use dxgate_core::{RouterIdentity, RuntimeConfig, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
 use dxgate_proxy::{ProxyServer, ProxyState};
+use dxgate_ui::UiServer;
 use dxgate_xds::{
     BootstrapConfig, RuntimeConfigSource, StaticConfigFile, XdsClient, XdsClientConfig,
 };
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -40,8 +40,13 @@ struct Args {
     #[arg(long, env = "DXGATE_HTTP_ADDR", default_value = "0.0.0.0:80")]
     http_addr: SocketAddr,
 
-    #[arg(long, env = "DXGATE_ADMIN_ADDR", default_value = "0.0.0.0:15021")]
-    admin_addr: SocketAddr,
+    #[arg(long, env = "DXGATE_UI_ADDR", default_value = "0.0.0.0:15021")]
+    ui_addr: SocketAddr,
+
+    // Should be <= the pod's terminationGracePeriodSeconds, or Kubernetes SIGKILLs
+    // the process mid-drain and the graceful shutdown buys nothing.
+    #[arg(long, env = "DXGATE_DRAIN_TIMEOUT_SECONDS", default_value_t = 30)]
+    drain_timeout_seconds: u64,
 
     #[arg(long, env = "DXGATE_STATIC_CONFIG")]
     static_config: Option<PathBuf>,
@@ -191,20 +196,39 @@ async fn main() -> std::io::Result<()> {
     }
 
     if matches!(args.mode, DxgateMode::Controller) {
-        tokio::signal::ctrl_c().await?;
+        termination_signal().await;
         info!("received shutdown signal");
         return Ok(());
     }
 
     let proxy = ProxyServer::new(state.clone());
-    let admin = AdminServer::new(state, args.http_addr);
-    let proxy_task = tokio::spawn(proxy.serve(args.http_addr));
-    let admin_task = tokio::spawn(admin.serve(args.admin_addr));
+    let ui = UiServer::new(state, args.http_addr);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut proxy_task = tokio::spawn(
+        proxy.serve_with_shutdown(args.http_addr, shutdown_requested(shutdown_rx.clone())),
+    );
+    let mut ui_task =
+        tokio::spawn(ui.serve_with_shutdown(args.ui_addr, shutdown_requested(shutdown_rx)));
 
     tokio::select! {
-        result = proxy_task => result.unwrap_or_else(|err| Err(std::io::Error::other(err)))?,
-        result = admin_task => result.unwrap_or_else(|err| Err(std::io::Error::other(err)))?,
-        _ = tokio::signal::ctrl_c() => info!("received shutdown signal"),
+        result = &mut proxy_task => result.unwrap_or_else(|err| Err(std::io::Error::other(err)))?,
+        result = &mut ui_task => result.unwrap_or_else(|err| Err(std::io::Error::other(err)))?,
+        _ = termination_signal() => {
+            let drain = Duration::from_secs(args.drain_timeout_seconds);
+            info!(drain_timeout = ?drain, "received shutdown signal, draining in-flight requests");
+            // Both listeners stop accepting; in-flight requests get until the drain
+            // timeout to finish, after which the process exits regardless so a stuck
+            // upstream cannot outlive the pod's termination grace period.
+            let _ = shutdown_tx.send(true);
+            if time::timeout(drain, async {
+                let _ = tokio::join!(&mut proxy_task, &mut ui_task);
+            })
+            .await
+            .is_err()
+            {
+                warn!("drain timeout elapsed with requests still in flight");
+            }
+        }
     }
 
     if otel_enabled {
@@ -212,6 +236,41 @@ async fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves on SIGTERM (what Kubernetes sends first) or SIGINT (Ctrl-C).
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(err) => {
+                error!(%err, "failed installing SIGTERM handler; falling back to SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn shutdown_requested(mut rx: watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn print_crds() -> std::io::Result<()> {
@@ -332,8 +391,8 @@ fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {
     if let Some(value) = bootstrap.http_addr {
         args.http_addr = value;
     }
-    if let Some(value) = bootstrap.admin_addr {
-        args.admin_addr = value;
+    if let Some(value) = bootstrap.ui_addr {
+        args.ui_addr = value;
     }
     if !bootstrap.listener_names.is_empty() {
         args.listener_names = bootstrap.listener_names;
@@ -376,7 +435,8 @@ mod tests {
             xds_address: "http://old:15012".to_string(),
             xds_enabled: None,
             http_addr: "0.0.0.0:80".parse().unwrap(),
-            admin_addr: "0.0.0.0:15021".parse().unwrap(),
+            ui_addr: "0.0.0.0:15021".parse().unwrap(),
+            drain_timeout_seconds: 30,
             static_config: None,
             config_watch: false,
             bootstrap: Some(PathBuf::from("/etc/dxgate/bootstrap.json")),

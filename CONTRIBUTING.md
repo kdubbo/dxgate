@@ -5,7 +5,7 @@ and the checks your change must pass before it can be merged.
 
 ## Prerequisites
 
-- Rust `1.76+` (the pinned toolchain is in `toolchain.toml`; `rustup` picks it up
+- Rust `1.85+` (the pinned toolchain is in `toolchain.toml`; `rustup` picks it up
   automatically).
 - `protobuf-compiler` (`protoc`) — required to build the `xds` crate.
 
@@ -34,6 +34,15 @@ cargo test --workspace           # unit + integration tests
 cargo deny check                 # license + advisory + source gating (cargo install cargo-deny)
 ```
 
+The `performance` and `sla` tests are `#[ignore]`d because their real budgets
+depend on the machine. CI runs them with loose thresholds to catch
+order-of-magnitude regressions; reproduce that gate, or tighten it locally, with:
+
+```bash
+DXGATE_PERF_MIN_RPS=50 DXGATE_SLA_P95_MS=750 \
+  cargo test --release -p dxgate-proxy --test performance --test sla -- --ignored
+```
+
 ## Pull Requests
 
 - Keep changes focused; one logical change per PR.
@@ -55,5 +64,5 @@ clusters"). Reference issues where relevant.
 | `xds` | xDS client and generated protobuf types |
 | `proxy` | Data-plane: routing, TLS, LLM/MCP/A2A, policies |
 | `controller` | Kubernetes CRD controller |
-| `admin` | Admin UI / API |
+| `ui` | Web UI / API |
 | `app` | Binary entrypoint wiring the runtime together |

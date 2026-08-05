@@ -8,6 +8,7 @@ use dxgate_proxy::{
     Readiness, RouteMetric,
 };
 use serde::Serialize;
+use std::future::Future;
 use std::net::SocketAddr;
 
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -19,13 +20,13 @@ pub struct BuildInfo {
 }
 
 #[derive(Clone)]
-pub struct AdminServer {
+pub struct UiServer {
     state: ProxyState,
     build: BuildInfo,
     proxy_port: u16,
 }
 
-impl AdminServer {
+impl UiServer {
     pub fn new(state: ProxyState, proxy_addr: SocketAddr) -> Self {
         Self {
             state,
@@ -38,9 +39,20 @@ impl AdminServer {
     }
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
+        self.serve_with_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serves until `shutdown` resolves, then stops accepting and lets in-flight
+    /// requests finish before returning.
+    pub async fn serve_with_shutdown(
+        self,
+        addr: SocketAddr,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
         let app = Router::new()
-            .route("/", get(admin_ui))
-            .route("/ui", get(admin_ui))
+            .route("/", get(ui_page))
+            .route("/ui", get(ui_page))
             .route("/assets/dxgate-logo.svg", get(logo_svg))
             .route("/healthz", get(healthz))
             .route("/readyz", get(readyz))
@@ -54,13 +66,14 @@ impl AdminServer {
 
         axum::Server::bind(&addr)
             .serve(app.into_make_service())
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(std::io::Error::other)
     }
 }
 
-async fn admin_ui(State(admin): State<AdminServer>) -> Html<String> {
-    Html(admin_html(admin.proxy_port))
+async fn ui_page(State(ui): State<UiServer>) -> Html<String> {
+    Html(ui_html(ui.proxy_port))
 }
 
 async fn logo_svg() -> Response {
@@ -71,12 +84,12 @@ async fn logo_svg() -> Response {
         .into_response()
 }
 
-async fn healthz(State(admin): State<AdminServer>) -> Json<BuildInfo> {
-    Json(admin.build)
+async fn healthz(State(ui): State<UiServer>) -> Json<BuildInfo> {
+    Json(ui.build)
 }
 
-async fn readyz(State(admin): State<AdminServer>) -> Response {
-    let readiness = admin.state.readiness().await;
+async fn readyz(State(ui): State<UiServer>) -> Response {
+    let readiness = ui.state.readiness().await;
     let status = if readiness.ready {
         StatusCode::OK
     } else {
@@ -85,9 +98,9 @@ async fn readyz(State(admin): State<AdminServer>) -> Response {
     (status, Json(readiness)).into_response()
 }
 
-async fn metrics(State(admin): State<AdminServer>) -> Response {
-    let readiness = admin.state.readiness().await;
-    let proxy = admin.state.metrics();
+async fn metrics(State(ui): State<UiServer>) -> Response {
+    let readiness = ui.state.readiness().await;
+    let proxy = ui.state.metrics();
     (
         [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         prometheus_metrics(readiness, proxy),
@@ -308,12 +321,12 @@ fn prometheus_label_value(value: &str) -> String {
         .replace('"', "\\\"")
 }
 
-async fn debug_config(State(admin): State<AdminServer>) -> Json<dxgate_core::RuntimeConfig> {
-    Json(admin.state.config().await)
+async fn debug_config(State(ui): State<UiServer>) -> Json<dxgate_core::RuntimeConfig> {
+    Json(ui.state.config().await)
 }
 
-async fn debug_routes(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
-    let cfg = admin.state.config().await;
+async fn debug_routes(State(ui): State<UiServer>) -> Json<serde_json::Value> {
+    let cfg = ui.state.config().await;
     let routes: Vec<_> = cfg
         .listeners
         .iter()
@@ -334,13 +347,13 @@ async fn debug_routes(State(admin): State<AdminServer>) -> Json<serde_json::Valu
     Json(serde_json::json!(routes))
 }
 
-async fn debug_clusters(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
-    let cfg = admin.state.config().await;
+async fn debug_clusters(State(ui): State<UiServer>) -> Json<serde_json::Value> {
+    let cfg = ui.state.config().await;
     Json(serde_json::json!(cfg.clusters))
 }
 
-async fn debug_backends(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
-    let cfg = admin.state.config().await;
+async fn debug_backends(State(ui): State<UiServer>) -> Json<serde_json::Value> {
+    let cfg = ui.state.config().await;
     Json(serde_json::json!({
         "providers": cfg.providers,
         "backends": cfg.backends,
@@ -348,28 +361,28 @@ async fn debug_backends(State(admin): State<AdminServer>) -> Json<serde_json::Va
     }))
 }
 
-async fn debug_policies(State(admin): State<AdminServer>) -> Json<serde_json::Value> {
-    let cfg = admin.state.config().await;
+async fn debug_policies(State(ui): State<UiServer>) -> Json<serde_json::Value> {
+    let cfg = ui.state.config().await;
     Json(serde_json::json!(cfg.policies))
 }
 
-fn admin_html(proxy_port: u16) -> String {
-    ADMIN_HTML.replace("__DXGATE_PROXY_PORT__", &proxy_port.to_string())
+fn ui_html(proxy_port: u16) -> String {
+    UI_HTML.replace("__DXGATE_PROXY_PORT__", &proxy_port.to_string())
 }
 
-const ADMIN_HTML: &str = include_str!("../../../ui/admin.html");
+const UI_HTML: &str = include_str!("../../../ui/ui.html");
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_html, prometheus_metrics};
+    use super::{prometheus_metrics, ui_html};
     use dxgate_proxy::{
         A2aMethodMetric, HttpRouteMetric, LatencyBucket, LlmUsageMetric, McpToolMetric,
         ProxyMetrics, Readiness,
     };
 
     #[test]
-    fn admin_ui_contains_runtime_panels() {
-        let html = admin_html(18080);
+    fn ui_page_contains_runtime_panels() {
+        let html = ui_html(18080);
 
         assert!(html.contains("Overview"));
         assert!(html.contains("/debug/config"));
@@ -386,7 +399,7 @@ mod tests {
         assert!(html.contains("cfgList('clusters')"));
         assert!(!html.contains("class=\"mark\""));
         assert!(!html.contains("<strong>dxgate</strong>"));
-        assert!(!html.contains("<span>admin</span>"));
+        assert!(!html.contains("<span>ui</span>"));
         assert!(!html.contains("id=\"statusline\""));
         assert!(!html.contains("id=\"source-line\""));
         assert!(!html.contains("class=\"pill"));

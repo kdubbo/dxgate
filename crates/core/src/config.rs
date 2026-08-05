@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 pub const HTTP_LISTENER_PORT: u16 = 80;
 pub const HTTPS_LISTENER_PORT: u16 = 443;
-pub const ADMIN_PORT: u16 = 15021;
+pub const UI_PORT: u16 = 15021;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -436,6 +436,13 @@ pub struct UpstreamTls {
     pub validation_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn_protocols: Vec<String>,
+    // Peer identities accepted from the upstream certificate (typically SPIFFE URIs
+    // such as `spiffe://cluster.local/ns/app/sa/orders`). Chain verification alone
+    // only proves the peer holds *a* cert from the trust domain's CA; matching a SAN
+    // is what proves it is the workload we intended to reach. Empty means unverified
+    // peer identity, which the verifier warns about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_alt_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -984,16 +991,16 @@ mod tests {
                     domains: vec!["*.example.com".into()],
                     routes: vec![
                         Route {
-                            name: "admin".into(),
+                            name: "ui".into(),
                             matches: vec![RouteMatch {
-                                path: PathMatch::Exact("/admin".into()),
+                                path: PathMatch::Exact("/ui".into()),
                                 headers: vec![HeaderMatch {
                                     name: "x-env".into(),
                                     value: "prod".into(),
                                 }],
                             }],
                             weighted_clusters: vec![WeightedCluster {
-                                name: "admin".into(),
+                                name: "ui".into(),
                                 weight: 100,
                             }],
                         },
@@ -1014,7 +1021,7 @@ mod tests {
             }],
             clusters: vec![
                 Cluster {
-                    name: "admin".into(),
+                    name: "ui".into(),
                     endpoints: vec![],
                     http2: false,
                     tls: None,
@@ -1043,12 +1050,12 @@ mod tests {
                 HTTP_LISTENER_PORT,
                 &MatchInput {
                     host: "api.example.com",
-                    path: "/admin",
+                    path: "/ui",
                     headers: &headers,
                 },
             )
             .unwrap();
-        assert_eq!(route.name, "admin");
+        assert_eq!(route.name, "ui");
 
         let route = cfg
             .route_for(

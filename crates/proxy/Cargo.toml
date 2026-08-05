@@ -17,6 +17,7 @@ jsonwebtoken.workspace = true
 opentelemetry.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+x509-parser.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

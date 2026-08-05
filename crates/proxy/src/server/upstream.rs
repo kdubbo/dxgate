@@ -15,9 +15,11 @@ use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::SystemTime;
 use tracing::{info, warn};
+use x509_parser::extensions::GeneralName;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 type PlainClient = Client<HttpConnector, Body>;
 type WebClient = Client<HttpsConnector<HttpConnector>, Body>;
@@ -206,6 +208,8 @@ impl MtlsClientPool {
         let roots = load_roots(ca_file)?;
         let verifier = Arc::new(SpiffeCompatibleVerifier {
             inner: WebPkiVerifier::new(roots, None),
+            allowed_sans: tls.subject_alt_names.clone(),
+            warned_unpinned: Once::new(),
         });
         ClientConfig::builder()
             .with_safe_defaults()
@@ -257,12 +261,15 @@ impl FileWatcherConfig {
 }
 
 pub(super) fn mtls_cache_key(tls: &UpstreamTls) -> String {
+    // subject_alt_names is part of the key: it selects the verifier baked into the
+    // cached client, so clusters pinning different peer identities must not share one.
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         tls.sni.as_deref().unwrap_or_default(),
         tls.certificate_provider.as_deref().unwrap_or("default"),
         tls.validation_provider.as_deref().unwrap_or("default"),
-        tls.alpn_protocols.join(",")
+        tls.alpn_protocols.join(","),
+        tls.subject_alt_names.join(",")
     )
 }
 
@@ -333,11 +340,40 @@ fn load_private_keys(path: &Path, format: KeyFormat) -> Result<Vec<Vec<u8>>, Str
 
 struct SpiffeCompatibleVerifier {
     inner: WebPkiVerifier,
+    // Accepted peer identities from the cluster's validation context. Empty disables
+    // identity pinning: the chain is still verified, but any workload holding a cert
+    // from the same trust domain is accepted.
+    allowed_sans: Vec<String>,
+    warned_unpinned: Once,
 }
 
 impl std::fmt::Debug for SpiffeCompatibleVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpiffeCompatibleVerifier").finish()
+        f.debug_struct("SpiffeCompatibleVerifier")
+            .field("allowed_sans", &self.allowed_sans)
+            .finish()
+    }
+}
+
+impl SpiffeCompatibleVerifier {
+    fn verify_peer_identity(&self, end_entity: &Certificate) -> Result<(), rustls::Error> {
+        let presented = peer_identities(&end_entity.0).map_err(|err| {
+            rustls::Error::General(format!("parse upstream certificate identities: {err}"))
+        })?;
+        if presented
+            .iter()
+            .any(|name| self.allowed_sans.iter().any(|allowed| allowed == name))
+        {
+            return Ok(());
+        }
+        warn!(
+            expected = ?self.allowed_sans,
+            presented = ?presented,
+            "upstream certificate identity rejected"
+        );
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
     }
 }
 
@@ -359,11 +395,45 @@ impl ServerCertVerifier for SpiffeCompatibleVerifier {
             ocsp_response,
             now,
         ) {
-            Ok(verified) => Ok(verified),
+            Ok(_) => {}
+            // SPIFFE leaf certs identify the workload with a URI SAN and carry no DNS
+            // SAN, so webpki's SNI match always fails. Tolerating that is only sound
+            // because `allowed_sans` re-asserts the identity below; without it the
+            // trust domain's CA is the only thing standing between us and any peer.
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
-                Ok(ServerCertVerified::assertion())
+                if self.allowed_sans.is_empty() {
+                    self.warned_unpinned.call_once(|| {
+                        warn!(
+                            "upstream certificate name does not match SNI and no subject_alt_names \
+                             are configured: peer identity is unverified, any certificate issued \
+                             by the trusted CA is accepted"
+                        );
+                    });
+                }
             }
-            Err(err) => Err(err),
+            Err(err) => return Err(err),
         }
+        if !self.allowed_sans.is_empty() {
+            self.verify_peer_identity(end_entity)?;
+        }
+        Ok(ServerCertVerified::assertion())
     }
+}
+
+/// URI and DNS subject alternative names presented by a peer certificate.
+fn peer_identities(der: &[u8]) -> Result<Vec<String>, String> {
+    let (_, cert) = X509Certificate::from_der(der).map_err(|e| e.to_string())?;
+    let Some(san) = cert.subject_alternative_name().map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    Ok(san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some((*uri).to_string()),
+            GeneralName::DNSName(dns) => Some((*dns).to_string()),
+            _ => None,
+        })
+        .collect())
 }

@@ -18,6 +18,7 @@ use opentelemetry::trace::TraceContextExt;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::env;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::time;
@@ -77,9 +78,21 @@ impl ProxyServer {
     }
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
+        self.serve_with_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serves until `shutdown` resolves, then stops accepting and lets in-flight
+    /// requests finish before returning.
+    pub async fn serve_with_shutdown(
+        self,
+        addr: SocketAddr,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
         let app = Router::new().fallback(any(proxy_request)).with_state(self);
         axum::Server::bind(&addr)
             .serve(app.into_make_service())
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(std::io::Error::other)
     }
@@ -255,7 +268,11 @@ async fn forward_http(
     record_http_span(&server, &route_name, "none", "none", 0, 0);
     let weighted_clusters = route.weighted_clusters.clone();
 
-    let weighted = match server.state.pick_cluster(&weighted_clusters).await {
+    let weighted = match server
+        .state
+        .pick_cluster(&route_name, &weighted_clusters)
+        .await
+    {
         Some(weighted) => weighted,
         None => {
             record_http_observation(
@@ -302,11 +319,7 @@ async fn forward_http(
     };
     let cluster_name = cluster.name.clone();
 
-    let endpoint = match server
-        .state
-        .pick_endpoint(&cluster_name, &cluster.endpoints)
-        .await
-    {
+    let endpoint = match server.state.pick_endpoint(&cluster).await {
         Ok(endpoint) => endpoint,
         Err(err) => {
             record_http_observation(
@@ -417,6 +430,11 @@ async fn forward_http(
         .as_ref()
         .map(|response| response.status().as_u16())
         .unwrap_or_else(|(status, _)| status.as_u16());
+    // Feeds the cluster's outlier detector so a persistently failing endpoint stops
+    // being picked; connect failures surface here as the 502 the client would see.
+    server
+        .state
+        .record_endpoint_result(&cluster, endpoint, status);
     record_http_observation(
         &server,
         HttpObservation {
@@ -587,7 +605,7 @@ async fn forward_agent(
     } else {
         server
             .state
-            .pick_backend(&eligible)
+            .pick_backend(&route.name, &eligible)
             .await
             .cloned()
             .unwrap_or_else(|| eligible[0].clone())
@@ -1267,7 +1285,7 @@ mod tests {
     use hyper::body;
     use rcgen::{
         BasicConstraints, Certificate as RcgenCertificate, CertificateParams, DistinguishedName,
-        DnType, IsCa,
+        DnType, IsCa, SanType,
     };
     use rustls::{Certificate, PrivateKey, RootCertStore};
     use std::fs;
@@ -1436,6 +1454,7 @@ mod tests {
                     certificate_provider: None,
                     validation_provider: None,
                     alpn_protocols: vec!["h2".into()],
+                    subject_alt_names: vec![],
                 },
                 false,
             )
@@ -1460,11 +1479,12 @@ mod tests {
             certificate_provider: Some("workload".into()),
             validation_provider: Some("roots".into()),
             alpn_protocols: vec!["h2".into(), "http/1.1".into()],
+            subject_alt_names: vec!["spiffe://cluster.local/ns/app/sa/nginx".into()],
         };
 
         assert_eq!(
             mtls_cache_key(&tls),
-            "nginx.app.svc.cluster.local|workload|roots|h2,http/1.1"
+            "nginx.app.svc.cluster.local|workload|roots|h2,http/1.1|spiffe://cluster.local/ns/app/sa/nginx"
         );
     }
 
@@ -1476,6 +1496,7 @@ mod tests {
             certificate_provider: None,
             validation_provider: None,
             alpn_protocols: vec![],
+            subject_alt_names: vec![],
         };
         let mutual = UpstreamTls {
             mode: UpstreamTlsMode::DubboMutual,
@@ -1483,6 +1504,7 @@ mod tests {
             certificate_provider: None,
             validation_provider: None,
             alpn_protocols: vec![],
+            subject_alt_names: vec![],
         };
 
         assert_eq!(upstream_request_mode(None), UpstreamRequestMode::PlainHttp);
@@ -1580,6 +1602,156 @@ mod tests {
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(DnType::CommonName, dns_name);
         RcgenCertificate::from_params(params).unwrap()
+    }
+
+    /// A workload cert shaped like the ones a SPIFFE control plane issues: a URI SAN
+    /// carrying the identity and no DNS SAN, so SNI matching cannot succeed.
+    fn spiffe_cert(uri: &str) -> RcgenCertificate {
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::URI(uri.into())];
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, "spiffe");
+        RcgenCertificate::from_params(params).unwrap()
+    }
+
+    /// Writes the gRPC xDS bootstrap the mTLS pool reads, returning its path.
+    fn write_bootstrap(dir: &Path, ca: &RcgenCertificate, client: &RcgenCertificate) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let cert_chain = dir.join("cert-chain.pem");
+        let key = dir.join("key.pem");
+        let root = dir.join("root-cert.pem");
+        let bootstrap = dir.join("grpc-bootstrap.json");
+        fs::write(&cert_chain, client.serialize_pem_with_signer(ca).unwrap()).unwrap();
+        fs::write(&key, client.serialize_private_key_pem()).unwrap();
+        fs::write(&root, ca.serialize_pem().unwrap()).unwrap();
+        fs::write(
+            &bootstrap,
+            serde_json::json!({
+                "certificate_providers": {
+                    "default": {
+                        "plugin_name": "file_watcher",
+                        "config": {
+                            "certificate_file": cert_chain,
+                            "private_key_file": key,
+                            "ca_certificate_file": root
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        bootstrap
+    }
+
+    /// Accepts exactly one TLS connection and answers any request with 200 "ok".
+    async fn spawn_tls_server(ca: &RcgenCertificate, cert: &RcgenCertificate) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(ca, cert)));
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            // A rejected peer aborts the handshake; that is the assertion, not a failure.
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 256];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+        });
+        addr
+    }
+
+    fn spiffe_tls(subject_alt_names: Vec<String>) -> UpstreamTls {
+        UpstreamTls {
+            mode: UpstreamTlsMode::DubboMutual,
+            sni: Some("nginx.app.svc.cluster.local".into()),
+            certificate_provider: None,
+            validation_provider: None,
+            alpn_protocols: vec![],
+            subject_alt_names,
+        }
+    }
+
+    #[tokio::test]
+    async fn mtls_accepts_upstream_matching_configured_spiffe_identity() {
+        let ca = test_ca();
+        let dir = temp_dir("dxgate-mtls-san-ok");
+        let bootstrap = write_bootstrap(
+            &dir,
+            &ca,
+            &spiffe_cert("spiffe://cluster.local/ns/default/sa/dxgate"),
+        );
+        let addr =
+            spawn_tls_server(&ca, &spiffe_cert("spiffe://cluster.local/ns/app/sa/orders")).await;
+
+        let pool = MtlsClientPool::from_bootstrap(bootstrap.to_str().unwrap()).unwrap();
+        let client = pool
+            .client_for(
+                &spiffe_tls(vec!["spiffe://cluster.local/ns/app/sa/orders".into()]),
+                false,
+            )
+            .unwrap();
+        let uri = format!("https://127.0.0.1:{}/", addr.port())
+            .parse()
+            .unwrap();
+
+        let response = client.get(uri).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn mtls_rejects_upstream_whose_spiffe_identity_is_not_allowed() {
+        let ca = test_ca();
+        let dir = temp_dir("dxgate-mtls-san-bad");
+        let bootstrap = write_bootstrap(
+            &dir,
+            &ca,
+            &spiffe_cert("spiffe://cluster.local/ns/default/sa/dxgate"),
+        );
+        // The upstream holds a valid cert from the same CA, just not the identity the
+        // route pinned. Chain verification alone would have accepted it.
+        let addr = spawn_tls_server(
+            &ca,
+            &spiffe_cert("spiffe://cluster.local/ns/app/sa/attacker"),
+        )
+        .await;
+
+        let pool = MtlsClientPool::from_bootstrap(bootstrap.to_str().unwrap()).unwrap();
+        let client = pool
+            .client_for(
+                &spiffe_tls(vec!["spiffe://cluster.local/ns/app/sa/orders".into()]),
+                false,
+            )
+            .unwrap();
+        let uri = format!("https://127.0.0.1:{}/", addr.port())
+            .parse()
+            .unwrap();
+
+        assert!(
+            client.get(uri).await.is_err(),
+            "handshake must fail when the peer's SPIFFE identity is not in subject_alt_names"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn server_config(

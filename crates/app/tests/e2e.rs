@@ -1,8 +1,7 @@
-//! End-to-end tests that drive a real dxgate proxy (and admin server) over
+//! End-to-end tests that drive a real dxgate proxy (and ui server) over
 //! loopback TCP against mock upstreams: route matching, policy enforcement,
 //! body limits, and streaming pass-through.
 
-use dxgate_admin::AdminServer;
 use dxgate_core::{
     AgentProtocol, AgentRoute, AgentRouteMatch, AuthPolicy, Backend, BackendKind, Cluster,
     Endpoint, HeaderTransform, Listener, ListenerProtocol, PathMatch, Policy, PolicyAction,
@@ -10,6 +9,7 @@ use dxgate_core::{
     WeightedBackend, WeightedCluster,
 };
 use dxgate_proxy::{ProxyServer, ProxyState};
+use dxgate_ui::UiServer;
 use hyper::body::HttpBody;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
@@ -293,13 +293,13 @@ fn mcp_config(upstream: SocketAddr) -> RuntimeConfig {
 }
 
 #[tokio::test]
-async fn http_route_proxies_to_upstream_and_reports_admin_state() {
+async fn http_route_proxies_to_upstream_and_reports_ui_state() {
     let upstream = spawn_upstream(Arc::new(Notify::new())).await;
     let (proxy_addr, state) = spawn_proxy(base_config(upstream)).await;
 
-    let admin_addr = reserve_port();
-    tokio::spawn(AdminServer::new(state, proxy_addr).serve(admin_addr));
-    wait_until_accepting(admin_addr).await;
+    let ui_addr = reserve_port();
+    tokio::spawn(UiServer::new(state, proxy_addr).serve(ui_addr));
+    wait_until_accepting(ui_addr).await;
 
     let client = Client::new();
     let response = client
@@ -311,13 +311,13 @@ async fn http_route_proxies_to_upstream_and_reports_admin_state() {
     assert_eq!(&bytes[..], b"hello from upstream");
 
     let readyz = client
-        .get(format!("http://{admin_addr}/readyz").parse().unwrap())
+        .get(format!("http://{ui_addr}/readyz").parse().unwrap())
         .await
         .unwrap();
     assert_eq!(readyz.status(), StatusCode::OK);
 
     let metrics = client
-        .get(format!("http://{admin_addr}/metrics").parse().unwrap())
+        .get(format!("http://{ui_addr}/metrics").parse().unwrap())
         .await
         .unwrap();
     assert_eq!(metrics.status(), StatusCode::OK);

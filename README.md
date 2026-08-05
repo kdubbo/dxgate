@@ -16,13 +16,13 @@ It also ships an additional proxy gateway runtime for OpenAI-compatible LLM rout
 
 - **Dubbo Gateway API data plane** — HTTP routing by host, path, and header with weighted clusters, driven by `dubbod` over xDS (listeners, clusters, endpoints, TLS secrets).
 - **gRPC / Dubbo Triple / HTTP/2** — end-to-end HTTP/2 pass-through with streaming bodies and trailer propagation; gRPC and Triple requests (detected by content-type) are proxied over HTTP/2 automatically, and `http2: true` on a cluster forces h2c/ALPN h2 for plain HTTP upstreams.
-- **Upstream TLS** — plaintext, simple TLS, and Dubbo mutual TLS (certificates via xDS SDS or file-watcher bootstrap).
+- **Upstream TLS** — plaintext, simple TLS, and Dubbo mutual TLS (certificates via xDS SDS or file-watcher bootstrap), with peer identity pinned to the cluster's `subject_alt_names` (SPIFFE URI SANs).
 - **LLM routing** — OpenAI-compatible `/v1/*` routing with model-aware backend selection and streaming (SSE) pass-through.
 - **MCP routing and federation** — `mcp-session-id` session-to-backend binding and federated `tools/list` across multiple MCP backends.
 - **A2A forwarding** — agent-card and A2A endpoint routing.
 - **Reusable policies** — API-key / JWT auth, rate limiting, retries, timeouts, request/response header transforms, body-size limits, allow/deny.
-- **Resilience** — per-cluster circuit breakers and retry with failover across weighted backends.
-- **Observability** — Prometheus metrics, W3C trace propagation with OTLP export, structured access logs, and a built-in admin UI.
+- **Resilience** — per-cluster circuit breakers, consecutive-5xx outlier ejection, and retry with failover across weighted backends; SIGTERM drains in-flight requests before exit.
+- **Observability** — Prometheus metrics, W3C trace propagation with OTLP export, structured access logs, and a built-in web UI.
 - **Three config sources** — xDS from `dubbod` (default), static YAML file (optionally watched), and Kubernetes CRDs (`Dxgate`, `DxgateBackend`, `DxgateRoute`, `DxgatePolicy`).
 
 ## License

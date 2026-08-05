@@ -11,7 +11,7 @@ name = "dxgate"
 path = "src/main.rs"
 
 [dependencies]
-dxgate-admin = { path = "../admin" }
+dxgate-ui = { path = "../ui" }
 dxgate-controller = { path = "../controller" }
 dxgate-core = { path = "../core" }
 dxgate-proxy = { path = "../proxy" }

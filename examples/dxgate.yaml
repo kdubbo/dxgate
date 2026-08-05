@@ -71,6 +71,9 @@ spec:
         app.kubernetes.io/name: dxgate
     spec:
       serviceAccountName: dxgate
+      # Must exceed DXGATE_DRAIN_TIMEOUT_SECONDS, or the kubelet SIGKILLs dxgate
+      # mid-drain and in-flight requests are dropped anyway.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: dxgate
           image: kdubbo/dxgate:latest
@@ -84,8 +87,10 @@ spec:
               value: /etc/dxgate/runtime.yaml
             - name: DXGATE_HTTP_ADDR
               value: 0.0.0.0:8080
-            - name: DXGATE_ADMIN_ADDR
+            - name: DXGATE_UI_ADDR
               value: 0.0.0.0:15021
+            - name: DXGATE_DRAIN_TIMEOUT_SECONDS
+              value: "30"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -105,18 +110,18 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-            - name: admin
+            - name: ui
               containerPort: 15021
           readinessProbe:
             httpGet:
               path: /readyz
-              port: admin
+              port: ui
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
-              port: admin
+              port: ui
             initialDelaySeconds: 10
             periodSeconds: 10
           volumeMounts:
@@ -167,7 +172,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: dxgate-admin
+  name: dxgate-ui
   namespace: dubbo-system
   labels:
     app.kubernetes.io/name: dxgate
@@ -176,6 +181,6 @@ spec:
   selector:
     app.kubernetes.io/name: dxgate
   ports:
-    - name: admin
+    - name: ui
       port: 15021
-      targetPort: admin
+      targetPort: ui

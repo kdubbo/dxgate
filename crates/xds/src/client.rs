@@ -503,7 +503,28 @@ fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamT
         alpn_protocols: common
             .map(|common| common.alpn_protocols.clone())
             .unwrap_or_default(),
+        subject_alt_names: common.map(match_subject_alt_names).unwrap_or_default(),
     })
+}
+
+fn match_subject_alt_names(common: &xds_tls::CommonTlsContext) -> Vec<String> {
+    let Some(xds_tls::common_tls_context::ValidationContextType::CombinedValidationContext(
+        combined,
+    )) = common.validation_context_type.as_ref()
+    else {
+        return Vec::new();
+    };
+    combined
+        .default_validation_context
+        .as_ref()
+        .map(|ctx| {
+            ctx.match_subject_alt_names
+                .iter()
+                .filter(|san| !san.is_empty())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn circuit_breaker_from_cluster(cluster: &xds_cluster::Cluster) -> Option<CircuitBreakerConfig> {
@@ -1016,6 +1037,224 @@ mod tests {
         assert_eq!(tls.sni.as_deref(), Some("httpbin.org"));
         assert_eq!(tls.certificate_provider, None);
         assert_eq!(tls.validation_provider, None);
+    }
+
+    #[test]
+    fn upstream_tls_carries_match_subject_alt_names() {
+        let cluster = tls_cluster(xds_tls::CommonTlsContext {
+            tls_certificate_certificate_provider_instance: Some(
+                xds_tls::common_tls_context::CertificateProviderInstance {
+                    instance_name: "workload".into(),
+                    certificate_name: "default".into(),
+                },
+            ),
+            alpn_protocols: vec![],
+            validation_context_type: Some(
+                xds_tls::common_tls_context::ValidationContextType::CombinedValidationContext(
+                    xds_tls::common_tls_context::CombinedCertificateValidationContext {
+                        validation_context_certificate_provider_instance: Some(
+                            xds_tls::common_tls_context::CertificateProviderInstance {
+                                instance_name: "roots".into(),
+                                certificate_name: "ROOTCA".into(),
+                            },
+                        ),
+                        default_validation_context: Some(xds_tls::CertificateValidationContext {
+                            match_subject_alt_names: vec![
+                                "spiffe://cluster.local/ns/app/sa/orders".into(),
+                                // Empty entries would pin an identity nothing can
+                                // present, silently failing every handshake.
+                                String::new(),
+                            ],
+                            trusted_ca: None,
+                        }),
+                    },
+                ),
+            ),
+        });
+
+        let tls = upstream_tls_from_cluster(&cluster).expect("expected TLS config");
+
+        assert_eq!(
+            tls.subject_alt_names,
+            ["spiffe://cluster.local/ns/app/sa/orders"]
+        );
+    }
+
+    #[test]
+    fn upstream_tls_without_validation_context_has_no_subject_alt_names() {
+        let cluster = tls_cluster(xds_tls::CommonTlsContext::default());
+
+        let tls = upstream_tls_from_cluster(&cluster).expect("expected TLS config");
+
+        assert!(tls.subject_alt_names.is_empty());
+    }
+
+    #[test]
+    fn circuit_breaker_reads_the_first_threshold() {
+        let cluster = xds_cluster::Cluster {
+            name: "outbound|8080||orders.app.svc.cluster.local".into(),
+            circuit_breakers: Some(xds_cluster::cluster::CircuitBreakers {
+                thresholds: vec![xds_cluster::cluster::circuit_breakers::Thresholds {
+                    max_connections: Some(32),
+                    max_pending_requests: Some(64),
+                    max_requests: Some(128),
+                    max_retries: Some(3),
+                    track_remaining: false,
+                }],
+            }),
+            max_requests_per_connection: Some(100),
+            ..xds_cluster::Cluster::default()
+        };
+
+        let breaker = circuit_breaker_from_cluster(&cluster).expect("expected circuit breaker");
+
+        assert_eq!(breaker.max_connections, Some(32));
+        assert_eq!(breaker.http1_max_pending_requests, Some(64));
+        assert_eq!(breaker.http2_max_requests, Some(128));
+        assert_eq!(breaker.max_requests_per_connection, Some(100));
+        assert_eq!(breaker.max_retries, Some(3));
+        // http2_max_requests wins the concurrency limit the proxy actually enforces.
+        assert_eq!(breaker.concurrent_request_limit(), Some(128));
+    }
+
+    #[test]
+    fn circuit_breaker_is_absent_without_thresholds() {
+        let cluster = xds_cluster::Cluster {
+            circuit_breakers: Some(xds_cluster::cluster::CircuitBreakers { thresholds: vec![] }),
+            ..xds_cluster::Cluster::default()
+        };
+
+        assert!(circuit_breaker_from_cluster(&cluster).is_none());
+    }
+
+    #[test]
+    fn outlier_detection_converts_durations() {
+        let cluster = xds_cluster::Cluster {
+            outlier_detection: Some(xds_cluster::cluster::OutlierDetection {
+                consecutive_5xx: Some(3),
+                interval: Some(prost_types::Duration {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                base_ejection_time: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 500_000_000,
+                }),
+                max_ejection_percent: Some(50),
+                min_health_percent: Some(40),
+                ..xds_cluster::cluster::OutlierDetection::default()
+            }),
+            ..xds_cluster::Cluster::default()
+        };
+
+        let outlier = outlier_detection_from_cluster(&cluster).expect("expected outlier detection");
+
+        assert_eq!(outlier.consecutive_5xx_errors, Some(3));
+        assert_eq!(outlier.interval.as_deref(), Some("10s"));
+        // Sub-second windows must survive the round-trip through the string form the
+        // proxy parses back; truncating to "0s" would disable ejection entirely.
+        assert_eq!(outlier.base_ejection_time.as_deref(), Some("0.500000000s"));
+        assert_eq!(outlier.max_ejection_percent, Some(50));
+        assert_eq!(outlier.min_health_percent, Some(40));
+    }
+
+    #[test]
+    fn unhealthy_and_draining_endpoints_are_marked_unhealthy() {
+        let assignment = xds_endpoint::ClusterLoadAssignment {
+            cluster_name: "outbound|8080||orders.app.svc.cluster.local".into(),
+            endpoints: vec![xds_endpoint::LocalityLbEndpoints {
+                lb_endpoints: vec![
+                    lb_endpoint("10.0.0.1", 8080, xds_core::HealthStatus::Healthy),
+                    lb_endpoint("10.0.0.2", 8080, xds_core::HealthStatus::Unhealthy),
+                    lb_endpoint("10.0.0.3", 8080, xds_core::HealthStatus::Draining),
+                    lb_endpoint("10.0.0.4", 8080, xds_core::HealthStatus::Timeout),
+                    // Dubbod omits the status for endpoints it considers healthy.
+                    lb_endpoint("10.0.0.5", 8080, xds_core::HealthStatus::Unknown),
+                ],
+                ..xds_endpoint::LocalityLbEndpoints::default()
+            }],
+        };
+
+        let endpoints = endpoints_from_assignment(&assignment);
+
+        let healthy: Vec<_> = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.healthy)
+            .map(|endpoint| endpoint.address.as_str())
+            .collect();
+        assert_eq!(healthy, ["10.0.0.1", "10.0.0.5"]);
+        // Unhealthy endpoints stay in the config so readiness and debug endpoints can
+        // show them; the picker is what filters them out.
+        assert_eq!(endpoints.len(), 5);
+    }
+
+    #[test]
+    fn route_match_rejects_regex_and_defaults_a_missing_path() {
+        let exact = convert_route_match(&xds_route::RouteMatch {
+            path_specifier: Some(xds_route::route_match::PathSpecifier::Path(
+                "/orders".into(),
+            )),
+            headers: vec![xds_route::HeaderMatcher {
+                name: "x-env".into(),
+                header_match_specifier: Some(
+                    xds_route::header_matcher::HeaderMatchSpecifier::ExactMatch("prod".into()),
+                ),
+            }],
+        })
+        .expect("exact path should convert");
+        assert_eq!(exact.path, PathMatch::Exact("/orders".into()));
+        assert_eq!(exact.headers[0].name, "x-env");
+        assert_eq!(exact.headers[0].value, "prod");
+
+        let defaulted = convert_route_match(&xds_route::RouteMatch {
+            path_specifier: None,
+            headers: vec![],
+        })
+        .expect("missing path specifier should default to a prefix match");
+        assert_eq!(defaulted.path, PathMatch::Prefix("/".into()));
+
+        // dxgate has no regex matcher, so a regex route must be dropped rather than
+        // silently widened into a prefix that matches more traffic than intended.
+        assert!(convert_route_match(&xds_route::RouteMatch {
+            path_specifier: Some(xds_route::route_match::PathSpecifier::SafeRegex(
+                Default::default()
+            )),
+            headers: vec![],
+        })
+        .is_none());
+    }
+
+    fn tls_cluster(common: xds_tls::CommonTlsContext) -> xds_cluster::Cluster {
+        xds_cluster::Cluster {
+            name: "outbound|8080||orders.app.svc.cluster.local".into(),
+            transport_socket: Some(xds_core::TransportSocket {
+                name: "envoy.transport_sockets.tls".into(),
+                config_type: Some(xds_core::transport_socket::ConfigType::TypedConfig(any(
+                    "type.googleapis.com/extensions.transport_sockets.tls.v1.UpstreamTlsContext",
+                    xds_tls::UpstreamTlsContext {
+                        sni: "orders.app.svc.cluster.local".into(),
+                        common_tls_context: Some(common),
+                    },
+                ))),
+            }),
+            ..xds_cluster::Cluster::default()
+        }
+    }
+
+    fn lb_endpoint(
+        address: &str,
+        port: u32,
+        status: xds_core::HealthStatus,
+    ) -> xds_endpoint::LbEndpoint {
+        xds_endpoint::LbEndpoint {
+            host_identifier: Some(xds_endpoint::lb_endpoint::HostIdentifier::Endpoint(
+                xds_endpoint::Endpoint {
+                    address: Some(socket(address, port)),
+                },
+            )),
+            health_status: status as i32,
+            ..xds_endpoint::LbEndpoint::default()
+        }
     }
 
     fn response(type_url: &str, resources: Vec<Any>) -> DiscoveryResponse {

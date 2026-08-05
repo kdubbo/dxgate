@@ -1,10 +1,10 @@
 use dxgate_core::{
-    Cluster, ConfigConflict, DxgateError, Endpoint, RateLimitPolicy, Result, RuntimeConfig,
-    TokenLimitPolicy, WeightedBackend, WeightedCluster,
+    Cluster, ConfigConflict, DxgateError, Endpoint, OutlierDetectionConfig, RateLimitPolicy,
+    Result, RuntimeConfig, TokenLimitPolicy, WeightedBackend, WeightedCluster,
 };
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -20,10 +20,17 @@ struct Inner {
     config: RwLock<RuntimeConfig>,
     conflicts: RwLock<Vec<ConfigConflict>>,
     ready: AtomicBool,
-    picker_counter: AtomicU64,
+    // Round-robin cursors, one per selection domain: routes rotate over their
+    // weighted clusters/backends, clusters rotate over their endpoints. A single
+    // shared counter made each domain's sequence depend on unrelated traffic, so
+    // whenever domains had different sizes the distribution skewed away from the
+    // configured weights.
+    route_pickers: Mutex<HashMap<String, u64>>,
+    endpoint_pickers: Mutex<HashMap<String, u64>>,
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
     token_usage: Mutex<HashMap<String, TokenBucket>>,
     circuit_breakers: Mutex<HashMap<String, CircuitBreakerBucket>>,
+    outliers: Mutex<HashMap<String, OutlierBucket>>,
     mcp_sessions: Mutex<BindingMap>,
     a2a_tasks: Mutex<BindingMap>,
     metrics: Mutex<MetricsStore>,
@@ -233,6 +240,74 @@ struct CircuitBreakerBucket {
     active: u32,
 }
 
+// Envoy's defaults, applied when the control plane leaves a field unset.
+const DEFAULT_CONSECUTIVE_5XX: u32 = 5;
+const DEFAULT_BASE_EJECTION_TIME: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_EJECTION_PERCENT: u32 = 10;
+
+#[derive(Debug, Default)]
+struct OutlierBucket {
+    consecutive_failures: u32,
+    // Grows the ejection window for repeat offenders, as Envoy does.
+    ejections: u32,
+    ejected_until: Option<Instant>,
+}
+
+fn outlier_key(cluster: &str, endpoint: &Endpoint) -> String {
+    format!("{cluster}|{}:{}", endpoint.address, endpoint.port)
+}
+
+/// How many of `total` endpoints may be ejected at once, per `max_ejection_percent`
+/// and `min_health_percent`. Ejecting a whole cluster into unavailability would turn
+/// a partial outage into a total one, so the caps are honored even when every
+/// endpoint is failing.
+fn ejection_allowance(total: usize, cfg: &OutlierDetectionConfig) -> usize {
+    let max_pct = cfg
+        .max_ejection_percent
+        .unwrap_or(DEFAULT_MAX_EJECTION_PERCENT)
+        .min(100) as usize;
+    let by_max = total * max_pct / 100;
+    let by_min_health = match cfg.min_health_percent {
+        Some(pct) => total.saturating_sub((total * pct.min(100) as usize).div_ceil(100)),
+        None => total,
+    };
+    by_max.min(by_min_health)
+}
+
+/// Parses the duration forms the xDS client emits (`"30s"`, `"0.500000000s"`) and the
+/// `"500ms"` form static YAML tends to use. Unparseable values fall back to `default`.
+fn parse_duration(raw: Option<&String>, default: Duration) -> Duration {
+    let Some(raw) = raw.map(|value| value.trim()) else {
+        return default;
+    };
+    let seconds = if let Some(ms) = raw.strip_suffix("ms") {
+        ms.parse::<f64>().ok().map(|value| value / 1000.0)
+    } else {
+        raw.strip_suffix('s').and_then(|s| s.parse::<f64>().ok())
+    };
+    // from_secs_f64 panics on negative or non-finite input.
+    seconds
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or(default)
+}
+
+/// Advances `key`'s round-robin cursor and returns its position within `modulus`.
+/// Only the first sighting of a key allocates; the key set is bounded by config.
+fn next_cursor(pickers: &Mutex<HashMap<String, u64>>, key: &str, modulus: u64) -> u64 {
+    if modulus == 0 {
+        return 0;
+    }
+    let mut pickers = pickers.lock().unwrap();
+    let cursor = match pickers.get_mut(key) {
+        Some(cursor) => cursor,
+        None => pickers.entry(key.to_string()).or_insert(0),
+    };
+    let current = *cursor;
+    *cursor = cursor.wrapping_add(1);
+    current % modulus
+}
+
 pub struct CircuitBreakerPermit {
     state: ProxyState,
     cluster: String,
@@ -251,10 +326,12 @@ impl ProxyState {
                 config: RwLock::new(initial),
                 conflicts: RwLock::new(Vec::new()),
                 ready: AtomicBool::new(false),
-                picker_counter: AtomicU64::new(0),
+                route_pickers: Mutex::new(HashMap::new()),
+                endpoint_pickers: Mutex::new(HashMap::new()),
                 rate_limits: Mutex::new(HashMap::new()),
                 token_usage: Mutex::new(HashMap::new()),
                 circuit_breakers: Mutex::new(HashMap::new()),
+                outliers: Mutex::new(HashMap::new()),
                 mcp_sessions: Mutex::new(BindingMap::default()),
                 a2a_tasks: Mutex::new(BindingMap::default()),
                 metrics: Mutex::new(MetricsStore::default()),
@@ -278,6 +355,43 @@ impl ProxyState {
                     .lock()
                     .unwrap()
                     .retain(|name, bucket| cluster_names.contains(name) || bucket.active > 0);
+                // Cursors for routes/clusters the new config dropped would otherwise
+                // linger for the process lifetime.
+                self.inner
+                    .endpoint_pickers
+                    .lock()
+                    .unwrap()
+                    .retain(|name, _| cluster_names.contains(name));
+                // Outlier keys are "{cluster}|{addr}:{port}"; drop those whose cluster
+                // is gone, and those whose endpoint no longer appears in it.
+                let endpoint_keys: std::collections::HashSet<String> = cfg
+                    .clusters
+                    .iter()
+                    .flat_map(|cluster| {
+                        cluster
+                            .endpoints
+                            .iter()
+                            .map(|endpoint| outlier_key(&cluster.name, endpoint))
+                    })
+                    .collect();
+                self.inner
+                    .outliers
+                    .lock()
+                    .unwrap()
+                    .retain(|key, _| endpoint_keys.contains(key));
+                let route_names: std::collections::HashSet<&str> = cfg
+                    .listeners
+                    .iter()
+                    .flat_map(|listener| &listener.virtual_hosts)
+                    .flat_map(|host| &host.routes)
+                    .map(|route| route.name.as_str())
+                    .chain(cfg.routes.iter().map(|route| route.name.as_str()))
+                    .collect();
+                self.inner
+                    .route_pickers
+                    .lock()
+                    .unwrap()
+                    .retain(|name, _| route_names.contains(name.as_str()));
                 *self.inner.config.write().await = cfg;
                 self.inner.conflicts.write().await.clear();
                 self.inner.ready.store(true, Ordering::SeqCst);
@@ -305,13 +419,14 @@ impl ProxyState {
 
     pub async fn pick_cluster<'a>(
         &self,
+        route: &str,
         clusters: &'a [WeightedCluster],
     ) -> Option<&'a WeightedCluster> {
         let total: u32 = clusters.iter().map(|c| c.weight).sum();
         if total == 0 {
             return clusters.first();
         }
-        let next = self.inner.picker_counter.fetch_add(1, Ordering::Relaxed) as u32 % total;
+        let next = next_cursor(&self.inner.route_pickers, route, u64::from(total)) as u32;
         let mut cursor = 0;
         clusters.iter().find(|cluster| {
             cursor += cluster.weight;
@@ -321,13 +436,14 @@ impl ProxyState {
 
     pub async fn pick_backend<'a>(
         &self,
+        route: &str,
         backends: &'a [WeightedBackend],
     ) -> Option<&'a WeightedBackend> {
         let total: u32 = backends.iter().map(|b| b.weight).sum();
         if total == 0 {
             return backends.first();
         }
-        let next = self.inner.picker_counter.fetch_add(1, Ordering::Relaxed) as u32 % total;
+        let next = next_cursor(&self.inner.route_pickers, route, u64::from(total)) as u32;
         let mut cursor = 0;
         backends.iter().find(|backend| {
             cursor += backend.weight;
@@ -335,18 +451,101 @@ impl ProxyState {
         })
     }
 
-    pub async fn pick_endpoint<'a>(
-        &self,
-        cluster_name: &str,
-        endpoints: &'a [Endpoint],
-    ) -> Result<&'a Endpoint> {
-        let healthy: Vec<&Endpoint> = endpoints.iter().filter(|ep| ep.healthy).collect();
+    pub async fn pick_endpoint<'a>(&self, cluster: &'a Cluster) -> Result<&'a Endpoint> {
+        let healthy: Vec<&Endpoint> = cluster.endpoints.iter().filter(|ep| ep.healthy).collect();
         if healthy.is_empty() {
-            return Err(DxgateError::NoHealthyEndpoints(cluster_name.to_string()));
+            return Err(DxgateError::NoHealthyEndpoints(cluster.name.clone()));
         }
-        let idx =
-            self.inner.picker_counter.fetch_add(1, Ordering::Relaxed) as usize % healthy.len();
-        Ok(healthy[idx])
+        let candidates = self.admissible_endpoints(cluster, &healthy);
+        let idx = next_cursor(
+            &self.inner.endpoint_pickers,
+            &cluster.name,
+            candidates.len() as u64,
+        ) as usize;
+        Ok(candidates[idx])
+    }
+
+    /// `healthy` minus the endpoints outlier detection has currently ejected, capped
+    /// so ejection can never empty the cluster. Never returns an empty vec.
+    fn admissible_endpoints<'a>(
+        &self,
+        cluster: &Cluster,
+        healthy: &[&'a Endpoint],
+    ) -> Vec<&'a Endpoint> {
+        let Some(outlier) = cluster.outlier_detection.as_ref() else {
+            return healthy.to_vec();
+        };
+        let allowance = ejection_allowance(healthy.len(), outlier);
+        if allowance == 0 {
+            return healthy.to_vec();
+        }
+        let now = Instant::now();
+        let buckets = self.inner.outliers.lock().unwrap();
+        let mut ejected: Vec<(usize, Instant)> = healthy
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, endpoint)| {
+                buckets
+                    .get(&outlier_key(&cluster.name, endpoint))
+                    .and_then(|bucket| bucket.ejected_until)
+                    .filter(|until| *until > now)
+                    .map(|until| (idx, until))
+            })
+            .collect();
+        drop(buckets);
+        if ejected.is_empty() {
+            return healthy.to_vec();
+        }
+        // Over the cap: keep out the endpoints furthest from recovering and re-admit
+        // the rest, so the cluster keeps serving from its least-bad members.
+        if ejected.len() > allowance {
+            ejected.sort_by_key(|(_, until)| std::cmp::Reverse(*until));
+            ejected.truncate(allowance);
+        }
+        let excluded: std::collections::HashSet<usize> =
+            ejected.into_iter().map(|(idx, _)| idx).collect();
+        healthy
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !excluded.contains(idx))
+            .map(|(_, endpoint)| *endpoint)
+            .collect()
+    }
+
+    /// Feeds one upstream result into the cluster's outlier detector. A run of
+    /// `consecutive_5xx_errors` failures ejects the endpoint for a window that grows
+    /// with each repeat ejection; any success clears the run.
+    pub fn record_endpoint_result(&self, cluster: &Cluster, endpoint: &Endpoint, status: u16) {
+        let Some(outlier) = cluster.outlier_detection.as_ref() else {
+            return;
+        };
+        let threshold = outlier
+            .consecutive_5xx_errors
+            .unwrap_or(DEFAULT_CONSECUTIVE_5XX);
+        if threshold == 0 {
+            return;
+        }
+        let key = outlier_key(&cluster.name, endpoint);
+        let mut buckets = self.inner.outliers.lock().unwrap();
+        if status < 500 {
+            if let Some(bucket) = buckets.get_mut(&key) {
+                bucket.consecutive_failures = 0;
+            }
+            return;
+        }
+        let base = parse_duration(
+            outlier.base_ejection_time.as_ref(),
+            DEFAULT_BASE_EJECTION_TIME,
+        );
+        let bucket = buckets.entry(key).or_default();
+        bucket.consecutive_failures += 1;
+        if bucket.consecutive_failures < threshold {
+            return;
+        }
+        bucket.consecutive_failures = 0;
+        bucket.ejections = bucket.ejections.saturating_add(1);
+        // saturating_mul: a long-dead endpoint must not overflow its way to a panic.
+        bucket.ejected_until = Some(Instant::now() + base.saturating_mul(bucket.ejections));
     }
 
     pub fn check_rate_limit(&self, key: String, limit: &RateLimitPolicy) -> bool {
@@ -699,6 +898,30 @@ mod tests {
         Cluster, Listener, ListenerProtocol, PathMatch, Route, RouteMatch, VirtualHost,
     };
 
+    fn test_cluster(
+        name: &str,
+        endpoints: Vec<Endpoint>,
+        outlier_detection: Option<OutlierDetectionConfig>,
+    ) -> Cluster {
+        Cluster {
+            name: name.into(),
+            endpoints,
+            http2: false,
+            tls: None,
+            circuit_breaker: None,
+            outlier_detection,
+        }
+    }
+
+    fn endpoint(address: &str) -> Endpoint {
+        Endpoint {
+            address: address.into(),
+            port: 8080,
+            healthy: true,
+            node_name: None,
+        }
+    }
+
     fn valid_config(version: &str) -> RuntimeConfig {
         RuntimeConfig {
             version: version.into(),
@@ -823,7 +1046,14 @@ mod tests {
         let mut names = Vec::new();
 
         for _ in 0..6 {
-            names.push(state.pick_cluster(&clusters).await.unwrap().name.clone());
+            names.push(
+                state
+                    .pick_cluster("default", &clusters)
+                    .await
+                    .unwrap()
+                    .name
+                    .clone(),
+            );
         }
 
         assert_eq!(names, ["a", "a", "b", "a", "a", "b"]);
@@ -877,16 +1107,159 @@ mod tests {
             },
         ];
 
-        let endpoint = state.pick_endpoint("backend", &endpoints).await.unwrap();
+        let cluster = test_cluster("backend", endpoints, None);
+        let endpoint = state.pick_endpoint(&cluster).await.unwrap();
         assert_eq!(endpoint.address, "10.0.0.2");
 
-        let unhealthy = vec![Endpoint {
-            address: "10.0.0.3".into(),
-            port: 8080,
-            healthy: false,
-            node_name: None,
-        }];
-        assert!(state.pick_endpoint("backend", &unhealthy).await.is_err());
+        let unhealthy = test_cluster(
+            "backend",
+            vec![Endpoint {
+                address: "10.0.0.3".into(),
+                port: 8080,
+                healthy: false,
+                node_name: None,
+            }],
+            None,
+        );
+        assert!(state.pick_endpoint(&unhealthy).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn round_robin_cursors_are_per_cluster() {
+        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let a = test_cluster("a", vec![endpoint("10.0.0.1"), endpoint("10.0.0.2")], None);
+        let b = test_cluster("b", vec![endpoint("10.1.0.1"), endpoint("10.1.0.2")], None);
+
+        // Interleaving two clusters must not advance the other's cursor: each still
+        // alternates over its own endpoints. A shared counter made `a` return
+        // 10.0.0.1 every time here.
+        let mut picked = Vec::new();
+        for _ in 0..4 {
+            picked.push(state.pick_endpoint(&a).await.unwrap().address.clone());
+            let _ = state.pick_endpoint(&b).await.unwrap();
+        }
+
+        assert_eq!(picked, ["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[tokio::test]
+    async fn outlier_detection_ejects_after_consecutive_failures() {
+        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let cluster = test_cluster(
+            "backend",
+            vec![endpoint("10.0.0.1"), endpoint("10.0.0.2")],
+            Some(OutlierDetectionConfig {
+                consecutive_5xx_errors: Some(2),
+                interval: None,
+                base_ejection_time: Some("30s".into()),
+                // 50% of two endpoints: exactly one may be ejected.
+                max_ejection_percent: Some(50),
+                min_health_percent: None,
+            }),
+        );
+        let bad = &cluster.endpoints[0];
+
+        state.record_endpoint_result(&cluster, bad, 503);
+        // One failure is below the threshold, so the endpoint still serves.
+        assert!(state
+            .admissible_endpoints(&cluster, &cluster.endpoints.iter().collect::<Vec<_>>())
+            .iter()
+            .any(|ep| ep.address == "10.0.0.1"));
+
+        state.record_endpoint_result(&cluster, bad, 503);
+        let admissible =
+            state.admissible_endpoints(&cluster, &cluster.endpoints.iter().collect::<Vec<_>>());
+        assert_eq!(admissible.len(), 1);
+        assert_eq!(admissible[0].address, "10.0.0.2");
+
+        // Every pick now avoids the ejected endpoint.
+        for _ in 0..4 {
+            assert_eq!(
+                state.pick_endpoint(&cluster).await.unwrap().address,
+                "10.0.0.2"
+            );
+        }
+    }
+
+    #[test]
+    fn outlier_detection_success_clears_the_failure_run() {
+        let state = ProxyState::new(RuntimeConfig::empty("test"));
+        let cluster = test_cluster(
+            "backend",
+            vec![endpoint("10.0.0.1"), endpoint("10.0.0.2")],
+            Some(OutlierDetectionConfig {
+                consecutive_5xx_errors: Some(2),
+                interval: None,
+                base_ejection_time: None,
+                max_ejection_percent: Some(50),
+                min_health_percent: None,
+            }),
+        );
+        let flaky = &cluster.endpoints[0];
+
+        state.record_endpoint_result(&cluster, flaky, 503);
+        state.record_endpoint_result(&cluster, flaky, 200);
+        state.record_endpoint_result(&cluster, flaky, 503);
+
+        // Failures were not consecutive, so nothing is ejected.
+        assert_eq!(
+            state
+                .admissible_endpoints(&cluster, &cluster.endpoints.iter().collect::<Vec<_>>())
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ejection_never_empties_a_cluster() {
+        let cfg = OutlierDetectionConfig {
+            consecutive_5xx_errors: Some(1),
+            interval: None,
+            base_ejection_time: None,
+            max_ejection_percent: Some(100),
+            min_health_percent: Some(50),
+        };
+        // min_health_percent caps the allowance below max_ejection_percent.
+        assert_eq!(ejection_allowance(4, &cfg), 2);
+        // Envoy's 10% default cannot eject either of two endpoints.
+        assert_eq!(
+            ejection_allowance(
+                2,
+                &OutlierDetectionConfig {
+                    consecutive_5xx_errors: None,
+                    interval: None,
+                    base_ejection_time: None,
+                    max_ejection_percent: None,
+                    min_health_percent: None,
+                }
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn outlier_durations_parse_xds_and_yaml_forms() {
+        let fallback = Duration::from_secs(30);
+        assert_eq!(
+            parse_duration(Some(&"10s".to_string()), fallback),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_duration(Some(&"0.500000000s".to_string()), fallback),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_duration(Some(&"250ms".to_string()), fallback),
+            Duration::from_millis(250)
+        );
+        // Unparseable, zero, and absent values all fall back rather than disabling
+        // ejection with a zero-length window.
+        assert_eq!(
+            parse_duration(Some(&"soon".to_string()), fallback),
+            fallback
+        );
+        assert_eq!(parse_duration(Some(&"0s".to_string()), fallback), fallback);
+        assert_eq!(parse_duration(None, fallback), fallback);
     }
 
     #[test]

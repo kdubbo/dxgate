@@ -43,7 +43,7 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub http_addr: Option<SocketAddr>,
     #[serde(default)]
-    pub admin_addr: Option<SocketAddr>,
+    pub ui_addr: Option<SocketAddr>,
     #[serde(default)]
     pub listener_names: Vec<String>,
     #[serde(default)]

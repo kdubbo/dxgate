@@ -13,6 +13,13 @@ yanked = "deny"
 # transitive deps. The real fix is a rustls 0.21 -> 0.23 upgrade, which changes
 # the mTLS verifier / ClientConfig API and is tracked as a separate task; these
 # are low-impact in dxgate's usage (see notes) and ignored until then.
+#
+# Scoping note for whoever picks that task up: rustls 0.23 forces hyper-rustls
+# 0.26+, which is hyper 1.x only, which forces axum 0.6 -> 0.8 and tonic 0.11 ->
+# 0.12 as well. That is ~53 call sites across the proxy data plane, the ui
+# server, and all six integration suites -- a milestone, not a dependency bump.
+# The good news is that hyper 1.10 and rustls 0.23 are *already* in the tree via
+# kube 0.91, so the migration removes duplicate versions rather than adding them.
 ignore = [
     # rustls-pemfile is unmaintained (no vuln, no safe upgrade in the 0.21 line).
     "RUSTSEC-2025-0134",

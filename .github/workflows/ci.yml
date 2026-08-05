@@ -33,6 +33,29 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  performance:
+    name: Performance smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The performance and SLA tests are #[ignore]d because their real budgets
+      # depend on the machine. Shared runners cannot hold a tight budget, so CI
+      # runs them with deliberately loose thresholds: this gates against
+      # order-of-magnitude regressions (a lock held across an await, an accidental
+      # per-request allocation storm), not against micro-regressions. Tighten the
+      # numbers locally via the same env vars when profiling.
+      - name: Throughput and latency regression gate
+        env:
+          DXGATE_PERF_REQUESTS: "200"
+          DXGATE_PERF_MIN_RPS: "50"
+          DXGATE_SLA_REQUESTS: "100"
+          DXGATE_SLA_P95_MS: "750"
+        run: |
+          cargo test --release -p dxgate-proxy \
+            --test performance --test sla -- --ignored
+
   build:
     name: Build
     runs-on: ubuntu-latest
