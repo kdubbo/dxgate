@@ -20,9 +20,9 @@ use crate::proto::listener::v1 as xds_listener;
 use crate::proto::route::v1 as xds_route;
 use crate::proto::service::discovery::v1::DiscoveryResponse;
 use dxgate_core::{
-    CircuitBreakerConfig, Cluster, ConfigDelta, Endpoint as RuntimeEndpoint, HeaderMatch, Listener,
-    ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch, SourceState,
-    UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedCluster,
+    CircuitBreakerConfig, Cluster, Collection, ConfigDelta, Endpoint as RuntimeEndpoint,
+    HeaderMatch, Listener, ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch,
+    SourceState, UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedCluster,
 };
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,10 +55,10 @@ impl SubscriptionChange {
 #[derive(Default)]
 pub(super) struct AdsState {
     subscriptions: BTreeMap<String, BTreeSet<String>>,
-    listeners: BTreeMap<String, ListenerSnapshot>,
-    routes: BTreeMap<String, Vec<VirtualHost>>,
-    clusters: BTreeMap<String, ClusterSnapshot>,
-    endpoints: BTreeMap<String, Vec<RuntimeEndpoint>>,
+    listeners: Collection<String, ListenerSnapshot>,
+    routes: Collection<String, Vec<VirtualHost>>,
+    clusters: Collection<String, ClusterSnapshot>,
+    endpoints: Collection<String, Vec<RuntimeEndpoint>>,
     /// Per-type resource versions, replayed as a delta stream's
     /// `initial_resource_versions` after a reconnect so the control plane only
     /// resends what actually changed while the stream was down.
@@ -109,27 +109,27 @@ impl AdsState {
     /// for that type, so anything the client still holds and the server did not
     /// send is gone.
     pub(super) fn apply_sotw(&mut self, resp: &DiscoveryResponse) -> Result<(), XdsError> {
+        // The payload is the complete set for its type, so it replaces what the
+        // client holds outright: whatever the server did not send is gone. With
+        // an explicit subscription the response only covers the requested names,
+        // so resources outside it are carried over.
         let requested = self.subscription(&resp.type_url);
         match resp.type_url.as_str() {
             LISTENER_TYPE => {
-                prune_requested(&mut self.listeners, &requested);
-                let received = self.upsert_listeners(&resp.resources)?;
-                retain_received(&mut self.listeners, &received, &requested);
+                let received = decode_listeners(&resp.resources)?;
+                replace_within_subscription(&mut self.listeners, received, &requested);
             }
             ROUTE_TYPE => {
-                prune_requested(&mut self.routes, &requested);
-                let received = self.upsert_routes(&resp.resources)?;
-                retain_received(&mut self.routes, &received, &requested);
+                let received = decode_routes(&resp.resources)?;
+                replace_within_subscription(&mut self.routes, received, &requested);
             }
             CLUSTER_TYPE => {
-                prune_requested(&mut self.clusters, &requested);
-                let received = self.upsert_clusters(&resp.resources)?;
-                retain_received(&mut self.clusters, &received, &requested);
+                let received = self.decode_clusters(&resp.resources)?;
+                replace_within_subscription(&mut self.clusters, received, &requested);
             }
             ENDPOINT_TYPE => {
-                prune_requested(&mut self.endpoints, &requested);
-                let received = self.upsert_endpoints(&resp.resources)?;
-                retain_received(&mut self.endpoints, &received, &requested);
+                let received = decode_endpoints(&resp.resources)?;
+                replace_within_subscription(&mut self.endpoints, received, &requested);
             }
             _ => {}
         }
@@ -150,29 +150,22 @@ impl AdsState {
             .collect::<Vec<_>>();
         match type_url {
             LISTENER_TYPE => {
-                self.upsert_listeners(&payload)?;
-                for name in removed {
-                    self.listeners.remove(name);
-                }
+                upsert_each(&mut self.listeners, decode_listeners(&payload)?);
+                remove_each(&mut self.listeners, removed);
             }
             ROUTE_TYPE => {
-                self.upsert_routes(&payload)?;
-                for name in removed {
-                    self.routes.remove(name);
-                }
+                upsert_each(&mut self.routes, decode_routes(&payload)?);
+                remove_each(&mut self.routes, removed);
             }
             CLUSTER_TYPE => {
-                self.upsert_clusters(&payload)?;
-                for name in removed {
-                    self.clusters.remove(name);
-                }
+                let clusters = self.decode_clusters(&payload)?;
+                upsert_each(&mut self.clusters, clusters);
+                remove_each(&mut self.clusters, removed);
                 self.prune_orphan_endpoints();
             }
             ENDPOINT_TYPE => {
-                self.upsert_endpoints(&payload)?;
-                for name in removed {
-                    self.endpoints.remove(name);
-                }
+                upsert_each(&mut self.endpoints, decode_endpoints(&payload)?);
+                remove_each(&mut self.endpoints, removed);
             }
             _ => return Ok(()),
         }
@@ -269,42 +262,14 @@ impl AdsState {
         self.published.reconcile_delta(delta)
     }
 
-    fn upsert_listeners(
+    /// Decodes CDS resources. Clusters are the one type that can carry another
+    /// type's payload — an inline `load_assignment` is the endpoint assignment —
+    /// so this writes those through as it goes.
+    fn decode_clusters(
         &mut self,
         resources: &[prost_types::Any],
-    ) -> Result<BTreeSet<String>, XdsError> {
-        let mut received = BTreeSet::new();
-        for resource in resources {
-            let listener = decode_resource::<xds_listener::Listener>(LISTENER_TYPE, resource)?;
-            let snapshot = listener_snapshot(listener)?;
-            received.insert(snapshot.listener.name.clone());
-            self.listeners
-                .insert(snapshot.listener.name.clone(), snapshot);
-        }
-        Ok(received)
-    }
-
-    fn upsert_routes(
-        &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<BTreeSet<String>, XdsError> {
-        let mut received = BTreeSet::new();
-        for resource in resources {
-            let route = decode_resource::<xds_route::RouteConfiguration>(ROUTE_TYPE, resource)?;
-            received.insert(route.name.clone());
-            self.routes.insert(
-                route.name.clone(),
-                convert_virtual_hosts(&route.virtual_hosts),
-            );
-        }
-        Ok(received)
-    }
-
-    fn upsert_clusters(
-        &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<BTreeSet<String>, XdsError> {
-        let mut received = BTreeSet::new();
+    ) -> Result<Vec<(String, ClusterSnapshot)>, XdsError> {
+        let mut decoded = Vec::with_capacity(resources.len());
         for resource in resources {
             let cluster = decode_resource::<xds_cluster::Cluster>(CLUSTER_TYPE, resource)?;
             if cluster.name.is_empty() {
@@ -318,14 +283,13 @@ impl AdsState {
                 .unwrap_or_else(|| cluster.name.clone());
 
             if let Some(load_assignment) = cluster.load_assignment.as_ref() {
-                self.endpoints.insert(
+                self.endpoints.upsert(
                     eds_service_name.clone(),
                     endpoints_from_assignment(load_assignment),
                 );
             }
 
-            received.insert(cluster.name.clone());
-            self.clusters.insert(
+            decoded.push((
                 cluster.name.clone(),
                 ClusterSnapshot {
                     tls: upstream_tls_from_cluster(&cluster),
@@ -334,38 +298,18 @@ impl AdsState {
                     name: cluster.name,
                     eds_service_name,
                 },
-            );
+            ));
         }
-        Ok(received)
-    }
-
-    fn upsert_endpoints(
-        &mut self,
-        resources: &[prost_types::Any],
-    ) -> Result<BTreeSet<String>, XdsError> {
-        let mut received = BTreeSet::new();
-        for resource in resources {
-            let assignment =
-                decode_resource::<xds_endpoint::ClusterLoadAssignment>(ENDPOINT_TYPE, resource)?;
-            if assignment.cluster_name.is_empty() {
-                continue;
-            }
-            received.insert(assignment.cluster_name.clone());
-            self.endpoints.insert(
-                assignment.cluster_name.clone(),
-                endpoints_from_assignment(&assignment),
-            );
-        }
-        Ok(received)
+        Ok(decoded)
     }
 
     /// Drops endpoint assignments no remaining cluster points at. Only delta
-    /// needs this: the state-of-the-world path prunes against the subscription.
+    /// needs this: the state-of-the-world path replaces the whole set anyway.
     fn prune_orphan_endpoints(&mut self) {
-        let live: BTreeSet<&String> = self
+        let live: BTreeSet<String> = self
             .clusters
             .values()
-            .map(|cluster| &cluster.eds_service_name)
+            .map(|cluster| cluster.eds_service_name.clone())
             .collect();
         self.endpoints.retain(|name, _| live.contains(name));
     }
@@ -401,27 +345,98 @@ impl AdsState {
     }
 }
 
-/// State-of-the-world semantics for a wildcard subscription: with no requested
-/// names the response itself is the complete set, so anything absent from it is
-/// gone. With an explicit subscription `prune_requested` already did the work.
-fn retain_received<T>(
-    resources: &mut BTreeMap<String, T>,
-    received: &BTreeSet<String>,
-    requested: &[String],
-) {
-    if requested.is_empty() {
-        resources.retain(|name, _| received.contains(name));
+fn decode_listeners(
+    resources: &[prost_types::Any],
+) -> Result<Vec<(String, ListenerSnapshot)>, XdsError> {
+    resources
+        .iter()
+        .map(|resource| {
+            let listener = decode_resource::<xds_listener::Listener>(LISTENER_TYPE, resource)?;
+            let snapshot = listener_snapshot(listener)?;
+            Ok((snapshot.listener.name.clone(), snapshot))
+        })
+        .collect()
+}
+
+fn decode_routes(
+    resources: &[prost_types::Any],
+) -> Result<Vec<(String, Vec<VirtualHost>)>, XdsError> {
+    resources
+        .iter()
+        .map(|resource| {
+            let route = decode_resource::<xds_route::RouteConfiguration>(ROUTE_TYPE, resource)?;
+            Ok((route.name, convert_virtual_hosts(&route.virtual_hosts)))
+        })
+        .collect()
+}
+
+fn decode_endpoints(
+    resources: &[prost_types::Any],
+) -> Result<Vec<(String, Vec<RuntimeEndpoint>)>, XdsError> {
+    let mut decoded = Vec::with_capacity(resources.len());
+    for resource in resources {
+        let assignment =
+            decode_resource::<xds_endpoint::ClusterLoadAssignment>(ENDPOINT_TYPE, resource)?;
+        if assignment.cluster_name.is_empty() {
+            continue;
+        }
+        decoded.push((
+            assignment.cluster_name.clone(),
+            endpoints_from_assignment(&assignment),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn upsert_each<V: PartialEq>(collection: &mut Collection<String, V>, decoded: Vec<(String, V)>) {
+    for (name, value) in decoded {
+        collection.upsert(name, value);
     }
 }
 
-#[derive(Debug, Clone)]
+fn remove_each<V: PartialEq>(collection: &mut Collection<String, V>, removed: &[String]) {
+    for name in removed {
+        collection.remove(name);
+    }
+}
+
+/// Applies a state-of-the-world payload.
+///
+/// A wildcard subscription (no requested names) means the response is the whole
+/// world, so it replaces the collection outright. An explicit subscription means
+/// the response only speaks for the names asked about, so resources outside the
+/// subscription are carried over and the rest is replaced.
+fn replace_within_subscription<V: PartialEq>(
+    collection: &mut Collection<String, V>,
+    received: Vec<(String, V)>,
+    requested: &[String],
+) {
+    if requested.is_empty() {
+        collection.replace_all(received);
+        return;
+    }
+    let outside: Vec<String> = collection
+        .keys()
+        .filter(|name| !requested.contains(name))
+        .cloned()
+        .collect();
+    let mut next: Vec<(String, V)> = received;
+    for name in outside {
+        if let Some(value) = collection.take(&name) {
+            next.push((name, value));
+        }
+    }
+    collection.replace_all(next);
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ListenerSnapshot {
     listener: Listener,
     route_names: Vec<String>,
     inline_virtual_hosts: Vec<VirtualHost>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ClusterSnapshot {
     name: String,
     eds_service_name: String,
@@ -776,16 +791,6 @@ fn decode_resource<T: Message + Default>(
         type_url: type_url.to_string(),
         source,
     })
-}
-
-fn prune_requested<T>(resources: &mut BTreeMap<String, T>, requested: &[String]) {
-    if requested.is_empty() {
-        resources.clear();
-    } else {
-        for name in requested {
-            resources.remove(name);
-        }
-    }
 }
 
 fn sorted_unique(names: impl IntoIterator<Item = String>) -> Vec<String> {

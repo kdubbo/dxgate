@@ -18,7 +18,7 @@ use crate::{
     runtime_config_from_resources, ControllerError, Dxgate, DxgateBackend, DxgateCondition,
     DxgatePolicy, DxgateRoute, DxgateStatus,
 };
-use dxgate_core::{ConfigStore, SourceId, SourceState};
+use dxgate_core::{Collection, ConfigStore, SourceId, SourceState};
 use futures_util::stream::{self, Stream, StreamExt};
 use kube::api::{Patch, PatchParams};
 use kube::core::NamespaceResourceScope;
@@ -45,47 +45,30 @@ fn object_key<K: Resource>(object: &K) -> ObjectKey {
     (object.namespace().unwrap_or_default(), object.name_any())
 }
 
-/// A local cache of one CRD kind. Ordered by `(namespace, name)` so the
-/// projection is deterministic regardless of the order events arrived in.
-#[derive(Debug)]
-struct Cache<K> {
-    objects: BTreeMap<ObjectKey, K>,
-}
+/// A local cache of one CRD kind, keyed by `(namespace, name)` so the projection
+/// is deterministic regardless of the order events arrived in.
+///
+/// The event handling is a three-line match because [`Collection`] owns the
+/// "what actually changed" bookkeeping and is property-tested for it.
+type Cache<K> = Collection<ObjectKey, K>;
 
-impl<K> Default for Cache<K> {
-    fn default() -> Self {
-        Self {
-            objects: BTreeMap::new(),
+fn apply_event<K: Resource + Clone + PartialEq>(cache: &mut Cache<K>, event: watcher::Event<K>) {
+    match event {
+        watcher::Event::Applied(object) => {
+            cache.upsert(object_key(&object), object);
         }
-    }
-}
-
-impl<K: Resource + Clone> Cache<K> {
-    fn apply(&mut self, event: watcher::Event<K>) {
-        match event {
-            watcher::Event::Applied(object) => {
-                self.objects.insert(object_key(&object), object);
-            }
-            watcher::Event::Deleted(object) => {
-                self.objects.remove(&object_key(&object));
-            }
-            // The watch lost its place, so deletions may have been missed and
-            // the accompanying list is authoritative.
-            watcher::Event::Restarted(objects) => {
-                self.objects = objects
+        watcher::Event::Deleted(object) => {
+            cache.remove(&object_key(&object));
+        }
+        // The watch lost its place, so deletions may have been missed and the
+        // accompanying list is authoritative.
+        watcher::Event::Restarted(objects) => {
+            cache.replace_all(
+                objects
                     .into_iter()
-                    .map(|object| (object_key(&object), object))
-                    .collect();
-            }
+                    .map(|object| (object_key(&object), object)),
+            );
         }
-    }
-
-    fn values(&self) -> Vec<K> {
-        self.objects.values().cloned().collect()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&ObjectKey, &K)> {
-        self.objects.iter()
     }
 }
 
@@ -161,10 +144,10 @@ pub async fn run_controller(store: Arc<ConfigStore>) -> Result<(), ControllerErr
                     );
                     observed += 1;
                     match event {
-                        CrdEvent::Dxgate(event) => caches.dxgates.apply(event),
-                        CrdEvent::Backend(event) => caches.backends.apply(event),
-                        CrdEvent::Route(event) => caches.routes.apply(event),
-                        CrdEvent::Policy(event) => caches.policies.apply(event),
+                        CrdEvent::Dxgate(event) => apply_event(&mut caches.dxgates, event),
+                        CrdEvent::Backend(event) => apply_event(&mut caches.backends, event),
+                        CrdEvent::Route(event) => apply_event(&mut caches.routes, event),
+                        CrdEvent::Policy(event) => apply_event(&mut caches.policies, event),
                     }
                 }
                 Err(err) => warn!(%err, "Kubernetes watch error"),
@@ -199,10 +182,10 @@ async fn reconcile(
     observed: usize,
 ) -> Result<(), ControllerError> {
     let config = match runtime_config_from_resources(
-        &caches.dxgates.values(),
-        &caches.backends.values(),
-        &caches.routes.values(),
-        &caches.policies.values(),
+        &caches.dxgates.values().cloned().collect::<Vec<_>>(),
+        &caches.backends.values().cloned().collect::<Vec<_>>(),
+        &caches.routes.values().cloned().collect::<Vec<_>>(),
+        &caches.policies.values().cloned().collect::<Vec<_>>(),
     ) {
         Ok(config) => config,
         Err(err) => {
@@ -365,6 +348,7 @@ where
     K: Clone
         + Debug
         + DeserializeOwned
+        + PartialEq
         + Serialize
         + Resource<DynamicType = (), Scope = NamespaceResourceScope>
         + Send
@@ -428,45 +412,74 @@ mod tests {
         object
     }
 
+    fn names(cache: &Cache<DxgateBackend>) -> Vec<String> {
+        cache.values().map(|object| object.name_any()).collect()
+    }
+
     #[test]
     fn applied_and_deleted_events_update_one_entry() {
         let mut cache = Cache::<DxgateBackend>::default();
 
-        cache.apply(watcher::Event::Applied(backend("app", "a")));
-        cache.apply(watcher::Event::Applied(backend("app", "b")));
-        assert_eq!(cache.values().len(), 2);
+        apply_event(&mut cache, watcher::Event::Applied(backend("app", "a")));
+        apply_event(&mut cache, watcher::Event::Applied(backend("app", "b")));
+        assert_eq!(cache.len(), 2);
 
-        cache.apply(watcher::Event::Deleted(backend("app", "a")));
-        let names: Vec<String> = cache.values().iter().map(|o| o.name_any()).collect();
-        assert_eq!(names, ["b"]);
+        apply_event(&mut cache, watcher::Event::Deleted(backend("app", "a")));
+        assert_eq!(names(&cache), ["b"]);
     }
 
     #[test]
     fn a_restart_replaces_the_cache_because_deletes_may_have_been_missed() {
         let mut cache = Cache::<DxgateBackend>::default();
-        cache.apply(watcher::Event::Applied(backend("app", "stale")));
+        apply_event(&mut cache, watcher::Event::Applied(backend("app", "stale")));
 
-        cache.apply(watcher::Event::Restarted(vec![
-            backend("app", "b"),
-            backend("app", "a"),
-        ]));
+        apply_event(
+            &mut cache,
+            watcher::Event::Restarted(vec![backend("app", "b"), backend("app", "a")]),
+        );
 
         // Ordered by (namespace, name), not by arrival order.
-        let names: Vec<String> = cache.values().iter().map(|o| o.name_any()).collect();
-        assert_eq!(names, ["a", "b"]);
+        assert_eq!(names(&cache), ["a", "b"]);
     }
 
     #[test]
     fn objects_of_the_same_name_in_different_namespaces_are_distinct() {
         let mut cache = Cache::<DxgateBackend>::default();
-        cache.apply(watcher::Event::Applied(backend("app", "shared")));
-        cache.apply(watcher::Event::Applied(backend("other", "shared")));
+        apply_event(
+            &mut cache,
+            watcher::Event::Applied(backend("app", "shared")),
+        );
+        apply_event(
+            &mut cache,
+            watcher::Event::Applied(backend("other", "shared")),
+        );
 
-        assert_eq!(cache.values().len(), 2);
+        assert_eq!(cache.len(), 2);
 
-        cache.apply(watcher::Event::Deleted(backend("app", "shared")));
-        assert_eq!(cache.values().len(), 1);
-        assert_eq!(cache.values()[0].namespace().as_deref(), Some("other"));
+        apply_event(
+            &mut cache,
+            watcher::Event::Deleted(backend("app", "shared")),
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.values().next().unwrap().namespace().as_deref(),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn a_resync_delivering_identical_objects_reports_nothing() {
+        let mut cache = Cache::<DxgateBackend>::default();
+        let objects = vec![backend("app", "a"), backend("app", "b")];
+        apply_event(&mut cache, watcher::Event::Restarted(objects.clone()));
+
+        let change = cache.replace_all(
+            objects
+                .into_iter()
+                .map(|object| (object_key(&object), object)),
+        );
+
+        assert!(change.is_empty());
     }
 
     #[test]

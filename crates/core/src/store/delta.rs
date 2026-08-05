@@ -1,5 +1,6 @@
 //! Deltas, and the bridge that lets a state-of-the-world source drive them.
 
+use super::collection::Collection;
 use super::{ResourceKey, ResourceKind};
 use crate::{AgentRoute, Backend, Cluster, Listener, Policy, Provider, RuntimeConfig, TlsSecret};
 use std::collections::BTreeSet;
@@ -139,7 +140,10 @@ impl From<RuntimeConfig> for ConfigDelta {
 /// difference as explicit removals, scoped to that one source.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceState {
-    published: BTreeSet<ResourceKey>,
+    /// Identity only: what this source published, not what was in it. The
+    /// store already decides whether a re-published resource changed, so
+    /// tracking content here would duplicate that judgement.
+    published: Collection<ResourceKey, ()>,
 }
 
 impl SourceState {
@@ -148,8 +152,8 @@ impl SourceState {
     }
 
     /// Keys currently attributed to this source.
-    pub fn keys(&self) -> &BTreeSet<ResourceKey> {
-        &self.published
+    pub fn keys(&self) -> BTreeSet<ResourceKey> {
+        self.published.key_set()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -164,18 +168,19 @@ impl SourceState {
     /// Same as [`SourceState::reconcile`] for callers that already built the
     /// upsert side of the delta. Any `removes` already on `delta` are kept.
     pub fn reconcile_delta(&mut self, mut delta: ConfigDelta) -> ConfigDelta {
-        let next = delta.upserted_keys();
-        let mut removes: Vec<ResourceKey> = self.published.difference(&next).cloned().collect();
+        let change = self
+            .published
+            .replace_all(delta.upserted_keys().into_iter().map(|key| (key, ())));
+        let mut removes = change.removed;
         removes.append(&mut delta.removes);
         delta.removes = removes;
-        self.published = next;
         delta
     }
 
     /// Marks every key as retired, producing the delta that empties the source's
     /// slice of the store.
     pub fn drain(&mut self) -> ConfigDelta {
-        let removes = std::mem::take(&mut self.published).into_iter().collect();
+        let removes = self.published.replace_all(std::iter::empty()).removed;
         ConfigDelta::default().with_removes(removes)
     }
 }

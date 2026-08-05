@@ -17,8 +17,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
+    derive = "PartialEq",
     group = "gateway.dxgate.io",
     version = "v1alpha1",
     kind = "Dxgate",
@@ -45,7 +46,7 @@ pub struct DxgateSpec {
     pub poll_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DxgateStatus {
     #[serde(default)]
     pub ready: bool,
@@ -57,7 +58,7 @@ pub struct DxgateStatus {
     pub observed_generation: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DxgateCondition {
     #[serde(rename = "type")]
     pub type_: String,
@@ -68,8 +69,9 @@ pub struct DxgateCondition {
     pub observed_generation: Option<i64>,
 }
 
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
+    derive = "PartialEq",
     group = "gateway.dxgate.io",
     version = "v1alpha1",
     kind = "DxgateBackend",
@@ -82,8 +84,9 @@ pub struct DxgateBackendSpec {
     pub backend: Value,
 }
 
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
+    derive = "PartialEq",
     group = "gateway.dxgate.io",
     version = "v1alpha1",
     kind = "DxgateRoute",
@@ -96,8 +99,9 @@ pub struct DxgateRouteSpec {
     pub route: Value,
 }
 
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
+    derive = "PartialEq",
     group = "gateway.dxgate.io",
     version = "v1alpha1",
     kind = "DxgatePolicy",

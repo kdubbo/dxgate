@@ -20,9 +20,11 @@
 //! the request-path indexes. Readers clone one `Arc`; no configuration is cloned
 //! per request.
 
+mod collection;
 mod delta;
 mod snapshot;
 
+pub use collection::{ChangeSet, Collection};
 pub use delta::{ConfigDelta, SourceState};
 pub use snapshot::{ConfigSnapshot, RouteMatch as SnapshotRouteMatch};
 
@@ -39,21 +41,18 @@ use std::sync::{Arc, Mutex, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceId {
-    /// The ADS stream from `dubbod`.
+    /// The delta ADS stream from `dubbod`: the Gateway API slice.
     Xds,
-    /// A static YAML/JSON file, optionally watched.
-    Static,
-    /// The Kubernetes CRD controller.
+    /// The Kubernetes CRD controller: the AI-gateway slice.
     Kubernetes,
 }
 
 impl SourceId {
-    pub const ALL: [SourceId; 3] = [SourceId::Xds, SourceId::Static, SourceId::Kubernetes];
+    pub const ALL: [SourceId; 2] = [SourceId::Xds, SourceId::Kubernetes];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             SourceId::Xds => "xds",
-            SourceId::Static => "static",
             SourceId::Kubernetes => "kubernetes",
         }
     }
@@ -129,23 +128,25 @@ impl fmt::Display for ResourceKey {
 /// order, and a name-keyed map has no declaration order of its own. A
 /// state-of-the-world source assigns each resource its index in the list it
 /// published, so re-publishing the same list reproduces the same order.
-#[derive(Debug, Clone)]
-struct Owned<T> {
+#[derive(Debug, Clone, PartialEq)]
+struct Owned<T: PartialEq> {
     source: SourceId,
     order: u32,
     value: Arc<T>,
 }
 
-/// The mutable half of the store: owner-tracked maps, one per resource kind.
+/// The mutable half of the store: one owner-tracked [`Collection`] per resource
+/// kind. All the "did this actually change" bookkeeping lives in `Collection`,
+/// not here.
 #[derive(Debug, Default)]
 struct Resources {
-    listeners: BTreeMap<String, Owned<Listener>>,
-    clusters: BTreeMap<String, Owned<Cluster>>,
-    secrets: BTreeMap<String, Owned<TlsSecret>>,
-    providers: BTreeMap<String, Owned<Provider>>,
-    backends: BTreeMap<String, Owned<Backend>>,
-    agent_routes: BTreeMap<String, Owned<AgentRoute>>,
-    policies: BTreeMap<String, Owned<Policy>>,
+    listeners: Collection<String, Owned<Listener>>,
+    clusters: Collection<String, Owned<Cluster>>,
+    secrets: Collection<String, Owned<TlsSecret>>,
+    providers: Collection<String, Owned<Provider>>,
+    backends: Collection<String, Owned<Backend>>,
+    agent_routes: Collection<String, Owned<AgentRoute>>,
+    policies: Collection<String, Owned<Policy>>,
     /// Version label last reported by each source, surfaced on `/readyz`.
     source_versions: BTreeMap<SourceId, String>,
     /// Upserts refused on each source's most recent apply, kept until that
@@ -352,13 +353,19 @@ impl ConfigStore {
     /// its stream is torn down permanently.
     pub fn evict_source(&self, source: SourceId) -> ApplyOutcome {
         let mut resources = self.write.lock().expect("config store lock poisoned");
-        resources.listeners.retain(|_, o| o.source != source);
-        resources.clusters.retain(|_, o| o.source != source);
-        resources.secrets.retain(|_, o| o.source != source);
-        resources.providers.retain(|_, o| o.source != source);
-        resources.backends.retain(|_, o| o.source != source);
-        resources.agent_routes.retain(|_, o| o.source != source);
-        resources.policies.retain(|_, o| o.source != source);
+        resources
+            .listeners
+            .retain(|_, owned| owned.source != source);
+        resources.clusters.retain(|_, owned| owned.source != source);
+        resources.secrets.retain(|_, owned| owned.source != source);
+        resources
+            .providers
+            .retain(|_, owned| owned.source != source);
+        resources.backends.retain(|_, owned| owned.source != source);
+        resources
+            .agent_routes
+            .retain(|_, owned| owned.source != source);
+        resources.policies.retain(|_, owned| owned.source != source);
         resources.source_versions.remove(&source);
         resources.rejections.remove(&source);
         resources.revision += 1;
@@ -386,7 +393,7 @@ impl ConfigStore {
 /// on every update; recognising them keeps the store from bumping its revision
 /// and rebuilding every index for nothing.
 fn upsert_all<T: PartialEq>(
-    map: &mut BTreeMap<String, Owned<T>>,
+    collection: &mut Collection<String, Owned<T>>,
     source: SourceId,
     kind: ResourceKind,
     values: Vec<T>,
@@ -395,9 +402,8 @@ fn upsert_all<T: PartialEq>(
 ) -> bool {
     let mut changed = false;
     for (order, value) in values.into_iter().enumerate() {
-        let order = order as u32;
         let name = name_of(&value);
-        if let Some(existing) = map.get(&name) {
+        if let Some(existing) = collection.get(&name) {
             if existing.source != source {
                 rejected.push(ConfigConflict::new(
                     "ownership-conflict",
@@ -408,16 +414,12 @@ fn upsert_all<T: PartialEq>(
                 ));
                 continue;
             }
-            if existing.order == order && *existing.value == value {
-                continue;
-            }
         }
-        changed = true;
-        map.insert(
+        changed |= collection.upsert(
             name,
             Owned {
                 source,
-                order,
+                order: order as u32,
                 value: Arc::new(value),
             },
         );
@@ -428,8 +430,8 @@ fn upsert_all<T: PartialEq>(
 /// Flattens an owner-tracked map into declaration order: position within the
 /// owning source first, then source, then name. Cross-source ties cannot be
 /// ordered meaningfully, so they fall back to something deterministic.
-fn ordered<T>(map: &BTreeMap<String, Owned<T>>) -> Vec<Arc<T>> {
-    let mut entries: Vec<(&String, &Owned<T>)> = map.iter().collect();
+fn ordered<T: PartialEq>(collection: &Collection<String, Owned<T>>) -> Vec<Arc<T>> {
+    let mut entries: Vec<(&String, &Owned<T>)> = collection.iter().collect();
     entries.sort_by(|(left_name, left), (right_name, right)| {
         left.order
             .cmp(&right.order)
@@ -442,17 +444,25 @@ fn ordered<T>(map: &BTreeMap<String, Owned<T>>) -> Vec<Arc<T>> {
         .collect()
 }
 
-fn by_name<T>(map: &BTreeMap<String, Owned<T>>) -> Vec<(String, Arc<T>)> {
-    map.iter()
+fn by_name<T: PartialEq>(collection: &Collection<String, Owned<T>>) -> Vec<(String, Arc<T>)> {
+    collection
+        .iter()
         .map(|(name, owned)| (name.clone(), owned.value.clone()))
         .collect()
 }
 
 /// Removes `key` if `source` owns it. Returns whether anything was removed.
 fn remove_owned(resources: &mut Resources, source: SourceId, key: &ResourceKey) -> bool {
-    fn take<T>(map: &mut BTreeMap<String, Owned<T>>, source: SourceId, name: &str) -> bool {
-        if map.get(name).is_some_and(|owned| owned.source == source) {
-            return map.remove(name).is_some();
+    fn take<T: PartialEq>(
+        collection: &mut Collection<String, Owned<T>>,
+        source: SourceId,
+        name: &String,
+    ) -> bool {
+        if collection
+            .get(name)
+            .is_some_and(|owned| owned.source == source)
+        {
+            return collection.remove(name);
         }
         false
     }
@@ -492,12 +502,12 @@ fn build_snapshot(resources: &Resources) -> ConfigSnapshot {
 
 fn resource_owners(resources: &Resources) -> BTreeMap<ResourceKey, SourceId> {
     let mut owners = BTreeMap::new();
-    fn collect<T>(
+    fn collect<T: PartialEq>(
         owners: &mut BTreeMap<ResourceKey, SourceId>,
         kind: ResourceKind,
-        map: &BTreeMap<String, Owned<T>>,
+        collection: &Collection<String, Owned<T>>,
     ) {
-        for (name, owned) in map {
+        for (name, owned) in collection.iter() {
             owners.insert(ResourceKey::new(kind, name.clone()), owned.source);
         }
     }
@@ -679,7 +689,7 @@ mod tests {
             ConfigDelta::default().with_clusters(vec![cluster("reviews")]),
         );
         let outcome = store.apply(
-            SourceId::Static,
+            SourceId::Kubernetes,
             ConfigDelta::default().with_clusters(vec![cluster("reviews")]),
         );
 
@@ -764,7 +774,7 @@ mod tests {
     fn readiness_is_false_until_a_source_applies() {
         let store = ConfigStore::new();
         assert!(!store.snapshot().ready());
-        store.apply(SourceId::Static, ConfigDelta::default());
+        store.apply(SourceId::Xds, ConfigDelta::default());
         assert!(store.snapshot().ready());
     }
 

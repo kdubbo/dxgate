@@ -18,31 +18,6 @@ data:
       "cluster_id": "Kubernetes",
       "dns_domain": "cluster.local"
     }
-  runtime.yaml: |
-    version: k8s-example
-    listeners:
-      - name: http-80
-        bind: "0.0.0.0:80"
-        protocol: http
-        virtual_hosts:
-          - name: wildcard
-            domains: ["*"]
-            routes:
-              - name: default
-                matches:
-                  - path:
-                      type: prefix
-                      value: /
-                weighted_clusters:
-                  - name: example-backend
-                    weight: 100
-    clusters:
-      - name: example-backend
-        endpoints:
-          - address: dxgate-example-backend.dubbo-system.svc.cluster.local
-            port: 8080
-            healthy: true
-    secrets: []
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -83,8 +58,6 @@ spec:
               value: all
             - name: DXGATE_BOOTSTRAP
               value: /etc/dxgate/bootstrap.json
-            - name: DXGATE_STATIC_CONFIG
-              value: /etc/dxgate/runtime.yaml
             - name: DXGATE_HTTP_ADDR
               value: 0.0.0.0:8080
             - name: DXGATE_UI_ADDR
@@ -150,8 +123,6 @@ spec:
             items:
               - key: bootstrap.json
                 path: bootstrap.json
-              - key: runtime.yaml
-                path: runtime.yaml
 ---
 apiVersion: v1
 kind: Service

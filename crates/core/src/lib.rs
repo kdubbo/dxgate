@@ -9,6 +9,6 @@ pub use error::*;
 pub use identity::*;
 pub use matchers::*;
 pub use store::{
-    ApplyOutcome, ConfigDelta, ConfigSnapshot, ConfigStore, ResourceKey, ResourceKind, SourceId,
-    SourceState,
+    ApplyOutcome, ChangeSet, Collection, ConfigDelta, ConfigSnapshot, ConfigStore, ResourceKey,
+    ResourceKind, SourceId, SourceState,
 };

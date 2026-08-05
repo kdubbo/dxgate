@@ -3,7 +3,7 @@ use dxgate_controller::{crds, run_controller};
 use dxgate_core::{ConfigStore, RouterIdentity, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
 use dxgate_proxy::{ProxyServer, ProxyState};
 use dxgate_ui::UiServer;
-use dxgate_xds::{BootstrapConfig, StaticConfigSource, XdsClient, XdsClientConfig};
+use dxgate_xds::{BootstrapConfig, XdsClient, XdsClientConfig};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -46,12 +46,6 @@ struct Args {
     // the process mid-drain and the graceful shutdown buys nothing.
     #[arg(long, env = "DXGATE_DRAIN_TIMEOUT_SECONDS", default_value_t = 30)]
     drain_timeout_seconds: u64,
-
-    #[arg(long, env = "DXGATE_STATIC_CONFIG")]
-    static_config: Option<PathBuf>,
-
-    #[arg(long, env = "DXGATE_CONFIG_WATCH", default_value_t = false)]
-    config_watch: bool,
 
     #[arg(long, env = "DXGATE_BOOTSTRAP")]
     bootstrap: Option<PathBuf>,
@@ -137,16 +131,6 @@ async fn main() -> std::io::Result<()> {
     // a source's update only ever touches the resources that source published.
     let store = Arc::new(ConfigStore::new());
     let state = ProxyState::with_store(store.clone());
-
-    if let Some(path) = args.static_config.clone() {
-        let mut source = StaticConfigSource::new(path, store.clone());
-        if let Err(err) = source.reload().await {
-            error!(%err, "failed loading static config");
-        }
-        if args.config_watch {
-            tokio::spawn(source.watch());
-        }
-    }
 
     if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) && run_xds {
         let xds = XdsClient::new(XdsClientConfig {
@@ -365,9 +349,11 @@ fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {
     }
 }
 
+/// Whether to open an ADS stream. dxgate is a delegated data plane, so the xDS
+/// client is on unless explicitly disabled — a proxy with no control plane and
+/// no CRDs has nothing to route.
 fn should_run_xds(args: &Args) -> bool {
-    args.xds_enabled
-        .unwrap_or_else(|| args.static_config.is_none() || !args.listener_names.is_empty())
+    args.xds_enabled.unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -385,8 +371,6 @@ mod tests {
             http_addr: "0.0.0.0:80".parse().unwrap(),
             ui_addr: "0.0.0.0:15021".parse().unwrap(),
             drain_timeout_seconds: 30,
-            static_config: None,
-            config_watch: false,
             bootstrap: Some(PathBuf::from("/etc/dxgate/bootstrap.json")),
             otel_endpoint: None,
             otel_service_name: "dxgate".to_string(),
@@ -441,23 +425,14 @@ mod tests {
     }
 
     #[test]
-    fn static_only_run_disables_xds_by_default() {
+    fn xds_runs_unless_explicitly_disabled() {
         let mut args = base_args();
-        args.static_config = Some(PathBuf::from("examples/config.yaml"));
+        assert!(should_run_xds(&args));
 
+        args.xds_enabled = Some(false);
         assert!(!should_run_xds(&args));
 
         args.xds_enabled = Some(true);
-        assert!(should_run_xds(&args));
-    }
-
-    #[test]
-    fn xds_runs_by_default_without_static_config_or_with_listener_names() {
-        let mut args = base_args();
-        assert!(should_run_xds(&args));
-
-        args.static_config = Some(PathBuf::from("examples/config.yaml"));
-        args.listener_names = vec!["public.example:80".to_string()];
         assert!(should_run_xds(&args));
     }
 }

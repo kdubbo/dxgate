@@ -20,6 +20,21 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `store::Collection`, the one keyed collection every dxgate resource cache is
+  built on. dxgate had five hand-written versions of "apply an event and work
+  out what changed" — the xDS resource cache, the Kubernetes informer cache, the
+  source key tracker, and the store's own resource maps — and that is exactly
+  where its state-management bugs lived (the xDS client shipped one that never
+  re-subscribed to RDS/CDS/EDS after a reconnect). Four of the five now share one
+  implementation; the fifth, the proxy's hot-state pruning, is keyed on
+  configuration but holds runtime counters and is deliberately left alone.
+- Property tests for the invariants hand-written state management gets wrong
+  (`crates/core/tests/collection_invariants.rs`): an add followed by a remove
+  leaves no trace, upserts of distinct keys commute, replaying the same
+  state-of-the-world reports no change, a state-of-the-world replace equals its
+  input, the reported change set explains the difference exactly, and repeated
+  events are idempotent. Testing these once is the point — the alternative is
+  re-arguing them at every call site.
 - An owner-tracked configuration store (`dxgate_core::store`). Every resource is
   keyed by `(kind, name)` and carries the `SourceId` that published it, so a
   source's update only ever touches resources that source owns. Upserting a
@@ -30,9 +45,9 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whichever published last erased the others.
 - `SourceState`, the bridge that lets a state-of-the-world source drive the delta
   store: it diffs each full list against the keys that source published last time
-  and turns every disappearance into an explicit removal. Used by the static-file
-  source, the Kubernetes informer's re-list path, and the xDS client's derived
-  resources.
+  and turns every disappearance into an explicit removal. Used by the Kubernetes
+  informer's re-list path and by the xDS client's derived resources, neither of
+  which can say what it stopped producing.
 - Delta ADS (`DeltaAggregatedResources`). The client now prefers the incremental
   protocol, tracks per-resource versions, and replays them as
   `initial_resource_versions` after a reconnect so the control plane only resends
@@ -68,12 +83,11 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Configuration sources no longer overwrite each other. xDS, the static file, and
-  the Kubernetes controller each pushed a whole `RuntimeConfig` into one
-  `watch` channel, so running more than one source meant the last writer won.
-  They now write owner-scoped deltas into a shared store, and the xDS client is
-  no longer limited to listeners and clusters because it can no longer blank the
-  agent slice by publishing.
+- Configuration sources no longer overwrite each other. Every source pushed a
+  whole `RuntimeConfig` into one `watch` channel, so running more than one meant
+  the last writer won. They now write owner-scoped deltas into a shared store,
+  and the xDS client is no longer confined to listeners and clusters because it
+  can no longer blank the agent slice by publishing.
 - The Kubernetes controller consumes watch events instead of using them as a
   bell. It previously re-`LIST`ed all four CRD kinds and rebuilt the whole
   configuration on any event; it now keeps a per-kind informer cache fed by
@@ -91,6 +105,19 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whenever domains had different sizes. Cursors are now keyed by route (for
   weighted clusters/backends) and by cluster (for endpoints), and are pruned when a
   config drops the route or cluster.
+
+### Removed
+
+- The static-file configuration source. dxgate is a delegated data plane: the
+  Gateway API slice comes from `dubbod` over ADS and the AI-gateway slice from
+  Kubernetes CRDs, and a third source that could publish either was surface
+  without a role. Gone: `StaticConfigSource`, `StaticConfigFile`, the
+  `RuntimeConfigSource` trait, `SourceId::Static`, `--static-config` /
+  `DXGATE_STATIC_CONFIG`, `--config-watch` / `DXGATE_CONFIG_WATCH`, and
+  `examples/config.yaml`. `crates/xds/src/source.rs` is now `bootstrap.rs` and
+  holds only `BootstrapConfig`, which carries node identity rather than
+  configuration. `--xds-enabled` now defaults to on rather than being inferred
+  from whether a static file was supplied.
 
 ### Changed
 

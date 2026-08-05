@@ -24,8 +24,9 @@ struct Inner {
     /// Pruning is driven from the read path rather than the write path because
     /// sources write to the store without going through `ProxyState`.
     pruned_revision: AtomicU64,
-    /// Backs the state-of-the-world [`ProxyState::apply_config`] helper.
-    static_source: Mutex<SourceState>,
+    /// Backs the [`ProxyState::apply_config`] helper: one state-of-the-world
+    /// tracker per owning source.
+    document_sources: Mutex<BTreeMap<SourceId, SourceState>>,
     // Round-robin cursors, one per selection domain: routes rotate over their
     // weighted clusters/backends, clusters rotate over their endpoints. A single
     // shared counter made each domain's sequence depend on unrelated traffic, so
@@ -349,7 +350,7 @@ impl ProxyState {
             inner: Arc::new(Inner {
                 store,
                 pruned_revision: AtomicU64::new(0),
-                static_source: Mutex::new(SourceState::new()),
+                document_sources: Mutex::new(BTreeMap::new()),
                 route_pickers: Mutex::new(HashMap::new()),
                 endpoint_pickers: Mutex::new(HashMap::new()),
                 rate_limits: Mutex::new(HashMap::new()),
@@ -384,16 +385,57 @@ impl ProxyState {
         outcome
     }
 
-    /// Publishes a whole configuration document as the [`SourceId::Static`]
-    /// source, diffing it against what that source published last so removals
-    /// are explicit. Returns the merged store's conflicts, if any.
+    /// Publishes a whole configuration document, splitting it across the sources
+    /// that own each slice in production: the Gateway API resources are applied
+    /// as [`SourceId::Xds`], the agent resources as [`SourceId::Kubernetes`].
+    ///
+    /// Each half is diffed against what that source published last, so removals
+    /// are explicit. Returns the merged store's problems, if any. Intended for
+    /// tests and single-shot bootstrapping; running sources apply deltas
+    /// directly to the store.
     pub fn apply_config(&self, cfg: RuntimeConfig) -> std::result::Result<(), Vec<ConfigConflict>> {
-        let delta = {
-            let mut source = self.inner.static_source.lock().unwrap();
-            source.reconcile(cfg)
+        let RuntimeConfig {
+            version,
+            listeners,
+            clusters,
+            secrets,
+            providers,
+            backends,
+            routes,
+            policies,
+        } = cfg;
+        let gateway = ConfigDelta::default()
+            .with_version(version.clone())
+            .with_listeners(listeners)
+            .with_clusters(clusters);
+        let agent = ConfigDelta::default()
+            .with_version(version)
+            .with_secrets(secrets)
+            .with_providers(providers)
+            .with_backends(backends)
+            .with_agent_routes(routes)
+            .with_policies(policies);
+
+        let (gateway, agent) = {
+            let mut sources = self.inner.document_sources.lock().unwrap();
+            (
+                sources
+                    .entry(SourceId::Xds)
+                    .or_default()
+                    .reconcile_delta(gateway),
+                sources
+                    .entry(SourceId::Kubernetes)
+                    .or_default()
+                    .reconcile_delta(agent),
+            )
         };
-        let outcome = self.apply_delta(SourceId::Static, delta);
-        let problems = outcome.problems();
+        // Rejections are per-apply, but referential conflicts describe the
+        // merged store, so they are read once from the final outcome rather
+        // than collected from both halves and reported twice.
+        let mut problems = self.apply_delta(SourceId::Xds, gateway).rejected;
+        let outcome = self.apply_delta(SourceId::Kubernetes, agent);
+        problems.extend(outcome.rejected);
+        problems.extend(outcome.conflicts);
         if problems.is_empty() {
             Ok(())
         } else {
@@ -1070,7 +1112,7 @@ mod tests {
 
         let readiness = state.readiness();
         assert!(readiness.ready);
-        assert_eq!(readiness.version, "static=ok");
+        assert_eq!(readiness.version, "xds=ok,kubernetes=ok");
         assert!(readiness.conflicts.is_empty());
 
         let mut invalid = valid_config("bad");
