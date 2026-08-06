@@ -4,8 +4,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use dxgate_proxy::{
-    A2aMethodMetric, HttpRouteMetric, LlmUsageMetric, McpToolMetric, ProxyMetrics, ProxyState,
-    Readiness, RouteMetric,
+    A2aMethodMetric, HttpRouteConcurrencyMetric, HttpRouteMetric, LlmUsageMetric, McpToolMetric,
+    ProxyMetrics, ProxyState, Readiness, RouteMetric,
 };
 use serde::Serialize;
 use std::future::Future;
@@ -132,6 +132,34 @@ fn prometheus_metrics(readiness: Readiness, proxy: ProxyMetrics) -> String {
         "dxgate_upstream_failures_total {}\n",
         proxy.upstream_failures
     ));
+    out.push_str("# HELP dxgate_requests_in_flight Requests being handled right now\n# TYPE dxgate_requests_in_flight gauge\n");
+    out.push_str(&format!(
+        "dxgate_requests_in_flight {}\n",
+        proxy.concurrency.in_flight
+    ));
+    // Scale on rate() of this rather than on the gauge above: the gauge is a
+    // single instant and misses every burst that lands between two scrapes.
+    out.push_str("# HELP dxgate_request_seconds_total Accumulated request time; rate() gives average concurrency\n# TYPE dxgate_request_seconds_total counter\n");
+    out.push_str(&format!(
+        "dxgate_request_seconds_total {}\n",
+        proxy.concurrency.seconds_total
+    ));
+    out.push_str("# HELP dxgate_http_route_requests_in_flight Requests in flight by route and cluster\n# TYPE dxgate_http_route_requests_in_flight gauge\n");
+    for route in &proxy.http_route_concurrency {
+        let labels = http_route_concurrency_labels(route);
+        out.push_str(&format!(
+            "dxgate_http_route_requests_in_flight{{{labels}}} {}\n",
+            route.concurrency.in_flight
+        ));
+    }
+    out.push_str("# HELP dxgate_http_route_request_seconds_total Accumulated request time by route and cluster\n# TYPE dxgate_http_route_request_seconds_total counter\n");
+    for route in &proxy.http_route_concurrency {
+        let labels = http_route_concurrency_labels(route);
+        out.push_str(&format!(
+            "dxgate_http_route_request_seconds_total{{{labels}}} {}\n",
+            route.concurrency.seconds_total
+        ));
+    }
     out.push_str("# HELP dxgate_http_route_requests_total HTTP gateway requests observed by route and cluster\n# TYPE dxgate_http_route_requests_total counter\n");
     for route in &proxy.http_routes {
         let labels = http_route_labels(route);
@@ -299,6 +327,15 @@ fn http_route_labels(route: &HttpRouteMetric) -> String {
     ])
 }
 
+fn http_route_concurrency_labels(route: &HttpRouteConcurrencyMetric) -> String {
+    prometheus_labels(&[
+        ("namespace", route.namespace.as_str()),
+        ("gateway", route.gateway.as_str()),
+        ("route", route.route.as_str()),
+        ("cluster", route.cluster.as_str()),
+    ])
+}
+
 fn agent_route_labels(route: &RouteMetric) -> String {
     prometheus_labels(&[
         ("protocol", route.protocol.as_str()),
@@ -409,9 +446,35 @@ const UI_HTML: &str = include_str!("../../../ui/ui.html");
 mod tests {
     use super::{prometheus_metrics, ui_html};
     use dxgate_proxy::{
-        A2aMethodMetric, HttpRouteMetric, LatencyBucket, LlmUsageMetric, McpToolMetric,
-        ProxyMetrics, Readiness,
+        A2aMethodMetric, ConcurrencyMetric, HttpRouteConcurrencyMetric, HttpRouteMetric,
+        LatencyBucket, LlmUsageMetric, McpToolMetric, ProxyMetrics, Readiness,
     };
+
+    fn ready() -> Readiness {
+        Readiness {
+            ready: true,
+            revision: 1,
+            version: "static=test".into(),
+            source_versions: Default::default(),
+            conflicts: vec![],
+        }
+    }
+
+    fn empty_metrics() -> ProxyMetrics {
+        ProxyMetrics {
+            total_requests: 0,
+            agent_requests: 0,
+            policy_denied: 0,
+            upstream_failures: 0,
+            concurrency: ConcurrencyMetric::default(),
+            http_route_concurrency: vec![],
+            http_routes: vec![],
+            routes: vec![],
+            llm_usage: vec![],
+            mcp_tools: vec![],
+            a2a_methods: vec![],
+        }
+    }
 
     #[test]
     fn ui_page_contains_runtime_panels() {
@@ -450,6 +513,48 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_metrics_expose_concurrency_for_autoscaling() {
+        let mut proxy = empty_metrics();
+        proxy.concurrency = ConcurrencyMetric {
+            in_flight: 7,
+            seconds_total: 12.5,
+        };
+        proxy.http_route_concurrency = vec![HttpRouteConcurrencyMetric {
+            namespace: "app".into(),
+            gateway: "public".into(),
+            route: "orders".into(),
+            cluster: "orders-v1".into(),
+            concurrency: ConcurrencyMetric {
+                in_flight: 3,
+                seconds_total: 4.25,
+            },
+        }];
+
+        let text = prometheus_metrics(ready(), proxy);
+
+        assert!(text.contains("# TYPE dxgate_requests_in_flight gauge"));
+        assert!(text.contains("dxgate_requests_in_flight 7"));
+        // A counter, so rate() over it is average concurrency regardless of
+        // when the scrape lands.
+        assert!(text.contains("# TYPE dxgate_request_seconds_total counter"));
+        assert!(text.contains("dxgate_request_seconds_total 12.5"));
+        assert!(text.contains(
+            "dxgate_http_route_requests_in_flight{namespace=\"app\",gateway=\"public\",route=\"orders\",cluster=\"orders-v1\"} 3"
+        ));
+        assert!(text.contains(
+            "dxgate_http_route_request_seconds_total{namespace=\"app\",gateway=\"public\",route=\"orders\",cluster=\"orders-v1\"} 4.25"
+        ));
+        // Per-route concurrency cannot carry method or status: neither is known
+        // while the request is still in flight.
+        let in_flight_line = text
+            .lines()
+            .find(|line| line.starts_with("dxgate_http_route_requests_in_flight{"))
+            .expect("in-flight series");
+        assert!(!in_flight_line.contains("method="));
+        assert!(!in_flight_line.contains("status_code="));
+    }
+
+    #[test]
     fn prometheus_metrics_escape_labels_and_include_http_dimensions() {
         let text = prometheus_metrics(
             Readiness {
@@ -464,6 +569,8 @@ mod tests {
                 agent_requests: 0,
                 policy_denied: 0,
                 upstream_failures: 1,
+                concurrency: ConcurrencyMetric::default(),
+                http_route_concurrency: vec![],
                 http_routes: vec![HttpRouteMetric {
                     namespace: "app\nns".into(),
                     gateway: "public\"gw".into(),

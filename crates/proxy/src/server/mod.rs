@@ -179,6 +179,9 @@ async fn proxy_request(State(server): State<ProxyServer>, req: Request<Body>) ->
         upstream.address = tracing::field::Empty
     );
     span.set_parent(parent_context);
+    // Held for the whole handler: a request denied by policy or rejected before
+    // routing still occupied the gateway while it was being handled.
+    let _in_flight = server.state.track_request();
     let result = forward(server, req).instrument(span.clone()).await;
     match result {
         Ok(resp) => {
@@ -415,6 +418,14 @@ async fn forward_http(
     };
     inject_trace_context(req.headers_mut());
 
+    // Scoped to the upstream call: that is the window a route is actually
+    // occupying a connection, and the one an autoscaler needs to see.
+    let _route_in_flight = server.state.track_route_request(
+        &server.metrics_identity.namespace,
+        &server.metrics_identity.gateway,
+        &route_name,
+        &cluster_name,
+    );
     let started = Instant::now();
     let result = match (request_mode, use_h2) {
         (UpstreamRequestMode::PlainHttp, false) => server.clients.request_plain(req).await,

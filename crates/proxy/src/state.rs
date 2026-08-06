@@ -11,6 +11,102 @@ use std::time::{Duration, Instant};
 
 const LATENCY_BUCKETS_MS: [u64; 7] = [5, 10, 25, 50, 100, 250, 1000];
 
+/// Concurrency tracker for one scope: the gateway as a whole, or one route.
+///
+/// It reports two things because neither alone is enough to scale on. `current`
+/// is what a scrape sees at that instant, which misses everything between
+/// scrapes. `micros_total` is the integral of `current` over time, so
+/// `rate(..._seconds_total[1m])` yields the true average concurrency for that
+/// minute no matter when Prometheus happened to poll.
+///
+/// Concurrency is tracked rather than derived from the latency histogram
+/// because that histogram only records requests that finished. A gateway
+/// stalled on slow upstreams — exactly the case worth scaling for — reports
+/// nothing there until the backlog drains.
+#[derive(Debug)]
+struct Concurrency {
+    current: u64,
+    micros_total: u128,
+    updated: Instant,
+}
+
+impl Default for Concurrency {
+    fn default() -> Self {
+        Self {
+            current: 0,
+            micros_total: 0,
+            updated: Instant::now(),
+        }
+    }
+}
+
+impl Concurrency {
+    /// Folds the time spent at the present level into the integral. Called
+    /// before every change and before every read, so the integral is exact
+    /// rather than sampled.
+    fn accumulate(&mut self, now: Instant) {
+        self.micros_total += self.current as u128 * now.duration_since(self.updated).as_micros();
+        self.updated = now;
+    }
+
+    fn enter(&mut self, now: Instant) {
+        self.accumulate(now);
+        self.current += 1;
+    }
+
+    fn exit(&mut self, now: Instant) {
+        self.accumulate(now);
+        // Saturating because a guard must never be able to wrap the gauge into
+        // a nonsense value, whatever order drops happen in.
+        self.current = self.current.saturating_sub(1);
+    }
+
+    fn snapshot(&mut self, now: Instant) -> ConcurrencyMetric {
+        self.accumulate(now);
+        ConcurrencyMetric {
+            in_flight: self.current,
+            seconds_total: self.micros_total as f64 / 1_000_000.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ConcurrencyMetric {
+    /// Requests in flight at the moment of the read.
+    pub in_flight: u64,
+    /// Accumulated request time. `rate()` over it gives average concurrency.
+    pub seconds_total: f64,
+}
+
+/// Decrements the gateway-wide concurrency when the request ends. A request can
+/// leave through a policy denial, an upstream error or a dropped connection, so
+/// the decrement rides on `Drop` rather than on any single exit path.
+pub struct RequestGuard {
+    state: ProxyState,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let mut metrics = self.state.inner.metrics.lock().unwrap();
+        metrics.in_flight.exit(Instant::now());
+    }
+}
+
+/// Same contract as [`RequestGuard`], scoped to one route and cluster.
+pub struct RouteGuard {
+    state: ProxyState,
+    key: String,
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        let mut metrics = self.state.inner.metrics.lock().unwrap();
+        if let Some(route) = metrics.http_route_in_flight.get_mut(&self.key) {
+            route.concurrency.exit(Instant::now());
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     inner: Arc<Inner>,
@@ -61,6 +157,8 @@ pub struct ProxyMetrics {
     pub agent_requests: u64,
     pub policy_denied: u64,
     pub upstream_failures: u64,
+    pub concurrency: ConcurrencyMetric,
+    pub http_route_concurrency: Vec<HttpRouteConcurrencyMetric>,
     pub http_routes: Vec<HttpRouteMetric>,
     pub routes: Vec<RouteMetric>,
     pub llm_usage: Vec<LlmUsageMetric>,
@@ -171,6 +269,15 @@ pub struct HttpRouteMetric {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HttpRouteConcurrencyMetric {
+    pub namespace: String,
+    pub gateway: String,
+    pub route: String,
+    pub cluster: String,
+    pub concurrency: ConcurrencyMetric,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RouteMetric {
     pub protocol: String,
     pub route: String,
@@ -193,11 +300,25 @@ struct MetricsStore {
     agent_requests: u64,
     policy_denied: u64,
     upstream_failures: u64,
+    in_flight: Concurrency,
     http_routes: HashMap<String, HttpRouteMetricCounter>,
+    http_route_in_flight: HashMap<String, HttpRouteConcurrencyCounter>,
     routes: HashMap<String, RouteMetricCounter>,
     llm_usage: HashMap<String, LlmUsageMetric>,
     mcp_tools: HashMap<String, McpToolMetric>,
     a2a_methods: HashMap<String, A2aMethodMetric>,
+}
+
+/// Per-route concurrency is keyed without method or status code: both are
+/// unknown while the request is still in flight, which is the only time this
+/// counter means anything.
+#[derive(Debug, Default)]
+struct HttpRouteConcurrencyCounter {
+    namespace: String,
+    gateway: String,
+    route: String,
+    cluster: String,
+    concurrency: Concurrency,
 }
 
 #[derive(Debug, Default)]
@@ -719,6 +840,47 @@ impl ProxyState {
         }
     }
 
+    /// Counts one request as in flight until the returned guard is dropped.
+    /// Taken at the proxy entry point so requests that never reach an upstream
+    /// still show up as load.
+    pub fn track_request(&self) -> RequestGuard {
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        metrics.in_flight.enter(Instant::now());
+        drop(metrics);
+        RequestGuard {
+            state: self.clone(),
+        }
+    }
+
+    /// Counts one request as in flight against a route and cluster until the
+    /// returned guard is dropped.
+    pub fn track_route_request(
+        &self,
+        namespace: &str,
+        gateway: &str,
+        route: &str,
+        cluster: &str,
+    ) -> RouteGuard {
+        let key = format!("{namespace}|{gateway}|{route}|{cluster}");
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        let counter = metrics
+            .http_route_in_flight
+            .entry(key.clone())
+            .or_insert_with(|| HttpRouteConcurrencyCounter {
+                namespace: namespace.to_string(),
+                gateway: gateway.to_string(),
+                route: route.to_string(),
+                cluster: cluster.to_string(),
+                ..HttpRouteConcurrencyCounter::default()
+            });
+        counter.concurrency.enter(Instant::now());
+        drop(metrics);
+        RouteGuard {
+            state: self.clone(),
+            key,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_http_request(
         &self,
@@ -892,7 +1054,31 @@ impl ProxyState {
     }
 
     pub fn metrics(&self) -> ProxyMetrics {
-        let metrics = self.inner.metrics.lock().unwrap();
+        let mut metrics = self.inner.metrics.lock().unwrap();
+        // Reading folds the elapsed time into the integrals, so a scope that
+        // has been busy at a steady level since the last scrape still reports
+        // the time it spent there.
+        let now = Instant::now();
+        let concurrency = metrics.in_flight.snapshot(now);
+        let mut http_route_concurrency = metrics
+            .http_route_in_flight
+            .values_mut()
+            .map(|route| HttpRouteConcurrencyMetric {
+                namespace: route.namespace.clone(),
+                gateway: route.gateway.clone(),
+                route: route.route.clone(),
+                cluster: route.cluster.clone(),
+                concurrency: route.concurrency.snapshot(now),
+            })
+            .collect::<Vec<_>>();
+        http_route_concurrency.sort_by(|a, b| {
+            a.namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.gateway.cmp(&b.gateway))
+                .then_with(|| a.route.cmp(&b.route))
+                .then_with(|| a.cluster.cmp(&b.cluster))
+        });
+        let metrics = &*metrics;
         let mut http_routes = metrics
             .http_routes
             .values()
@@ -977,6 +1163,8 @@ impl ProxyState {
             agent_requests: metrics.agent_requests,
             policy_denied: metrics.policy_denied,
             upstream_failures: metrics.upstream_failures,
+            concurrency,
+            http_route_concurrency,
             http_routes,
             routes,
             llm_usage,
@@ -1060,6 +1248,74 @@ mod tests {
             routes: vec![],
             policies: vec![],
         }
+    }
+
+    #[test]
+    fn in_flight_tracks_guard_lifetime() {
+        let state = ProxyState::new();
+        assert_eq!(state.metrics().concurrency.in_flight, 0);
+
+        let first = state.track_request();
+        let second = state.track_request();
+        assert_eq!(state.metrics().concurrency.in_flight, 2);
+
+        drop(first);
+        assert_eq!(state.metrics().concurrency.in_flight, 1);
+        drop(second);
+        assert_eq!(state.metrics().concurrency.in_flight, 0);
+    }
+
+    #[test]
+    fn route_in_flight_is_scoped_to_route_and_cluster() {
+        let state = ProxyState::new();
+        let orders = state.track_route_request("app", "public", "orders", "orders-v1");
+        let _reviews = state.track_route_request("app", "public", "reviews", "reviews-v1");
+
+        let by_route = |metrics: &ProxyMetrics, route: &str| {
+            metrics
+                .http_route_concurrency
+                .iter()
+                .find(|entry| entry.route == route)
+                .map(|entry| entry.concurrency.in_flight)
+                .unwrap_or_default()
+        };
+
+        let metrics = state.metrics();
+        assert_eq!(by_route(&metrics, "orders"), 1);
+        assert_eq!(by_route(&metrics, "reviews"), 1);
+
+        drop(orders);
+        let metrics = state.metrics();
+        assert_eq!(by_route(&metrics, "orders"), 0);
+        // The series stays published at zero so a scrape can tell "idle" apart
+        // from "route no longer exists".
+        assert_eq!(by_route(&metrics, "reviews"), 1);
+    }
+
+    // The integral is what an autoscaler reads through rate(); a gauge sampled
+    // between scrapes would report zero for a request that started and finished
+    // in the gap.
+    #[test]
+    fn request_seconds_accumulate_while_in_flight() {
+        let state = ProxyState::new();
+        assert_eq!(state.metrics().concurrency.seconds_total, 0.0);
+
+        let guard = state.track_request();
+        std::thread::sleep(Duration::from_millis(20));
+        let held = state.metrics().concurrency.seconds_total;
+        assert!(
+            held > 0.0,
+            "seconds_total = {held}, want > 0 while in flight"
+        );
+
+        drop(guard);
+        let after_drop = state.metrics().concurrency.seconds_total;
+        assert!(after_drop >= held);
+
+        // An idle gateway must stop accumulating, otherwise rate() reports load
+        // that is not there.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(state.metrics().concurrency.seconds_total, after_drop);
     }
 
     #[test]
