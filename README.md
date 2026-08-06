@@ -14,9 +14,9 @@ It also ships an additional proxy gateway runtime for OpenAI-compatible LLM rout
 
 ## Features
 
-- **Dubbo Gateway API data plane** — HTTP routing by host, path, and header with weighted clusters, driven by `dubbod` over xDS (listeners, clusters, endpoints, TLS secrets).
+- **Dubbo Gateway API data plane** — HTTP routing by host, path, and header with weighted clusters, driven by `dubbod` over xDS (listeners, clusters, endpoints).
 - **gRPC / Dubbo Triple / HTTP/2** — end-to-end HTTP/2 pass-through with streaming bodies and trailer propagation; gRPC and Triple requests (detected by content-type) are proxied over HTTP/2 automatically, and `http2: true` on a cluster forces h2c/ALPN h2 for plain HTTP upstreams.
-- **Upstream TLS** — plaintext, simple TLS, and Dubbo mutual TLS (certificates via xDS SDS or file-watcher bootstrap), with peer identity pinned to the cluster's `subject_alt_names` (SPIFFE URI SANs).
+- **Upstream TLS** — plaintext, simple TLS, and Dubbo mutual TLS (certificates from the file-watcher bootstrap named by `GRPC_XDS_BOOTSTRAP`), with peer identity pinned to the cluster's `subject_alt_names` (SPIFFE URI SANs).
 - **LLM routing** — OpenAI-compatible `/v1/*` routing with model-aware backend selection and streaming (SSE) pass-through.
 - **MCP routing and federation** — `mcp-session-id` session-to-backend binding and federated `tools/list` across multiple MCP backends.
 - **A2A forwarding** — agent-card and A2A endpoint routing.
