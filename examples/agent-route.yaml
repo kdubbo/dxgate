@@ -1,0 +1,77 @@
+# A routable configuration for the Kubernetes half of dxgate.
+#
+# dxgate takes the Gateway API slice (listeners, clusters) from `dubbod` over
+# xDS and the agent slice (backends, routes, policies) from these CRDs. Nothing
+# here overlaps with what dubbod publishes, which is why both can be applied at
+# once.
+#
+# Apply order:
+#   dxgate --print-crds | kubectl apply -f -
+#   kubectl apply -f examples/rbac.yaml
+#   kubectl apply -f examples/deployment.yaml
+#   kubectl apply -f examples/backend.yaml
+#   kubectl apply -f examples/agent-route.yaml
+#
+# Then, from inside the cluster:
+#   curl -H 'authorization: Bearer dxgate-example' http://dxgate.dubbo-system.svc/api/echo
+#
+# To try this without a running `dubbod`, set DXGATE_XDS_ENABLED=false on the
+# dxgate container — otherwise the ADS client retries a missing control plane
+# every 10 seconds and logs about it. Routing still works either way.
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgatePolicy
+metadata:
+  name: example-guard
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: dxgate
+spec:
+  policy:
+    name: example-guard
+    action: allow
+    auth:
+      type: api-key
+      header: authorization
+      values:
+        - Bearer dxgate-example
+    # Counted per route, in this proxy process only. Every replica enforces its
+    # own window, so N replicas admit N times this rate.
+    rate_limit:
+      requests: 100
+      window_seconds: 60
+      key: route
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgateBackend
+metadata:
+  name: example-backend
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: dxgate
+spec:
+  backend:
+    name: example-backend
+    type: http
+    endpoint: http://dxgate-example-backend.dubbo-system.svc:8080
+---
+apiVersion: gateway.dxgate.io/v1alpha1
+kind: DxgateRoute
+metadata:
+  name: example-http
+  namespace: dubbo-system
+  labels:
+    app.kubernetes.io/name: dxgate
+spec:
+  route:
+    name: example-http
+    protocol: http
+    matches:
+      - path:
+          type: prefix
+          value: /api/
+    weighted_backends:
+      - name: example-backend
+        weight: 100
+    policies:
+      - example-guard

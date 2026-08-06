@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dxgate_controller::{crds, run_controller};
 use dxgate_core::{ConfigStore, RouterIdentity, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
 use dxgate_proxy::{ProxyServer, ProxyState};
@@ -23,9 +23,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[command(name = "dxgate")]
 #[command(about = "Pure Rust north-south proxy for Dubbo Gateway API traffic")]
 struct Args {
-    #[arg(long, env = "DXGATE_MODE", default_value = "proxy")]
-    mode: DxgateMode,
-
     #[arg(
         long,
         env = "DXGATE_XDS_ADDRESS",
@@ -35,6 +32,11 @@ struct Args {
 
     #[arg(long, env = "DXGATE_XDS_ENABLED")]
     xds_enabled: Option<bool>,
+
+    // Watching the dxgate CRDs needs RBAC on them, so it is opt-in: a proxy
+    // driven only by `dubbod` should not require Kubernetes access.
+    #[arg(long, env = "DXGATE_CONTROLLER_ENABLED", default_value_t = false)]
+    controller_enabled: bool,
 
     #[arg(long, env = "DXGATE_HTTP_ADDR", default_value = "0.0.0.0:80")]
     http_addr: SocketAddr,
@@ -87,13 +89,6 @@ struct Args {
     dns_domain: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum DxgateMode {
-    Proxy,
-    Controller,
-    All,
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut args = Args::parse();
@@ -132,7 +127,7 @@ async fn main() -> std::io::Result<()> {
     let store = Arc::new(ConfigStore::new());
     let state = ProxyState::with_store(store.clone());
 
-    if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) && run_xds {
+    if run_xds {
         let xds = XdsClient::new(XdsClientConfig {
             endpoint: args.xds_address,
             identity,
@@ -145,23 +140,19 @@ async fn main() -> std::io::Result<()> {
                 error!(%err, "xDS client exited");
             }
         });
-    } else if matches!(args.mode, DxgateMode::Proxy | DxgateMode::All) {
+    } else {
         info!("xDS client disabled");
     }
 
-    if matches!(args.mode, DxgateMode::Controller | DxgateMode::All) {
+    if args.controller_enabled {
         let controller_store = store.clone();
         tokio::spawn(async move {
             if let Err(err) = run_controller(controller_store).await {
                 error!(%err, "Kubernetes controller exited");
             }
         });
-    }
-
-    if matches!(args.mode, DxgateMode::Controller) {
-        termination_signal().await;
-        info!("received shutdown signal");
-        return Ok(());
+    } else {
+        info!("Kubernetes controller disabled");
     }
 
     let proxy = ProxyServer::new(state.clone());
@@ -358,16 +349,16 @@ fn should_run_xds(args: &Args) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bootstrap, parse_otel_tags, should_run_xds, Args, DxgateMode};
+    use super::{apply_bootstrap, parse_otel_tags, should_run_xds, Args};
     use dxgate_xds::BootstrapConfig;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
     fn base_args() -> Args {
         Args {
-            mode: DxgateMode::Proxy,
             xds_address: "http://old:15012".to_string(),
             xds_enabled: None,
+            controller_enabled: false,
             http_addr: "0.0.0.0:80".parse().unwrap(),
             ui_addr: "0.0.0.0:15021".parse().unwrap(),
             drain_timeout_seconds: 30,
