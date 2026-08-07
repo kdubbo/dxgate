@@ -1,3 +1,15 @@
+// Not an xDS resource: this is the control plane's own activation-demand API.
+// It lives here because this crate already owns the protoc build and the tonic
+// client generation, and `proto/activation/v1alpha1/demand.proto` is kept
+// byte-identical to the copy dubbod generates its server from — the two are one
+// contract, so they must not drift.
+pub mod activation {
+    pub mod v1alpha1 {
+        #![allow(dead_code)]
+        tonic::include_proto!("dubbo.activation.v1alpha1");
+    }
+}
+
 pub mod cluster {
     pub mod v1 {
         #![allow(dead_code)]

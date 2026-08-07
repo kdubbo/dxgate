@@ -300,7 +300,7 @@ async fn forward_http(
         }
     };
 
-    let cluster = match snapshot.cluster(&weighted.name) {
+    let mut cluster = match snapshot.cluster(&weighted.name) {
         Some(cluster) => cluster.clone(),
         None => {
             record_http_observation(
@@ -323,6 +323,19 @@ async fn forward_http(
         }
     };
     let cluster_name = cluster.name.clone();
+
+    // A cluster with no endpoints is normally a dead backend, but it is also
+    // what a scaled-to-zero service looks like. Ask the activator before
+    // failing: it holds the request, reports the demand that drives the
+    // scale-up, and hands back the cluster once an endpoint appears. When
+    // activation is disabled, or the target is not activatable, this returns
+    // immediately and the 503 below is reached exactly as before.
+    if server.state.pick_endpoint(&cluster).await.is_err() {
+        let activator = server.state.activation();
+        if let Some(activated) = activator.activate(&server.state, &cluster_name).await {
+            cluster = activated;
+        }
+    }
 
     let endpoint = match server.state.pick_endpoint(&cluster).await {
         Ok(endpoint) => endpoint,

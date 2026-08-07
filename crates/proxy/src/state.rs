@@ -1,3 +1,4 @@
+use crate::activation::Activator;
 use dxgate_core::{
     ApplyOutcome, Cluster, ConfigConflict, ConfigDelta, ConfigSnapshot, ConfigStore, DxgateError,
     Endpoint, OutlierDetectionConfig, RateLimitPolicy, Result, RuntimeConfig, SourceId,
@@ -137,6 +138,10 @@ struct Inner {
     mcp_sessions: Mutex<BindingMap>,
     a2a_tasks: Mutex<BindingMap>,
     metrics: Mutex<MetricsStore>,
+    /// Holds requests for scaled-to-zero targets. Lives here rather than on
+    /// the server because endpoint selection — the only thing that can tell a
+    /// cold target from a dead one — lives here too.
+    activation: Activator,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +158,10 @@ pub struct Readiness {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyMetrics {
+    /// Requests parked waiting for a scaled-to-zero target to come up.
+    /// Separated from in-flight requests so a cold start is not read as the
+    /// gateway being slow.
+    pub held_activation_requests: u64,
     pub total_requests: u64,
     pub agent_requests: u64,
     pub policy_denied: u64,
@@ -467,6 +476,13 @@ impl ProxyState {
 
     /// A proxy over a store shared with the configuration sources.
     pub fn with_store(store: Arc<ConfigStore>) -> Self {
+        Self::with_activator(store, Activator::from_env())
+    }
+
+    /// A proxy whose activator is supplied rather than read from the
+    /// environment, so a test can exercise activation without setting process
+    /// state that every other test in the binary would then share.
+    pub fn with_activator(store: Arc<ConfigStore>, activation: Activator) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -481,6 +497,7 @@ impl ProxyState {
                 mcp_sessions: Mutex::new(BindingMap::default()),
                 a2a_tasks: Mutex::new(BindingMap::default()),
                 metrics: Mutex::new(MetricsStore::default()),
+                activation,
             }),
         }
     }
@@ -1053,6 +1070,10 @@ impl ProxyState {
         }
     }
 
+    pub fn activation(&self) -> &Activator {
+        &self.inner.activation
+    }
+
     pub fn metrics(&self) -> ProxyMetrics {
         let mut metrics = self.inner.metrics.lock().unwrap();
         // Reading folds the elapsed time into the integrals, so a scope that
@@ -1159,6 +1180,7 @@ impl ProxyState {
                 .then_with(|| a.method.cmp(&b.method))
         });
         ProxyMetrics {
+            held_activation_requests: self.inner.activation.held_requests(),
             total_requests: metrics.total_requests,
             agent_requests: metrics.agent_requests,
             policy_denied: metrics.policy_denied,

@@ -137,6 +137,14 @@ fn prometheus_metrics(readiness: Readiness, proxy: ProxyMetrics) -> String {
         "dxgate_requests_in_flight {}\n",
         proxy.concurrency.in_flight
     ));
+    // Counted separately from in-flight requests: these are waiting on a
+    // scale-up, not on an upstream, so folding them together would read as the
+    // gateway having gone slow.
+    out.push_str("# HELP dxgate_activation_requests_held Requests waiting for a scaled-to-zero target to come up\n# TYPE dxgate_activation_requests_held gauge\n");
+    out.push_str(&format!(
+        "dxgate_activation_requests_held {}\n",
+        proxy.held_activation_requests
+    ));
     // Scale on rate() of this rather than on the gauge above: the gauge is a
     // single instant and misses every burst that lands between two scrapes.
     out.push_str("# HELP dxgate_request_seconds_total Accumulated request time; rate() gives average concurrency\n# TYPE dxgate_request_seconds_total counter\n");
@@ -462,6 +470,7 @@ mod tests {
 
     fn empty_metrics() -> ProxyMetrics {
         ProxyMetrics {
+            held_activation_requests: 0,
             total_requests: 0,
             agent_requests: 0,
             policy_denied: 0,
@@ -565,6 +574,7 @@ mod tests {
                 conflicts: vec![],
             },
             ProxyMetrics {
+                held_activation_requests: 0,
                 total_requests: 1,
                 agent_requests: 0,
                 policy_denied: 0,
