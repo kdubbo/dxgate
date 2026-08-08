@@ -258,16 +258,11 @@ async fn forward_http(
 
     let route = match snapshot
         .route_for(server.listener_port, &input)
-        .or_else(|primary| {
-            // Preserve compatibility with static configurations that still
-            // declare the historical port 80 while the process binds a
-            // translated Kubernetes targetPort.
-            if server.listener_port == HTTP_LISTENER_PORT {
-                Err(primary)
-            } else {
-                snapshot.route_for(HTTP_LISTENER_PORT, &input)
-            }
-        }) {
+        // grpc-engine terminates the xDS listener and forwards to dxgate's
+        // local HTTP port, so the application request can lose the original
+        // targetPort. Only fall back when one xDS listener port matches.
+        .or_else(|_| snapshot.route_for_unique_port(&input))
+    {
         Ok(route) => route,
         Err(err) => {
             record_http_observation(

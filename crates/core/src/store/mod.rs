@@ -529,8 +529,9 @@ fn resource_owners(resources: &Resources) -> BTreeMap<ResourceKey, SourceId> {
 mod tests {
     use super::*;
     use crate::{
-        AgentProtocol, BackendKind, Endpoint, ListenerProtocol, PathMatch, ProviderKind, Route,
-        RouteMatch, RuntimeConfig, VirtualHost, WeightedBackend, WeightedCluster,
+        AgentProtocol, BackendKind, Endpoint, ListenerProtocol, MatchInput, PathMatch,
+        ProviderKind, Route, RouteMatch, RuntimeConfig, VirtualHost, WeightedBackend,
+        WeightedCluster,
     };
 
     fn cluster(name: &str) -> Cluster {
@@ -607,6 +608,50 @@ mod tests {
             api_key_env: None,
             request_headers: vec![],
         }
+    }
+
+    #[test]
+    fn unique_port_route_survives_a_local_target_port_hop() {
+        let store = ConfigStore::new();
+        store.apply(
+            SourceId::Xds,
+            ConfigDelta::default()
+                .with_listeners(vec![listener("gateway", 15080, "payment")])
+                .with_clusters(vec![cluster("payment")]),
+        );
+        let headers = [];
+        let input = MatchInput {
+            host: "payment.example",
+            path: "/health",
+            headers: &headers,
+        };
+
+        assert_eq!(
+            store.snapshot().route_for_unique_port(&input).unwrap().name,
+            "gateway-default"
+        );
+    }
+
+    #[test]
+    fn unique_port_route_rejects_ambiguous_listeners() {
+        let store = ConfigStore::new();
+        store.apply(
+            SourceId::Xds,
+            ConfigDelta::default()
+                .with_listeners(vec![
+                    listener("gateway-a", 15080, "payment"),
+                    listener("gateway-b", 16080, "payment"),
+                ])
+                .with_clusters(vec![cluster("payment")]),
+        );
+        let headers = [];
+        let input = MatchInput {
+            host: "payment.example",
+            path: "/health",
+            headers: &headers,
+        };
+
+        assert!(store.snapshot().route_for_unique_port(&input).is_err());
     }
 
     #[test]

@@ -326,13 +326,26 @@ impl ConfigSnapshot {
             path: input.path.to_string(),
         };
         let index = self.ports.get(&port).ok_or_else(not_found)?;
-        index
-            .hosts
-            .iter()
-            .filter(|host| host.matches_host(input.host))
-            .flat_map(|host| host.routes.iter())
-            .find(|route| route.matches(input))
-            .ok_or_else(not_found)
+        route_in_port(index, input).ok_or_else(not_found)
+    }
+
+    /// Resolves a route when a local proxy hop has hidden the original
+    /// listener port. The match must belong to exactly one xDS listener port;
+    /// ambiguity is rejected instead of routing a request across listeners.
+    pub fn route_for_unique_port(&self, input: &MatchInput<'_>) -> Result<RouteMatch<'_>> {
+        let not_found = || DxgateError::RouteNotFound {
+            host: input.host.to_string(),
+            path: input.path.to_string(),
+        };
+        let mut matches = self
+            .ports
+            .values()
+            .filter_map(|index| route_in_port(index, input));
+        let route = matches.next().ok_or_else(not_found)?;
+        if matches.next().is_some() {
+            return Err(not_found());
+        }
+        Ok(route)
     }
 
     /// Resolves an agent route within the request's protocol bucket.
@@ -384,6 +397,15 @@ impl ConfigSnapshot {
             })
             .collect()
     }
+}
+
+fn route_in_port<'a>(index: &'a PortIndex, input: &MatchInput<'_>) -> Option<&'a Arc<Route>> {
+    index
+        .hosts
+        .iter()
+        .filter(|host| host.matches_host(input.host))
+        .flat_map(|host| host.routes.iter())
+        .find(|route| route.matches(input))
 }
 
 /// One row of [`ConfigSnapshot::route_table`].
