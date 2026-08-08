@@ -64,6 +64,7 @@ pub struct ProxyServer {
     metrics_identity: MetricsIdentity,
     access_log: AccessLogConfig,
     max_body_bytes: usize,
+    listener_port: u16,
 }
 
 impl ProxyServer {
@@ -75,6 +76,7 @@ impl ProxyServer {
             metrics_identity: MetricsIdentity::from_env(),
             access_log: AccessLogConfig::from_env(),
             max_body_bytes: parse_max_body_bytes(env::var("DXGATE_MAX_BODY_BYTES").ok().as_deref()),
+            listener_port: HTTP_LISTENER_PORT,
         }
     }
 
@@ -90,7 +92,11 @@ impl ProxyServer {
         addr: SocketAddr,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
-        let app = Router::new().fallback(any(proxy_request)).with_state(self);
+        let mut server = self;
+        server.listener_port = addr.port();
+        let app = Router::new()
+            .fallback(any(proxy_request))
+            .with_state(server);
         axum::Server::bind(&addr)
             .serve(app.into_make_service())
             .with_graceful_shutdown(shutdown)
@@ -250,7 +256,18 @@ async fn forward_http(
         headers: &headers,
     };
 
-    let route = match snapshot.route_for(HTTP_LISTENER_PORT, &input) {
+    let route = match snapshot
+        .route_for(server.listener_port, &input)
+        .or_else(|primary| {
+            // Preserve compatibility with static configurations that still
+            // declare the historical port 80 while the process binds a
+            // translated Kubernetes targetPort.
+            if server.listener_port == HTTP_LISTENER_PORT {
+                Err(primary)
+            } else {
+                snapshot.route_for(HTTP_LISTENER_PORT, &input)
+            }
+        }) {
         Ok(route) => route,
         Err(err) => {
             record_http_observation(
