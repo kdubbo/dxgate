@@ -30,6 +30,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -52,32 +53,73 @@ fn object_key<K: Resource>(object: &K) -> ObjectKey {
 /// "what actually changed" bookkeeping and is property-tested for it.
 type Cache<K> = Collection<ObjectKey, K>;
 
-fn apply_event<K: Resource + Clone + PartialEq>(cache: &mut Cache<K>, event: watcher::Event<K>) {
+#[derive(Debug)]
+struct WatchCache<K> {
+    objects: Cache<K>,
+    initializing: Option<Vec<(ObjectKey, K)>>,
+}
+
+impl<K> Default for WatchCache<K> {
+    fn default() -> Self {
+        Self {
+            objects: Cache::default(),
+            initializing: None,
+        }
+    }
+}
+
+impl<K> Deref for WatchCache<K> {
+    type Target = Cache<K>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.objects
+    }
+}
+
+impl<K> DerefMut for WatchCache<K> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.objects
+    }
+}
+
+fn apply_event<K: Resource + Clone + PartialEq>(
+    cache: &mut WatchCache<K>,
+    event: watcher::Event<K>,
+) {
     match event {
-        watcher::Event::Applied(object) => {
+        watcher::Event::Apply(object) => {
             cache.upsert(object_key(&object), object);
         }
-        watcher::Event::Deleted(object) => {
+        watcher::Event::Delete(object) => {
             cache.remove(&object_key(&object));
         }
-        // The watch lost its place, so deletions may have been missed and the
-        // accompanying list is authoritative.
-        watcher::Event::Restarted(objects) => {
-            cache.replace_all(
-                objects
-                    .into_iter()
-                    .map(|object| (object_key(&object), object)),
-            );
+        watcher::Event::Init => {
+            cache.initializing = Some(Vec::new());
+        }
+        watcher::Event::InitApply(object) => {
+            let key = object_key(&object);
+            if let Some(initializing) = cache.initializing.as_mut() {
+                initializing.push((key, object));
+            } else {
+                cache.upsert(key, object);
+            }
+        }
+        // Keep serving the last complete snapshot throughout a relist, then
+        // atomically replace it so a partial list cannot erase live routes.
+        watcher::Event::InitDone => {
+            if let Some(objects) = cache.initializing.take() {
+                cache.replace_all(objects);
+            }
         }
     }
 }
 
 #[derive(Debug, Default)]
 struct Caches {
-    dxgates: Cache<Dxgate>,
-    backends: Cache<DxgateBackend>,
-    routes: Cache<DxgateRoute>,
-    policies: Cache<DxgatePolicy>,
+    dxgates: WatchCache<Dxgate>,
+    backends: WatchCache<DxgateBackend>,
+    routes: WatchCache<DxgateRoute>,
+    policies: WatchCache<DxgatePolicy>,
 }
 
 /// One event from any of the four watched kinds.
@@ -412,31 +454,32 @@ mod tests {
         object
     }
 
-    fn names(cache: &Cache<DxgateBackend>) -> Vec<String> {
+    fn names(cache: &WatchCache<DxgateBackend>) -> Vec<String> {
         cache.values().map(|object| object.name_any()).collect()
     }
 
     #[test]
     fn applied_and_deleted_events_update_one_entry() {
-        let mut cache = Cache::<DxgateBackend>::default();
+        let mut cache = WatchCache::<DxgateBackend>::default();
 
-        apply_event(&mut cache, watcher::Event::Applied(backend("app", "a")));
-        apply_event(&mut cache, watcher::Event::Applied(backend("app", "b")));
+        apply_event(&mut cache, watcher::Event::Apply(backend("app", "a")));
+        apply_event(&mut cache, watcher::Event::Apply(backend("app", "b")));
         assert_eq!(cache.len(), 2);
 
-        apply_event(&mut cache, watcher::Event::Deleted(backend("app", "a")));
+        apply_event(&mut cache, watcher::Event::Delete(backend("app", "a")));
         assert_eq!(names(&cache), ["b"]);
     }
 
     #[test]
     fn a_restart_replaces_the_cache_because_deletes_may_have_been_missed() {
-        let mut cache = Cache::<DxgateBackend>::default();
-        apply_event(&mut cache, watcher::Event::Applied(backend("app", "stale")));
+        let mut cache = WatchCache::<DxgateBackend>::default();
+        apply_event(&mut cache, watcher::Event::Apply(backend("app", "stale")));
 
-        apply_event(
-            &mut cache,
-            watcher::Event::Restarted(vec![backend("app", "b"), backend("app", "a")]),
-        );
+        apply_event(&mut cache, watcher::Event::Init);
+        apply_event(&mut cache, watcher::Event::InitApply(backend("app", "b")));
+        apply_event(&mut cache, watcher::Event::InitApply(backend("app", "a")));
+        assert_eq!(names(&cache), ["stale"]);
+        apply_event(&mut cache, watcher::Event::InitDone);
 
         // Ordered by (namespace, name), not by arrival order.
         assert_eq!(names(&cache), ["a", "b"]);
@@ -444,22 +487,16 @@ mod tests {
 
     #[test]
     fn objects_of_the_same_name_in_different_namespaces_are_distinct() {
-        let mut cache = Cache::<DxgateBackend>::default();
+        let mut cache = WatchCache::<DxgateBackend>::default();
+        apply_event(&mut cache, watcher::Event::Apply(backend("app", "shared")));
         apply_event(
             &mut cache,
-            watcher::Event::Applied(backend("app", "shared")),
-        );
-        apply_event(
-            &mut cache,
-            watcher::Event::Applied(backend("other", "shared")),
+            watcher::Event::Apply(backend("other", "shared")),
         );
 
         assert_eq!(cache.len(), 2);
 
-        apply_event(
-            &mut cache,
-            watcher::Event::Deleted(backend("app", "shared")),
-        );
+        apply_event(&mut cache, watcher::Event::Delete(backend("app", "shared")));
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache.values().next().unwrap().namespace().as_deref(),
@@ -469,9 +506,13 @@ mod tests {
 
     #[test]
     fn a_resync_delivering_identical_objects_reports_nothing() {
-        let mut cache = Cache::<DxgateBackend>::default();
+        let mut cache = WatchCache::<DxgateBackend>::default();
         let objects = vec![backend("app", "a"), backend("app", "b")];
-        apply_event(&mut cache, watcher::Event::Restarted(objects.clone()));
+        apply_event(&mut cache, watcher::Event::Init);
+        for object in objects.clone() {
+            apply_event(&mut cache, watcher::Event::InitApply(object));
+        }
+        apply_event(&mut cache, watcher::Event::InitDone);
 
         let change = cache.replace_all(
             objects

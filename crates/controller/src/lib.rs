@@ -10,9 +10,7 @@ use dxgate_core::{Backend, Policy, RuntimeConfig};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::ListParams;
 use kube::{Api, Client, CustomResource, CustomResourceExt};
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{ArrayValidation, InstanceType, Schema, SchemaObject, SingleOrVec};
-use schemars::JsonSchema;
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -131,27 +129,20 @@ fn raw_object_schema(_: &mut SchemaGenerator) -> Schema {
 }
 
 fn raw_object_vec_schema(_: &mut SchemaGenerator) -> Schema {
-    let mut schema = SchemaObject {
-        instance_type: Some(InstanceType::Array.into()),
-        ..SchemaObject::default()
-    };
-    schema.array = Some(Box::new(ArrayValidation {
-        items: Some(SingleOrVec::Single(Box::new(arbitrary_object_schema()))),
-        ..ArrayValidation::default()
-    }));
-    Schema::Object(schema)
+    json_schema!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true
+        }
+    })
 }
 
 fn arbitrary_object_schema() -> Schema {
-    let mut schema = SchemaObject {
-        instance_type: Some(InstanceType::Object.into()),
-        ..SchemaObject::default()
-    };
-    schema.extensions.insert(
-        "x-kubernetes-preserve-unknown-fields".to_string(),
-        Value::Bool(true),
-    );
-    Schema::Object(schema)
+    json_schema!({
+        "type": "object",
+        "x-kubernetes-preserve-unknown-fields": true
+    })
 }
 
 pub fn crds() -> Vec<CustomResourceDefinition> {

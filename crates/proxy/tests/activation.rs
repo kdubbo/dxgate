@@ -123,6 +123,49 @@ async fn request_fails_when_the_target_never_comes_up() {
 }
 
 #[tokio::test]
+async fn activation_backlog_rejects_excess_without_dropping_the_held_request() {
+    let backend_addr = unused_addr();
+    let proxy_addr = unused_addr();
+    let backend = spawn_backend(backend_addr);
+
+    let state = ProxyState::with_activator(
+        Arc::new(ConfigStore::new()),
+        Activator::holding(Duration::from_secs(5), 1),
+    );
+    state.apply_config(config(vec![])).unwrap();
+
+    let proxy = tokio::spawn({
+        let state = state.clone();
+        async move {
+            ProxyServer::new(state).serve(proxy_addr).await.unwrap();
+        }
+    });
+    wait_until_listening(proxy_addr).await;
+
+    let held = tokio::spawn(async move { get(proxy_addr, "/first").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!held.is_finished());
+
+    let rejected_at = Instant::now();
+    let (status, _) = get(proxy_addr, "/second").await;
+    assert_eq!(status, 503);
+    assert!(
+        rejected_at.elapsed() < Duration::from_secs(1),
+        "backlog overflow waited instead of failing fast"
+    );
+
+    state
+        .apply_config(config(vec![endpoint(backend_addr)]))
+        .unwrap();
+    let (status, body) = held.await.unwrap();
+    assert_eq!(status, 200);
+    assert!(body.contains("path=/first"));
+
+    proxy.abort();
+    backend.abort();
+}
+
+#[tokio::test]
 async fn unactivatable_targets_fail_immediately() {
     let proxy_addr = unused_addr();
 
