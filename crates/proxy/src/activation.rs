@@ -18,7 +18,7 @@
 //! endpoints appear.
 //!
 //! The gateway is the only component on the request path that can do this. The
-//! mesh is proxyless, so a caller's own gRPC xDS client dials endpoints
+//! Inherent mesh uses SDK-native outbound traffic, so a caller's own gRPC xDS client dials endpoints
 //! directly; when there are none it fails immediately and nothing survives long
 //! enough to ask for a scale-up. A request that reaches the gateway, by
 //! contrast, is already parked in a task the gateway owns, so it can wait.
