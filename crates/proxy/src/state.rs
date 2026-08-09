@@ -1,13 +1,13 @@
 use crate::activation::Activator;
 use dxgate_core::{
     ApplyOutcome, Cluster, ConfigConflict, ConfigDelta, ConfigSnapshot, ConfigStore, DxgateError,
-    Endpoint, OutlierDetectionConfig, RateLimitPolicy, Result, RuntimeConfig, SourceId,
-    SourceState, TokenLimitPolicy, WeightedBackend, WeightedCluster,
+    Endpoint, OutlierDetectionConfig, RateLimitPolicy, Result, RuntimeConfig, SecretKeyReference,
+    SourceId, SourceState, TokenLimitPolicy, WeightedBackend, WeightedCluster,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const LATENCY_BUCKETS_MS: [u64; 7] = [5, 10, 25, 50, 100, 250, 1000];
@@ -137,6 +137,7 @@ struct Inner {
     outliers: Mutex<HashMap<String, OutlierBucket>>,
     mcp_sessions: Mutex<BindingMap>,
     a2a_tasks: Mutex<BindingMap>,
+    credentials: RwLock<HashMap<SecretKeyReference, String>>,
     metrics: Mutex<MetricsStore>,
     /// Holds requests for scaled-to-zero targets. Lives here rather than on
     /// the server because endpoint selection — the only thing that can tell a
@@ -496,6 +497,7 @@ impl ProxyState {
                 outliers: Mutex::new(HashMap::new()),
                 mcp_sessions: Mutex::new(BindingMap::default()),
                 a2a_tasks: Mutex::new(BindingMap::default()),
+                credentials: RwLock::new(HashMap::new()),
                 metrics: Mutex::new(MetricsStore::default()),
                 activation,
             }),
@@ -516,6 +518,19 @@ impl ProxyState {
         snapshot
     }
 
+    pub fn replace_credentials(&self, values: HashMap<SecretKeyReference, String>) {
+        *self.inner.credentials.write().unwrap() = values;
+    }
+
+    pub fn credential(&self, reference: &SecretKeyReference) -> Option<String> {
+        self.inner
+            .credentials
+            .read()
+            .unwrap()
+            .get(reference)
+            .cloned()
+    }
+
     /// Applies a delta on behalf of `source`.
     pub fn apply_delta(&self, source: SourceId, delta: ConfigDelta) -> ApplyOutcome {
         let outcome = self.inner.store.apply(source, delta);
@@ -523,56 +538,16 @@ impl ProxyState {
         outcome
     }
 
-    /// Publishes a whole configuration document, splitting it across the sources
-    /// that own each slice in production: the Gateway API resources are applied
-    /// as [`SourceId::Xds`], the agent resources as [`SourceId::Kubernetes`].
-    ///
-    /// Each half is diffed against what that source published last, so removals
-    /// are explicit. Returns the merged store's problems, if any. Intended for
-    /// tests and single-shot bootstrapping; running sources apply deltas
+    /// Publishes a whole control-plane document for tests and single-shot
+    /// bootstrapping. Production updates use the same xDS owner and apply deltas
     /// directly to the store.
     pub fn apply_config(&self, cfg: RuntimeConfig) -> std::result::Result<(), Vec<ConfigConflict>> {
-        let RuntimeConfig {
-            version,
-            listeners,
-            clusters,
-            secrets,
-            providers,
-            backends,
-            routes,
-            policies,
-        } = cfg;
-        let gateway = ConfigDelta::default()
-            .with_version(version.clone())
-            .with_listeners(listeners)
-            .with_clusters(clusters);
-        let agent = ConfigDelta::default()
-            .with_version(version)
-            .with_secrets(secrets)
-            .with_providers(providers)
-            .with_backends(backends)
-            .with_agent_routes(routes)
-            .with_policies(policies);
-
-        let (gateway, agent) = {
+        let delta = {
             let mut sources = self.inner.document_sources.lock().unwrap();
-            (
-                sources
-                    .entry(SourceId::Xds)
-                    .or_default()
-                    .reconcile_delta(gateway),
-                sources
-                    .entry(SourceId::Kubernetes)
-                    .or_default()
-                    .reconcile_delta(agent),
-            )
+            sources.entry(SourceId::Xds).or_default().reconcile(cfg)
         };
-        // Rejections are per-apply, but referential conflicts describe the
-        // merged store, so they are read once from the final outcome rather
-        // than collected from both halves and reported twice.
-        let mut problems = self.apply_delta(SourceId::Xds, gateway).rejected;
-        let outcome = self.apply_delta(SourceId::Kubernetes, agent);
-        problems.extend(outcome.rejected);
+        let outcome = self.apply_delta(SourceId::Xds, delta);
+        let mut problems = outcome.rejected;
         problems.extend(outcome.conflicts);
         if problems.is_empty() {
             Ok(())
@@ -1390,7 +1365,7 @@ mod tests {
 
         let readiness = state.readiness();
         assert!(readiness.ready);
-        assert_eq!(readiness.version, "xds=ok,kubernetes=ok");
+        assert_eq!(readiness.version, "xds=ok");
         assert!(readiness.conflicts.is_empty());
 
         let mut invalid = valid_config("bad");

@@ -531,6 +531,7 @@ fn provider(name: &str, kind: ProviderKind, addr: SocketAddr, base_path: &str) -
         kind,
         base_url: format!("http://{addr}{base_path}"),
         api_key_env: Some(env_name.into()),
+        credential_ref: None,
         request_headers: vec![],
     }
 }
@@ -582,6 +583,7 @@ fn llm_config(provider: Provider, backends: Vec<Backend>, policies: Vec<Policy>)
             }],
             weighted_backends: weighted,
             policies: vec![],
+            replace_prefix_match: None,
         }],
         policies,
     }

@@ -479,38 +479,24 @@ name = "dxgate-app"
 version = "0.1.0"
 dependencies = [
  "clap",
- "dxgate-controller",
  "dxgate-core",
  "dxgate-proxy",
  "dxgate-ui",
  "dxgate-xds",
  "http 0.2.12",
  "hyper 0.14.32",
+ "k8s-openapi",
+ "kube",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rustls 0.23.43",
  "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "dxgate-controller"
-version = "0.1.0"
-dependencies = [
- "dxgate-core",
- "futures-util",
- "k8s-openapi",
- "kube",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2026,6 +2012,7 @@ checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki 0.103.13",
  "subtle",

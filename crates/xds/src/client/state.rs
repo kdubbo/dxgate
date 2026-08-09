@@ -20,9 +20,12 @@ use crate::proto::listener::v1 as xds_listener;
 use crate::proto::route::v1 as xds_route;
 use crate::proto::service::discovery::v1::DiscoveryResponse;
 use dxgate_core::{
+    AgentProtocol, AgentRoute, AgentRouteMatch, AuthPolicy, Backend, BackendKind,
     CircuitBreakerConfig, Cluster, Collection, ConfigDelta, Endpoint as RuntimeEndpoint,
-    HeaderMatch, Listener, ListenerProtocol, OutlierDetectionConfig, PathMatch, Route, RouteMatch,
-    SourceState, UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedCluster,
+    HeaderMatch, HeaderTransform, HeaderValue, Listener, ListenerProtocol, OutlierDetectionConfig,
+    PathMatch, Policy, PolicyAction, Provider, ProviderKind, RateLimitKey, RateLimitPolicy,
+    RetryPolicy, Route, RouteMatch, SecretKeyReference, SourceState, TokenLimitPolicy, UpstreamTls,
+    UpstreamTlsMode, VirtualHost, WeightedBackend, WeightedCluster,
 };
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,7 +59,7 @@ impl SubscriptionChange {
 pub(super) struct AdsState {
     subscriptions: BTreeMap<String, BTreeSet<String>>,
     listeners: Collection<String, ListenerSnapshot>,
-    routes: Collection<String, Vec<VirtualHost>>,
+    routes: Collection<String, RouteSnapshot>,
     clusters: Collection<String, ClusterSnapshot>,
     endpoints: Collection<String, Vec<RuntimeEndpoint>>,
     /// Per-type resource versions, replayed as a delta stream's
@@ -230,8 +233,8 @@ impl AdsState {
                 let mut listener = snapshot.listener.clone();
                 listener.virtual_hosts = snapshot.inline_virtual_hosts.clone();
                 for route_name in &snapshot.route_names {
-                    if let Some(vhosts) = self.routes.get(route_name) {
-                        listener.virtual_hosts.extend(vhosts.clone());
+                    if let Some(route) = self.routes.get(route_name) {
+                        listener.virtual_hosts.extend(route.virtual_hosts.clone());
                     }
                 }
                 listener
@@ -255,10 +258,33 @@ impl AdsState {
             })
             .collect();
 
+        let mut providers = BTreeMap::new();
+        let mut backends = BTreeMap::new();
+        let mut agent_routes = BTreeMap::new();
+        let mut policies = BTreeMap::new();
+        for route in self.routes.values() {
+            for provider in &route.providers {
+                providers.insert(provider.name.clone(), provider.clone());
+            }
+            for backend in &route.backends {
+                backends.insert(backend.name.clone(), backend.clone());
+            }
+            for agent_route in &route.agent_routes {
+                agent_routes.insert(agent_route.name.clone(), agent_route.clone());
+            }
+            for policy in &route.policies {
+                policies.insert(policy.name.clone(), policy.clone());
+            }
+        }
+
         let delta = ConfigDelta::default()
             .with_version(if version.is_empty() { "ads" } else { version })
             .with_listeners(listeners)
-            .with_clusters(clusters);
+            .with_clusters(clusters)
+            .with_providers(providers.into_values().collect())
+            .with_backends(backends.into_values().collect())
+            .with_agent_routes(agent_routes.into_values().collect())
+            .with_policies(policies.into_values().collect());
         self.published.reconcile_delta(delta)
     }
 
@@ -325,7 +351,7 @@ impl AdsState {
         self.routes
             .values()
             .flat_map(|vhosts| {
-                vhosts.iter().flat_map(|vh| {
+                vhosts.virtual_hosts.iter().flat_map(|vh| {
                     vh.routes.iter().flat_map(|route| {
                         route
                             .weighted_clusters
@@ -358,14 +384,13 @@ fn decode_listeners(
         .collect()
 }
 
-fn decode_routes(
-    resources: &[prost_types::Any],
-) -> Result<Vec<(String, Vec<VirtualHost>)>, XdsError> {
+fn decode_routes(resources: &[prost_types::Any]) -> Result<Vec<(String, RouteSnapshot)>, XdsError> {
     resources
         .iter()
         .map(|resource| {
             let route = decode_resource::<xds_route::RouteConfiguration>(ROUTE_TYPE, resource)?;
-            Ok((route.name, convert_virtual_hosts(&route.virtual_hosts)))
+            let snapshot = route_snapshot(&route);
+            Ok((route.name, snapshot))
         })
         .collect()
 }
@@ -443,6 +468,244 @@ struct ClusterSnapshot {
     tls: Option<UpstreamTls>,
     circuit_breaker: Option<CircuitBreakerConfig>,
     outlier_detection: Option<OutlierDetectionConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RouteSnapshot {
+    virtual_hosts: Vec<VirtualHost>,
+    providers: Vec<Provider>,
+    backends: Vec<Backend>,
+    agent_routes: Vec<AgentRoute>,
+    policies: Vec<Policy>,
+}
+
+fn route_snapshot(route: &xds_route::RouteConfiguration) -> RouteSnapshot {
+    let mut snapshot = RouteSnapshot {
+        virtual_hosts: convert_virtual_hosts(&route.virtual_hosts),
+        ..RouteSnapshot::default()
+    };
+    let Some(agent) = route.agent_config.as_ref() else {
+        return snapshot;
+    };
+    snapshot.providers = agent
+        .providers
+        .iter()
+        .filter_map(convert_provider)
+        .collect();
+    snapshot.backends = agent.backends.iter().filter_map(convert_backend).collect();
+    snapshot.agent_routes = agent
+        .agent_routes
+        .iter()
+        .filter_map(convert_agent_route)
+        .collect();
+    snapshot.policies = agent.policies.iter().map(convert_policy).collect();
+    snapshot
+}
+
+fn convert_provider(provider: &xds_route::AgentProvider) -> Option<Provider> {
+    let kind = match xds_route::AgentProviderKind::try_from(provider.kind).ok()? {
+        xds_route::AgentProviderKind::Openai => ProviderKind::OpenAi,
+        xds_route::AgentProviderKind::Anthropic => ProviderKind::Anthropic,
+        xds_route::AgentProviderKind::Unspecified => return None,
+    };
+    Some(Provider {
+        name: provider.name.clone(),
+        kind,
+        base_url: provider.base_url.clone(),
+        api_key_env: None,
+        credential_ref: provider.credential.as_ref().map(convert_secret_ref),
+        request_headers: provider
+            .request_headers
+            .iter()
+            .map(convert_header_value)
+            .collect(),
+    })
+}
+
+fn convert_backend(backend: &xds_route::AgentBackend) -> Option<Backend> {
+    let kind = match backend.backend.as_ref()? {
+        xds_route::agent_backend::Backend::Http(http) => BackendKind::Http {
+            endpoint: http.endpoint.clone(),
+        },
+        xds_route::agent_backend::Backend::Llm(llm) => BackendKind::Llm {
+            provider: llm.provider.clone(),
+            models: llm.models.clone(),
+            endpoint: (!llm.endpoint.is_empty()).then(|| llm.endpoint.clone()),
+            model_rewrites: llm.model_rewrites.clone().into_iter().collect(),
+        },
+        xds_route::agent_backend::Backend::Mcp(mcp) => BackendKind::Mcp {
+            endpoint: mcp.endpoint.clone(),
+            tools: mcp.tools.clone(),
+        },
+        xds_route::agent_backend::Backend::A2a(a2a) => BackendKind::A2a {
+            endpoint: a2a.endpoint.clone(),
+            agent: (!a2a.agent.is_empty()).then(|| a2a.agent.clone()),
+        },
+    };
+    Some(Backend {
+        name: backend.name.clone(),
+        kind,
+        policies: backend.policies.clone(),
+    })
+}
+
+fn convert_agent_route(route: &xds_route::AgentRoute) -> Option<AgentRoute> {
+    let protocol = match xds_route::AgentProtocol::try_from(route.protocol).ok()? {
+        xds_route::AgentProtocol::Http => AgentProtocol::Http,
+        xds_route::AgentProtocol::Llm => AgentProtocol::Llm,
+        xds_route::AgentProtocol::Mcp => AgentProtocol::Mcp,
+        xds_route::AgentProtocol::A2a => AgentProtocol::A2a,
+        xds_route::AgentProtocol::Unspecified => return None,
+    };
+    Some(AgentRoute {
+        name: route.name.clone(),
+        protocol,
+        matches: route
+            .matches
+            .iter()
+            .filter_map(convert_agent_match)
+            .collect(),
+        weighted_backends: route
+            .weighted_backends
+            .iter()
+            .map(|backend| WeightedBackend {
+                name: backend.name.clone(),
+                weight: backend.weight,
+            })
+            .collect(),
+        policies: route.policies.clone(),
+        replace_prefix_match: route
+            .rewrite
+            .as_ref()
+            .map(|rewrite| rewrite.replace_prefix_match.clone())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+fn convert_agent_match(value: &xds_route::AgentRouteMatch) -> Option<AgentRouteMatch> {
+    let path = match value.path.as_ref()?.r#match.as_ref()? {
+        xds_route::agent_path_match::Match::Prefix(prefix) => PathMatch::Prefix(prefix.clone()),
+        xds_route::agent_path_match::Match::Exact(exact) => PathMatch::Exact(exact.clone()),
+    };
+    Some(AgentRouteMatch {
+        path,
+        host: optional_string(&value.host),
+        method: optional_string(&value.method),
+        model: optional_string(&value.model),
+        tool: optional_string(&value.tool),
+        agent: optional_string(&value.agent),
+        headers: value
+            .headers
+            .iter()
+            .map(|header| HeaderMatch {
+                name: header.name.clone(),
+                value: header.value.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn convert_policy(policy: &xds_route::AgentPolicy) -> Policy {
+    Policy {
+        name: policy.name.clone(),
+        action: PolicyAction::Allow,
+        matches: None,
+        auth: policy.auth.as_ref().map(|auth| AuthPolicy::ApiKey {
+            header: if auth.header.is_empty() {
+                "authorization".to_string()
+            } else {
+                auth.header.clone()
+            },
+            values: Vec::new(),
+            value_env: None,
+            secret_ref: auth.secret_ref.as_ref().map(convert_secret_ref),
+        }),
+        rate_limit: policy.rate_limit.as_ref().map(|limit| RateLimitPolicy {
+            requests: limit.requests,
+            window_seconds: duration_seconds(limit.window.as_ref()).max(1),
+            key: convert_rate_limit_key(limit.key),
+        }),
+        token_limit: policy.token_limit.as_ref().map(|limit| TokenLimitPolicy {
+            tokens: limit.tokens,
+            window_seconds: duration_seconds(limit.window.as_ref()).max(1),
+            key: convert_rate_limit_key(limit.key),
+        }),
+        timeout_ms: policy.timeout.as_ref().map(duration_millis),
+        retry: policy.retry.as_ref().map(|retry| RetryPolicy {
+            attempts: retry.attempts,
+            statuses: retry
+                .status_codes
+                .iter()
+                .filter_map(|status| u16::try_from(*status).ok())
+                .collect(),
+        }),
+        max_body_bytes: usize::try_from(policy.max_body_bytes)
+            .ok()
+            .filter(|limit| *limit > 0),
+        request_headers: policy
+            .request_headers
+            .as_ref()
+            .map(convert_header_transform)
+            .unwrap_or_default(),
+        response_headers: policy
+            .response_headers
+            .as_ref()
+            .map(convert_header_transform)
+            .unwrap_or_default(),
+    }
+}
+
+fn convert_secret_ref(reference: &xds_route::SecretKeyReference) -> SecretKeyReference {
+    SecretKeyReference {
+        namespace: reference.namespace.clone(),
+        name: reference.name.clone(),
+        key: reference.key.clone(),
+    }
+}
+
+fn convert_header_transform(transform: &xds_route::AgentHeaderTransform) -> HeaderTransform {
+    HeaderTransform {
+        add: transform.add.iter().map(convert_header_value).collect(),
+        remove: transform.remove.clone(),
+    }
+}
+
+fn convert_header_value(value: &xds_route::AgentHeaderValue) -> HeaderValue {
+    HeaderValue {
+        name: value.name.clone(),
+        value: value.value.clone(),
+    }
+}
+
+fn convert_rate_limit_key(value: i32) -> RateLimitKey {
+    match xds_route::AgentRateLimitKey::try_from(value)
+        .unwrap_or(xds_route::AgentRateLimitKey::Route)
+    {
+        xds_route::AgentRateLimitKey::Backend => RateLimitKey::Backend,
+        xds_route::AgentRateLimitKey::Header => RateLimitKey::Header,
+        xds_route::AgentRateLimitKey::Unspecified | xds_route::AgentRateLimitKey::Route => {
+            RateLimitKey::Route
+        }
+    }
+}
+
+fn duration_seconds(duration: Option<&prost_types::Duration>) -> u64 {
+    duration
+        .map(|value| {
+            u64::try_from(value.seconds.max(0)).unwrap_or_default() + u64::from(value.nanos > 0)
+        })
+        .unwrap_or_default()
+}
+
+fn duration_millis(duration: &prost_types::Duration) -> u64 {
+    u64::try_from(duration.seconds.max(0))
+        .unwrap_or_default()
+        .saturating_mul(1000)
+        .saturating_add(u64::try_from(duration.nanos.max(0)).unwrap_or_default() / 1_000_000)
+}
+
+fn optional_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamTls> {
@@ -807,6 +1070,7 @@ mod tests {
     use crate::proto::core::v1::{address, socket_address, Address, SocketAddress};
     use dxgate_core::{ResourceKey, ResourceKind, RouterIdentity};
     use prost_types::Any;
+    use std::collections::HashMap;
 
     #[test]
     fn identity_metadata_selects_dubbod_grpc_generator() {
@@ -865,6 +1129,7 @@ mod tests {
                     })),
                 }],
             }],
+            agent_config: None,
         };
         let cluster = xds_cluster::Cluster {
             name: cluster_name.into(),
@@ -977,6 +1242,104 @@ mod tests {
         let republished = state.config_delta("v1");
         assert!(republished.removes.is_empty());
         assert_eq!(republished.listeners.len(), 1);
+    }
+
+    #[test]
+    fn rds_agent_config_projects_mesh_ai_resources() {
+        let route = xds_route::RouteConfiguration {
+            name: "gateway.app:80".into(),
+            virtual_hosts: Vec::new(),
+            agent_config: Some(xds_route::AgentConfig {
+                providers: vec![xds_route::AgentProvider {
+                    name: "chat.app.provider".into(),
+                    kind: xds_route::AgentProviderKind::Anthropic as i32,
+                    base_url: "http://mock-ai.app.svc:8080".into(),
+                    credential: Some(xds_route::SecretKeyReference {
+                        namespace: "app".into(),
+                        name: "ai-key".into(),
+                        key: "token".into(),
+                    }),
+                    request_headers: vec![xds_route::AgentHeaderValue {
+                        name: "x-tenant".into(),
+                        value: "mesh".into(),
+                    }],
+                }],
+                backends: vec![xds_route::AgentBackend {
+                    name: "chat.app".into(),
+                    policies: vec!["chat.app.policy".into()],
+                    backend: Some(xds_route::agent_backend::Backend::Llm(
+                        xds_route::LlmBackend {
+                            provider: "chat.app.provider".into(),
+                            models: vec!["claude-mock".into()],
+                            endpoint: String::new(),
+                            model_rewrites: HashMap::from([("chat".into(), "claude-mock".into())]),
+                        },
+                    )),
+                }],
+                agent_routes: vec![xds_route::AgentRoute {
+                    name: "app/chat/0".into(),
+                    protocol: xds_route::AgentProtocol::Llm as i32,
+                    matches: vec![xds_route::AgentRouteMatch {
+                        path: Some(xds_route::AgentPathMatch {
+                            r#match: Some(xds_route::agent_path_match::Match::Prefix(
+                                "/anthropic".into(),
+                            )),
+                        }),
+                        host: "ai.example.test".into(),
+                        method: "POST".into(),
+                        ..xds_route::AgentRouteMatch::default()
+                    }],
+                    weighted_backends: vec![xds_route::WeightedBackend {
+                        name: "chat.app".into(),
+                        weight: 100,
+                    }],
+                    policies: vec!["chat.app.policy".into()],
+                    rewrite: Some(xds_route::PathRewrite {
+                        replace_prefix_match: "/v1".into(),
+                    }),
+                }],
+                policies: vec![xds_route::AgentPolicy {
+                    name: "chat.app.policy".into(),
+                    auth: Some(xds_route::ClientAuthPolicy {
+                        header: "x-api-key".into(),
+                        secret_ref: Some(xds_route::SecretKeyReference {
+                            namespace: "app".into(),
+                            name: "client-key".into(),
+                            key: "token".into(),
+                        }),
+                    }),
+                    timeout: Some(prost_types::Duration {
+                        seconds: 2,
+                        nanos: 500_000_000,
+                    }),
+                    retry: Some(xds_route::AgentRetryPolicy {
+                        attempts: 2,
+                        status_codes: vec![502, 503],
+                    }),
+                    max_body_bytes: 4096,
+                    ..xds_route::AgentPolicy::default()
+                }],
+            }),
+        };
+
+        let snapshot = route_snapshot(&route);
+        assert_eq!(snapshot.providers[0].kind, ProviderKind::Anthropic);
+        assert_eq!(
+            snapshot.providers[0].credential_ref,
+            Some(SecretKeyReference {
+                namespace: "app".into(),
+                name: "ai-key".into(),
+                key: "token".into(),
+            })
+        );
+        assert_eq!(snapshot.backends[0].name, "chat.app");
+        assert_eq!(snapshot.agent_routes[0].protocol, AgentProtocol::Llm);
+        assert_eq!(
+            snapshot.agent_routes[0].replace_prefix_match.as_deref(),
+            Some("/v1")
+        );
+        assert_eq!(snapshot.policies[0].timeout_ms, Some(2500));
+        assert_eq!(snapshot.policies[0].max_body_bytes, Some(4096));
     }
 
     #[test]

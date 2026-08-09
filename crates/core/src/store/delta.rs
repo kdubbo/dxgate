@@ -225,6 +225,7 @@ mod tests {
             kind: ProviderKind::OpenAi,
             base_url: String::new(),
             api_key_env: None,
+            credential_ref: None,
             request_headers: vec![],
         }
     }

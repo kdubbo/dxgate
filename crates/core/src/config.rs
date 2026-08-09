@@ -493,8 +493,17 @@ pub struct Provider {
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<SecretKeyReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_headers: Vec<HeaderValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SecretKeyReference {
+    pub namespace: String,
+    pub name: String,
+    pub key: String,
 }
 
 impl Provider {
@@ -628,6 +637,8 @@ pub struct AgentRoute {
     pub weighted_backends: Vec<WeightedBackend>,
     #[serde(default)]
     pub policies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_prefix_match: Option<String>,
 }
 
 impl AgentRoute {
@@ -785,6 +796,8 @@ pub enum AuthPolicy {
         values: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_ref: Option<SecretKeyReference>,
     },
     Jwt {
         #[serde(default = "default_authorization_header")]
@@ -1093,6 +1106,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: "https://api.openai.com".into(),
                 api_key_env: Some("OPENAI_API_KEY".into()),
+                credential_ref: None,
                 request_headers: vec![],
             }],
             backends: vec![Backend {
@@ -1122,6 +1136,7 @@ mod tests {
                     weight: 100,
                 }],
                 policies: vec!["auth".into()],
+                replace_prefix_match: None,
             }],
             policies: vec![Policy {
                 name: "auth".into(),
@@ -1131,6 +1146,7 @@ mod tests {
                     header: "authorization".into(),
                     values: vec!["Bearer local".into()],
                     value_env: None,
+                    secret_ref: None,
                 }),
                 rate_limit: None,
                 token_limit: None,

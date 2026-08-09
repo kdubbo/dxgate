@@ -113,6 +113,354 @@ pub mod route_action {
         WeightedClusters(super::WeightedCluster),
     }
 }
+/// AgentConfig is the mesh-native LLM, MCP, and A2A slice compiled by dubbod
+/// from DxgateService and HTTPRoute resources.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentConfig {
+    #[prost(message, repeated, tag = "1")]
+    pub providers: ::prost::alloc::vec::Vec<AgentProvider>,
+    #[prost(message, repeated, tag = "2")]
+    pub backends: ::prost::alloc::vec::Vec<AgentBackend>,
+    #[prost(message, repeated, tag = "3")]
+    pub agent_routes: ::prost::alloc::vec::Vec<AgentRoute>,
+    #[prost(message, repeated, tag = "4")]
+    pub policies: ::prost::alloc::vec::Vec<AgentPolicy>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentProvider {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "AgentProviderKind", tag = "2")]
+    pub kind: i32,
+    #[prost(string, tag = "3")]
+    pub base_url: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub credential: ::core::option::Option<SecretKeyReference>,
+    #[prost(message, repeated, tag = "5")]
+    pub request_headers: ::prost::alloc::vec::Vec<AgentHeaderValue>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentBackend {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "6")]
+    pub policies: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(oneof = "agent_backend::Backend", tags = "2, 3, 4, 5")]
+    pub backend: ::core::option::Option<agent_backend::Backend>,
+}
+/// Nested message and enum types in `AgentBackend`.
+pub mod agent_backend {
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Backend {
+        #[prost(message, tag = "2")]
+        Http(super::HttpBackend),
+        #[prost(message, tag = "3")]
+        Llm(super::LlmBackend),
+        #[prost(message, tag = "4")]
+        Mcp(super::McpBackend),
+        #[prost(message, tag = "5")]
+        A2a(super::A2aBackend),
+    }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HttpBackend {
+    #[prost(string, tag = "1")]
+    pub endpoint: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LlmBackend {
+    #[prost(string, tag = "1")]
+    pub provider: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub models: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub endpoint: ::prost::alloc::string::String,
+    #[prost(map = "string, string", tag = "4")]
+    pub model_rewrites: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct McpBackend {
+    #[prost(string, tag = "1")]
+    pub endpoint: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub tools: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct A2aBackend {
+    #[prost(string, tag = "1")]
+    pub endpoint: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub agent: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentRoute {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "AgentProtocol", tag = "2")]
+    pub protocol: i32,
+    #[prost(message, repeated, tag = "3")]
+    pub matches: ::prost::alloc::vec::Vec<AgentRouteMatch>,
+    #[prost(message, repeated, tag = "4")]
+    pub weighted_backends: ::prost::alloc::vec::Vec<WeightedBackend>,
+    #[prost(string, repeated, tag = "5")]
+    pub policies: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub rewrite: ::core::option::Option<PathRewrite>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentRouteMatch {
+    #[prost(message, optional, tag = "1")]
+    pub path: ::core::option::Option<AgentPathMatch>,
+    #[prost(string, tag = "2")]
+    pub host: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub tool: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub agent: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "7")]
+    pub headers: ::prost::alloc::vec::Vec<AgentHeaderMatch>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentPathMatch {
+    #[prost(oneof = "agent_path_match::Match", tags = "1, 2")]
+    pub r#match: ::core::option::Option<agent_path_match::Match>,
+}
+/// Nested message and enum types in `AgentPathMatch`.
+pub mod agent_path_match {
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Match {
+        #[prost(string, tag = "1")]
+        Prefix(::prost::alloc::string::String),
+        #[prost(string, tag = "2")]
+        Exact(::prost::alloc::string::String),
+    }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentHeaderMatch {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WeightedBackend {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub weight: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PathRewrite {
+    /// Gateway API URLRewrite ReplacePrefixMatch value.
+    #[prost(string, tag = "1")]
+    pub replace_prefix_match: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentPolicy {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub auth: ::core::option::Option<ClientAuthPolicy>,
+    #[prost(message, optional, tag = "3")]
+    pub rate_limit: ::core::option::Option<AgentRateLimitPolicy>,
+    #[prost(message, optional, tag = "4")]
+    pub token_limit: ::core::option::Option<AgentTokenLimitPolicy>,
+    #[prost(message, optional, tag = "5")]
+    pub timeout: ::core::option::Option<::prost_types::Duration>,
+    #[prost(message, optional, tag = "6")]
+    pub retry: ::core::option::Option<AgentRetryPolicy>,
+    #[prost(uint64, tag = "7")]
+    pub max_body_bytes: u64,
+    #[prost(message, optional, tag = "8")]
+    pub request_headers: ::core::option::Option<AgentHeaderTransform>,
+    #[prost(message, optional, tag = "9")]
+    pub response_headers: ::core::option::Option<AgentHeaderTransform>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClientAuthPolicy {
+    #[prost(string, tag = "1")]
+    pub header: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub secret_ref: ::core::option::Option<SecretKeyReference>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SecretKeyReference {
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub key: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentRateLimitPolicy {
+    #[prost(uint32, tag = "1")]
+    pub requests: u32,
+    #[prost(message, optional, tag = "2")]
+    pub window: ::core::option::Option<::prost_types::Duration>,
+    #[prost(enumeration = "AgentRateLimitKey", tag = "3")]
+    pub key: i32,
+    #[prost(string, tag = "4")]
+    pub header: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentTokenLimitPolicy {
+    #[prost(uint64, tag = "1")]
+    pub tokens: u64,
+    #[prost(message, optional, tag = "2")]
+    pub window: ::core::option::Option<::prost_types::Duration>,
+    #[prost(enumeration = "AgentRateLimitKey", tag = "3")]
+    pub key: i32,
+    #[prost(string, tag = "4")]
+    pub header: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentRetryPolicy {
+    #[prost(uint32, tag = "1")]
+    pub attempts: u32,
+    #[prost(uint32, repeated, tag = "2")]
+    pub status_codes: ::prost::alloc::vec::Vec<u32>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentHeaderTransform {
+    #[prost(message, repeated, tag = "1")]
+    pub add: ::prost::alloc::vec::Vec<AgentHeaderValue>,
+    #[prost(string, repeated, tag = "2")]
+    pub remove: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentHeaderValue {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AgentProviderKind {
+    Unspecified = 0,
+    Openai = 1,
+    Anthropic = 2,
+}
+impl AgentProviderKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            AgentProviderKind::Unspecified => "AGENT_PROVIDER_KIND_UNSPECIFIED",
+            AgentProviderKind::Openai => "OPENAI",
+            AgentProviderKind::Anthropic => "ANTHROPIC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGENT_PROVIDER_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "OPENAI" => Some(Self::Openai),
+            "ANTHROPIC" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AgentProtocol {
+    Unspecified = 0,
+    Http = 1,
+    Llm = 2,
+    Mcp = 3,
+    A2a = 4,
+}
+impl AgentProtocol {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            AgentProtocol::Unspecified => "AGENT_PROTOCOL_UNSPECIFIED",
+            AgentProtocol::Http => "HTTP",
+            AgentProtocol::Llm => "LLM",
+            AgentProtocol::Mcp => "MCP",
+            AgentProtocol::A2a => "A2A",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGENT_PROTOCOL_UNSPECIFIED" => Some(Self::Unspecified),
+            "HTTP" => Some(Self::Http),
+            "LLM" => Some(Self::Llm),
+            "MCP" => Some(Self::Mcp),
+            "A2A" => Some(Self::A2a),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AgentRateLimitKey {
+    Unspecified = 0,
+    Route = 1,
+    Backend = 2,
+    Header = 3,
+}
+impl AgentRateLimitKey {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            AgentRateLimitKey::Unspecified => "AGENT_RATE_LIMIT_KEY_UNSPECIFIED",
+            AgentRateLimitKey::Route => "ROUTE",
+            AgentRateLimitKey::Backend => "BACKEND",
+            AgentRateLimitKey::Header => "HEADER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGENT_RATE_LIMIT_KEY_UNSPECIFIED" => Some(Self::Unspecified),
+            "ROUTE" => Some(Self::Route),
+            "BACKEND" => Some(Self::Backend),
+            "HEADER" => Some(Self::Header),
+            _ => None,
+        }
+    }
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RouteConfiguration {
@@ -120,4 +468,6 @@ pub struct RouteConfiguration {
     pub name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub virtual_hosts: ::prost::alloc::vec::Vec<VirtualHost>,
+    #[prost(message, optional, tag = "3")]
+    pub agent_config: ::core::option::Option<AgentConfig>,
 }

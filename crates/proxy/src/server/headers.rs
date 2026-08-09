@@ -70,7 +70,11 @@ fn apply_header_transform(headers: &mut HeaderMap, transform: &HeaderTransform) 
     }
 }
 
-pub(super) fn apply_provider_headers(headers: &mut HeaderMap, provider: Option<&Provider>) {
+pub(super) fn apply_provider_headers(
+    headers: &mut HeaderMap,
+    provider: Option<&Provider>,
+    secret: Option<&str>,
+) {
     let Some(provider) = provider else {
         return;
     };
@@ -82,19 +86,24 @@ pub(super) fn apply_provider_headers(headers: &mut HeaderMap, provider: Option<&
             headers.insert(name, value);
         }
     }
-    if let Some(env_name) = &provider.api_key_env {
-        if let Ok(key) = env::var(env_name) {
-            let credential = match provider.kind {
-                ProviderKind::Anthropic => HttpHeaderValue::from_str(&key)
-                    .map(|v| (HeaderName::from_static("x-api-key"), v)),
-                ProviderKind::Gemini => HttpHeaderValue::from_str(&key)
-                    .map(|v| (HeaderName::from_static("x-goog-api-key"), v)),
-                _ => HttpHeaderValue::from_str(&format!("Bearer {key}"))
-                    .map(|v| (http::header::AUTHORIZATION, v)),
-            };
-            if let Ok((name, value)) = credential {
-                headers.insert(name, value);
+    let key = secret.map(ToString::to_string).or_else(|| {
+        provider
+            .api_key_env
+            .as_ref()
+            .and_then(|name| env::var(name).ok())
+    });
+    if let Some(key) = key {
+        let credential = match provider.kind {
+            ProviderKind::Anthropic => {
+                HttpHeaderValue::from_str(&key).map(|v| (HeaderName::from_static("x-api-key"), v))
             }
+            ProviderKind::Gemini => HttpHeaderValue::from_str(&key)
+                .map(|v| (HeaderName::from_static("x-goog-api-key"), v)),
+            _ => HttpHeaderValue::from_str(&format!("Bearer {key}"))
+                .map(|v| (http::header::AUTHORIZATION, v)),
+        };
+        if let Ok((name, value)) = credential {
+            headers.insert(name, value);
         }
     }
     if provider.kind == ProviderKind::Anthropic {

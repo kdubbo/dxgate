@@ -1,14 +1,19 @@
 use clap::Parser;
-use dxgate_controller::{crds, run_controller};
-use dxgate_core::{ConfigStore, RouterIdentity, DEFAULT_CLUSTER_ID, DEFAULT_DNS_DOMAIN};
+use dxgate_core::{
+    AuthPolicy, ConfigStore, RouterIdentity, SecretKeyReference, DEFAULT_CLUSTER_ID,
+    DEFAULT_DNS_DOMAIN,
+};
 use dxgate_proxy::{ProxyServer, ProxyState};
 use dxgate_ui::UiServer;
 use dxgate_xds::{BootstrapConfig, XdsClient, XdsClientConfig};
+use k8s_openapi::api::core::v1::Secret;
+use kube::{Api, Client};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::Resource;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,11 +37,6 @@ struct Args {
 
     #[arg(long, env = "DXGATE_XDS_ENABLED")]
     xds_enabled: Option<bool>,
-
-    // Watching the dxgate CRDs needs RBAC on them, so it is opt-in: a proxy
-    // driven only by `dubbod` should not require Kubernetes access.
-    #[arg(long, env = "DXGATE_CONTROLLER_ENABLED", default_value_t = false)]
-    controller_enabled: bool,
 
     #[arg(long, env = "DXGATE_HTTP_ADDR", default_value = "0.0.0.0:80")]
     http_addr: SocketAddr,
@@ -64,9 +64,6 @@ struct Args {
     #[arg(long, env = "DXGATE_OTEL_TAGS")]
     otel_tags: Option<String>,
 
-    #[arg(long)]
-    print_crds: bool,
-
     #[arg(long, env = "DXGATE_LISTENER_NAMES", value_delimiter = ',')]
     listener_names: Vec<String>,
 
@@ -91,11 +88,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // kube's rustls stack disables a default crypto backend; install one
+    // before the Secret resolver creates its first Kubernetes TLS client.
+    let _ = rustls_kube::crypto::ring::default_provider().install_default();
+
     let mut args = Args::parse();
-    if args.print_crds {
-        print_crds()?;
-        return Ok(());
-    }
     if let Some(path) = args.bootstrap.clone() {
         let bootstrap = BootstrapConfig::load(path)
             .await
@@ -112,7 +109,7 @@ async fn main() -> std::io::Result<()> {
     let run_xds = should_run_xds(&args);
     let identity = RouterIdentity {
         pod_name: args.pod_name,
-        namespace: args.namespace,
+        namespace: args.namespace.clone(),
         pod_ip: args.pod_ip,
         node_name: args.node_name,
         cluster_id: args.cluster_id,
@@ -121,9 +118,8 @@ async fn main() -> std::io::Result<()> {
 
     info!(node_id = %identity.node_id(), "starting dxgate router proxy");
 
-    // Every configuration source writes into this one store, each owning a
-    // disjoint slice of it. There is no fan-in channel and no last-writer-wins:
-    // a source's update only ever touches the resources that source published.
+    // dubbod is the sole configuration source. Kubernetes access is limited to
+    // resolving Secret values referenced by the xDS configuration.
     let store = Arc::new(ConfigStore::new());
     let state = ProxyState::with_store(store.clone());
 
@@ -144,16 +140,10 @@ async fn main() -> std::io::Result<()> {
         info!("xDS client disabled");
     }
 
-    if args.controller_enabled {
-        let controller_store = store.clone();
-        tokio::spawn(async move {
-            if let Err(err) = run_controller(controller_store).await {
-                error!(%err, "Kubernetes controller exited");
-            }
-        });
-    } else {
-        info!("Kubernetes controller disabled");
-    }
+    tokio::spawn(sync_referenced_secrets(
+        state.clone(),
+        args.namespace.clone(),
+    ));
 
     let proxy = ProxyServer::new(state.clone());
     let ui = UiServer::new(state, args.http_addr);
@@ -227,16 +217,79 @@ async fn shutdown_requested(mut rx: watch::Receiver<bool>) {
     }
 }
 
-fn print_crds() -> std::io::Result<()> {
-    for (idx, crd) in crds().into_iter().enumerate() {
-        if idx > 0 {
-            println!("---");
+async fn sync_referenced_secrets(state: ProxyState, namespace: String) {
+    let mut client: Option<Client> = None;
+    let mut ticker = time::interval(Duration::from_secs(5));
+    loop {
+        ticker.tick().await;
+        let references = referenced_secrets(&state);
+        if references.is_empty() {
+            state.replace_credentials(HashMap::new());
+            continue;
         }
-        let yaml = serde_yaml::to_string(&crd)
-            .map_err(|err| std::io::Error::other(format!("serialize CRD: {err}")))?;
-        print!("{yaml}");
+        let kube = match &client {
+            Some(client) => client.clone(),
+            None => match Client::try_default().await {
+                Ok(value) => {
+                    client = Some(value.clone());
+                    value
+                }
+                Err(err) => {
+                    warn!(%err, "cannot initialize Kubernetes Secret resolver");
+                    continue;
+                }
+            },
+        };
+        let mut values = HashMap::new();
+        for reference in references {
+            if reference.namespace != namespace {
+                warn!(
+                    secret_namespace = %reference.namespace,
+                    secret_name = %reference.name,
+                    gateway_namespace = %namespace,
+                    "cross-namespace credential reference rejected"
+                );
+                continue;
+            }
+            let api = Api::<Secret>::namespaced(kube.clone(), &namespace);
+            match api.get(&reference.name).await {
+                Ok(secret) => {
+                    if let Some(value) = secret
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get(&reference.key))
+                        .and_then(|value| String::from_utf8(value.0.clone()).ok())
+                    {
+                        values.insert(reference, value);
+                    } else {
+                        warn!(secret = %reference.name, key = %reference.key, "credential key missing");
+                    }
+                }
+                Err(err) => warn!(secret = %reference.name, %err, "credential Secret unavailable"),
+            }
+        }
+        state.replace_credentials(values);
     }
-    Ok(())
+}
+
+fn referenced_secrets(state: &ProxyState) -> BTreeSet<SecretKeyReference> {
+    let snapshot = state.snapshot();
+    let mut references = BTreeSet::new();
+    for provider in snapshot.providers() {
+        if let Some(reference) = &provider.credential_ref {
+            references.insert(reference.clone());
+        }
+    }
+    for policy in snapshot.policies() {
+        if let Some(AuthPolicy::ApiKey {
+            secret_ref: Some(reference),
+            ..
+        }) = &policy.auth
+        {
+            references.insert(reference.clone());
+        }
+    }
+    references
 }
 
 fn init_tracing(
@@ -341,8 +394,8 @@ fn apply_bootstrap(args: &mut Args, bootstrap: BootstrapConfig) {
 }
 
 /// Whether to open an ADS stream. dxgate is a delegated data plane, so the xDS
-/// client is on unless explicitly disabled — a proxy with no control plane and
-/// no CRDs has nothing to route.
+/// client is on unless explicitly disabled — a proxy without its control plane
+/// has nothing to route.
 fn should_run_xds(args: &Args) -> bool {
     args.xds_enabled.unwrap_or(true)
 }
@@ -358,7 +411,6 @@ mod tests {
         Args {
             xds_address: "http://old:15012".to_string(),
             xds_enabled: None,
-            controller_enabled: false,
             http_addr: "0.0.0.0:80".parse().unwrap(),
             ui_addr: "0.0.0.0:15021".parse().unwrap(),
             drain_timeout_seconds: 30,
@@ -367,7 +419,6 @@ mod tests {
             otel_service_name: "dxgate".to_string(),
             otel_sampling_percentage: 100.0,
             otel_tags: None,
-            print_crds: false,
             listener_names: Vec::new(),
             pod_name: "dxgate".to_string(),
             namespace: "dubbo-system".to_string(),

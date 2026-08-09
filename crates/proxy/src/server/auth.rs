@@ -8,12 +8,17 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::env;
 
-pub(super) fn validate_auth(auth: &AuthPolicy, headers: &[(String, String)]) -> Result<(), String> {
+pub(super) fn validate_auth(
+    auth: &AuthPolicy,
+    headers: &[(String, String)],
+    secret: Option<&str>,
+) -> Result<(), String> {
     match auth {
         AuthPolicy::ApiKey {
             header,
             values,
             value_env,
+            secret_ref: _,
         } => {
             let actual = header_value(headers, header)
                 .ok_or_else(|| format!("missing header {}", header))?;
@@ -22,6 +27,9 @@ pub(super) fn validate_auth(auth: &AuthPolicy, headers: &[(String, String)]) -> 
                 if let Ok(value) = env::var(env_name) {
                     accepted.push(value);
                 }
+            }
+            if let Some(value) = secret {
+                accepted.push(value.to_string());
             }
             if accepted.iter().any(|value| value == actual) {
                 Ok(())

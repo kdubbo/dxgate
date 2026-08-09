@@ -1,17 +1,16 @@
 //! Owner-tracked configuration store.
 //!
-//! dxgate takes configuration from several sources — xDS from `dubbod`, a static
-//! file, and Kubernetes CRDs — and each source owns a disjoint slice of the
-//! runtime config. A whole-value [`RuntimeConfig`] snapshot cannot express that:
+//! Production configuration comes from `dubbod` over xDS. The owner tracking
+//! also lets tests and offline tooling apply a static fixture without silently
+//! overwriting control-plane resources. A whole-value [`RuntimeConfig`] snapshot cannot express that:
 //! whoever publishes last wins and silently erases everything the other sources
 //! contributed. The store instead keys every resource by `(kind, name)`, records
 //! the [`SourceId`] that owns it, and applies per-source deltas. An upsert only
 //! replaces a resource the same source already owns, and a removal only removes
-//! resources that source owns, so xDS can own listeners and clusters while the
-//! Kubernetes controller owns backends, routes, and policies.
+//! resources that source owns.
 //!
-//! Sources that can only produce a full list — a static file, a Kubernetes
-//! re-list after a watch restart — drive the same delta path through
+//! Sources that can only produce a full list — such as an offline test fixture
+//! — drive the same delta path through
 //! [`SourceState::reconcile`], which diffs the new list against the keys the
 //! source published last time and turns each disappearance into an explicit
 //! removal.
@@ -41,19 +40,19 @@ use std::sync::{Arc, Mutex, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceId {
-    /// The delta ADS stream from `dubbod`: the Gateway API slice.
+    /// The delta ADS stream from `dubbod`: all mesh routing configuration.
     Xds,
-    /// The Kubernetes CRD controller: the AI-gateway slice.
-    Kubernetes,
+    /// Offline/test configuration fixtures; not enabled by the production app.
+    Static,
 }
 
 impl SourceId {
-    pub const ALL: [SourceId; 2] = [SourceId::Xds, SourceId::Kubernetes];
+    pub const ALL: [SourceId; 2] = [SourceId::Xds, SourceId::Static];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             SourceId::Xds => "xds",
-            SourceId::Kubernetes => "kubernetes",
+            SourceId::Static => "static",
         }
     }
 }
@@ -597,6 +596,7 @@ mod tests {
                 weight: 100,
             }],
             policies: vec![],
+            replace_prefix_match: None,
         }
     }
 
@@ -606,6 +606,7 @@ mod tests {
             kind: ProviderKind::OpenAi,
             base_url: String::new(),
             api_key_env: None,
+            credential_ref: None,
             request_headers: vec![],
         }
     }
@@ -670,7 +671,7 @@ mod tests {
 
         // Kubernetes owns the agent slice. This used to clobber the xDS slice.
         let kube = store.apply(
-            SourceId::Kubernetes,
+            SourceId::Static,
             ConfigDelta::default()
                 .with_version("7")
                 .with_providers(vec![provider("openai")])
@@ -692,7 +693,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.owner(&ResourceKey::new(ResourceKind::Backend, "gpt")),
-            Some(SourceId::Kubernetes)
+            Some(SourceId::Static)
         );
     }
 
@@ -704,13 +705,13 @@ mod tests {
             ConfigDelta::default().with_clusters(vec![cluster("reviews")]),
         );
         store.apply(
-            SourceId::Kubernetes,
+            SourceId::Static,
             ConfigDelta::default().with_providers(vec![provider("openai")]),
         );
 
         // Kubernetes tries to remove a cluster it does not own: ignored.
         store.apply(
-            SourceId::Kubernetes,
+            SourceId::Static,
             ConfigDelta::default()
                 .with_removes(vec![ResourceKey::new(ResourceKind::Cluster, "reviews")]),
         );
@@ -734,7 +735,7 @@ mod tests {
             ConfigDelta::default().with_clusters(vec![cluster("reviews")]),
         );
         let outcome = store.apply(
-            SourceId::Kubernetes,
+            SourceId::Static,
             ConfigDelta::default().with_clusters(vec![cluster("reviews")]),
         );
 
@@ -778,7 +779,7 @@ mod tests {
             ConfigDelta::default().with_clusters(vec![cluster("reviews")]),
         );
         store.apply(
-            SourceId::Kubernetes,
+            SourceId::Static,
             ConfigDelta::default().with_providers(vec![provider("openai")]),
         );
 

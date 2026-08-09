@@ -334,6 +334,7 @@ fn config(backends: Vec<(&str, SocketAddr)>) -> RuntimeConfig {
                 })
                 .collect(),
             policies: vec![],
+            replace_prefix_match: None,
         }],
         policies: vec![],
     }

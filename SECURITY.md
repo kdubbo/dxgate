@@ -26,7 +26,7 @@ any public disclosure.
 In scope:
 
 - The `dxgate` data-plane proxy (routing, TLS termination, auth, rate limiting).
-- The xDS client and Kubernetes controller.
+- The xDS client and namespaced Kubernetes Secret resolver.
 - The web UI interface.
 
 Out of scope:

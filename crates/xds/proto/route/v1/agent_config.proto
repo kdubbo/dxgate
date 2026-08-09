@@ -1,0 +1,170 @@
+syntax = "proto3";
+
+package route.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/kdubbo/xds-api/route/v1;routev1";
+
+// AgentConfig is the mesh-native LLM, MCP, and A2A slice compiled by dubbod
+// from DxgateService and HTTPRoute resources.
+message AgentConfig {
+  repeated AgentProvider providers = 1;
+  repeated AgentBackend backends = 2;
+  repeated AgentRoute agent_routes = 3;
+  repeated AgentPolicy policies = 4;
+}
+
+message AgentProvider {
+  string name = 1;
+  AgentProviderKind kind = 2;
+  string base_url = 3;
+  SecretKeyReference credential = 4;
+  repeated AgentHeaderValue request_headers = 5;
+}
+
+enum AgentProviderKind {
+  AGENT_PROVIDER_KIND_UNSPECIFIED = 0;
+  OPENAI = 1;
+  ANTHROPIC = 2;
+}
+
+message AgentBackend {
+  string name = 1;
+  oneof backend {
+    HTTPBackend http = 2;
+    LLMBackend llm = 3;
+    MCPBackend mcp = 4;
+    A2ABackend a2a = 5;
+  }
+  repeated string policies = 6;
+}
+
+message HTTPBackend {
+  string endpoint = 1;
+}
+
+message LLMBackend {
+  string provider = 1;
+  repeated string models = 2;
+  string endpoint = 3;
+  map<string, string> model_rewrites = 4;
+}
+
+message MCPBackend {
+  string endpoint = 1;
+  repeated string tools = 2;
+}
+
+message A2ABackend {
+  string endpoint = 1;
+  string agent = 2;
+}
+
+message AgentRoute {
+  string name = 1;
+  AgentProtocol protocol = 2;
+  repeated AgentRouteMatch matches = 3;
+  repeated WeightedBackend weighted_backends = 4;
+  repeated string policies = 5;
+  PathRewrite rewrite = 6;
+}
+
+enum AgentProtocol {
+  AGENT_PROTOCOL_UNSPECIFIED = 0;
+  HTTP = 1;
+  LLM = 2;
+  MCP = 3;
+  A2A = 4;
+}
+
+message AgentRouteMatch {
+  AgentPathMatch path = 1;
+  string host = 2;
+  string method = 3;
+  string model = 4;
+  string tool = 5;
+  string agent = 6;
+  repeated AgentHeaderMatch headers = 7;
+}
+
+message AgentPathMatch {
+  oneof match {
+    string prefix = 1;
+    string exact = 2;
+  }
+}
+
+message AgentHeaderMatch {
+  string name = 1;
+  string value = 2;
+}
+
+message WeightedBackend {
+  string name = 1;
+  uint32 weight = 2;
+}
+
+message PathRewrite {
+  // Gateway API URLRewrite ReplacePrefixMatch value.
+  string replace_prefix_match = 1;
+}
+
+message AgentPolicy {
+  string name = 1;
+  ClientAuthPolicy auth = 2;
+  AgentRateLimitPolicy rate_limit = 3;
+  AgentTokenLimitPolicy token_limit = 4;
+  google.protobuf.Duration timeout = 5;
+  AgentRetryPolicy retry = 6;
+  uint64 max_body_bytes = 7;
+  AgentHeaderTransform request_headers = 8;
+  AgentHeaderTransform response_headers = 9;
+}
+
+message ClientAuthPolicy {
+  string header = 1;
+  SecretKeyReference secret_ref = 2;
+}
+
+message SecretKeyReference {
+  string namespace = 1;
+  string name = 2;
+  string key = 3;
+}
+
+message AgentRateLimitPolicy {
+  uint32 requests = 1;
+  google.protobuf.Duration window = 2;
+  AgentRateLimitKey key = 3;
+  string header = 4;
+}
+
+message AgentTokenLimitPolicy {
+  uint64 tokens = 1;
+  google.protobuf.Duration window = 2;
+  AgentRateLimitKey key = 3;
+  string header = 4;
+}
+
+enum AgentRateLimitKey {
+  AGENT_RATE_LIMIT_KEY_UNSPECIFIED = 0;
+  ROUTE = 1;
+  BACKEND = 2;
+  HEADER = 3;
+}
+
+message AgentRetryPolicy {
+  uint32 attempts = 1;
+  repeated uint32 status_codes = 2;
+}
+
+message AgentHeaderTransform {
+  repeated AgentHeaderValue add = 1;
+  repeated string remove = 2;
+}
+
+message AgentHeaderValue {
+  string name = 1;
+  string value = 2;
+}

@@ -42,6 +42,7 @@ async fn llm_route_enforces_api_key_and_forwards_to_provider() {
                 header: "authorization".into(),
                 values: vec!["Bearer client-key".into()],
                 value_env: None,
+                secret_ref: None,
             }),
             rate_limit: None,
             token_limit: None,
@@ -81,6 +82,46 @@ async fn llm_route_enforces_api_key_and_forwards_to_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_llm_path_is_detected_and_rewritten_before_forwarding() {
+    let llm = spawn_llm_backend().await;
+    let route = AgentRoute {
+        name: "custom-chat".into(),
+        protocol: AgentProtocol::Llm,
+        matches: vec![AgentRouteMatch {
+            path: PathMatch::Prefix("/openai".into()),
+            host: None,
+            method: Some("POST".into()),
+            model: Some("gpt-test".into()),
+            tool: None,
+            agent: None,
+            headers: vec![],
+        }],
+        weighted_backends: vec![WeightedBackend {
+            name: "gpt".into(),
+            weight: 100,
+        }],
+        policies: vec![],
+        replace_prefix_match: Some("/v1".into()),
+    };
+    let proxy = spawn_proxy(agent_config(
+        vec![llm_backend(llm.addr)],
+        vec![route],
+        vec![],
+    ))
+    .await;
+
+    let response = post_json(
+        proxy.addr,
+        "/openai/chat/completions",
+        json!({ "model": "gpt-test", "messages": [] }),
+        None,
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["model"], "gpt-test");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_tools_list_federates_multiple_backends() {
     let first = spawn_mcp_backend("search").await;
     let second = spawn_mcp_backend("calendar").await;
@@ -112,6 +153,7 @@ async fn mcp_tools_list_federates_multiple_backends() {
                 },
             ],
             policies: vec![],
+            replace_prefix_match: None,
         }],
         vec![],
     ))
@@ -170,6 +212,7 @@ async fn mcp_sse_session_binds_followup_requests_to_same_backend() {
                 },
             ],
             policies: vec![],
+            replace_prefix_match: None,
         }],
         vec![],
     ))
@@ -247,6 +290,7 @@ async fn a2a_agent_card_is_proxied() {
                 weight: 100,
             }],
             policies: vec![],
+            replace_prefix_match: None,
         }],
         vec![],
     ))
@@ -427,6 +471,7 @@ fn agent_config(
             kind: ProviderKind::OpenAiCompatible,
             base_url: "http://unused".into(),
             api_key_env: Some("DXGATE_TEST_OPENAI_KEY".into()),
+            credential_ref: None,
             request_headers: vec![],
         }],
         backends,
@@ -477,6 +522,7 @@ fn llm_route() -> AgentRoute {
             weight: 100,
         }],
         policies: vec!["caller-auth".into()],
+        replace_prefix_match: None,
     }
 }
 

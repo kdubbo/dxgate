@@ -10,7 +10,7 @@
 
 dxgate is the delegated gateway for Dubbo Gateway API traffic and the external data-plane proxy of the [Apache Dubbo Kubernetes](https://github.com/apache/dubbo-kubernetes) project. It consumes control-plane configuration from `dubbod` as a router xDS client.
 
-It also ships an additional proxy gateway runtime for OpenAI-compatible LLM routing, MCP tool routing and federation, A2A forwarding, reusable policies, richer metrics, and Kubernetes CRD-driven configuration. The original Dubbo Gateway API/xDS path remains the default path.
+The same mesh path carries ordinary Kubernetes HTTP services plus OpenAI-compatible and Anthropic LLM routing, MCP federation, A2A forwarding, reusable policies, and richer metrics.
 
 ## Features
 
@@ -23,7 +23,7 @@ It also ships an additional proxy gateway runtime for OpenAI-compatible LLM rout
 - **Reusable policies** — API-key / JWT auth, rate limiting, retries, timeouts, request/response header transforms, body-size limits, allow/deny.
 - **Resilience** — per-cluster circuit breakers, consecutive-5xx outlier ejection, and retry with failover across weighted backends; SIGTERM drains in-flight requests before exit.
 - **Observability** — Prometheus metrics, W3C trace propagation with OTLP export, structured access logs, and a built-in web UI.
-- **Two composable config sources** — the Gateway API slice arrives from `dubbod` over delta ADS (with a state-of-the-world fallback), and the AI-gateway slice from Kubernetes CRDs (`Dxgate`, `DxgateBackend`, `DxgateRoute`, `DxgatePolicy`) driven by informers. Every resource records the source that owns it, so the two compose instead of overwriting one another: xDS owns listeners and clusters while the CRD controller owns backends, routes, and policies. `/debug/sources` reports the ownership map.
+- **One mesh API and control plane** — ordinary HTTPRoute backends use core Kubernetes `Service`; LLM, MCP, and A2A backends use `networking.dubbo.apache.org/v1alpha3` `DxgateService`. `dubbod` validates and compiles both into RDS, and dxgate consumes the result over xDS. dxgate watches no private routing CRDs; Kubernetes access is limited to referenced Secret values.
 
 ## License
 

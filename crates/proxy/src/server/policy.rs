@@ -79,7 +79,14 @@ pub(super) fn evaluate_policies(
             }
         }
         if let Some(auth) = &policy.auth {
-            validate_auth(auth, &context.headers).map_err(|message| {
+            let secret = match auth {
+                dxgate_core::AuthPolicy::ApiKey {
+                    secret_ref: Some(reference),
+                    ..
+                } => server.state.credential(reference),
+                _ => None,
+            };
+            validate_auth(auth, &context.headers, secret.as_deref()).map_err(|message| {
                 server.state.record_policy_denied();
                 (
                     StatusCode::UNAUTHORIZED,

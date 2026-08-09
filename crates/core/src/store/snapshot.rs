@@ -63,6 +63,7 @@ pub struct ConfigSnapshot {
     agent_routes_by_protocol: HashMap<AgentProtocol, Vec<Arc<AgentRoute>>>,
     policy_refs: BTreeMap<String, Vec<ResourceKey>>,
     has_http_agent_route: bool,
+    has_agent_routes: bool,
 }
 
 /// The virtual hosts bound to one listener port, in declaration order.
@@ -138,6 +139,7 @@ impl ConfigSnapshot {
             agent_routes_by_protocol: HashMap::new(),
             policy_refs: BTreeMap::new(),
             has_http_agent_route: false,
+            has_agent_routes: false,
         }
     }
 
@@ -185,6 +187,7 @@ impl ConfigSnapshot {
                 .push(route.clone());
         }
         let has_http_agent_route = agent_routes_by_protocol.contains_key(&AgentProtocol::Http);
+        let has_agent_routes = !agent_routes.is_empty();
 
         let policy_refs = build_policy_refs(&backends, &agent_routes);
 
@@ -222,6 +225,7 @@ impl ConfigSnapshot {
             agent_routes_by_protocol,
             policy_refs,
             has_http_agent_route,
+            has_agent_routes,
         }
     }
 
@@ -287,12 +291,20 @@ impl ConfigSnapshot {
         self.providers.get(name)
     }
 
+    pub fn providers(&self) -> impl Iterator<Item = &Arc<Provider>> {
+        self.providers.values()
+    }
+
     pub fn backend(&self, name: &str) -> Option<&Arc<Backend>> {
         self.backends.get(name)
     }
 
     pub fn policy(&self, name: &str) -> Option<&Arc<Policy>> {
         self.policies.get(name)
+    }
+
+    pub fn policies(&self) -> impl Iterator<Item = &Arc<Policy>> {
+        self.policies.values()
     }
 
     pub fn agent_routes(&self) -> &[Arc<AgentRoute>] {
@@ -304,6 +316,10 @@ impl ConfigSnapshot {
     /// to the agent router.
     pub fn has_http_agent_route(&self) -> bool {
         self.has_http_agent_route
+    }
+
+    pub fn has_agent_routes(&self) -> bool {
+        self.has_agent_routes
     }
 
     /// Reverse index: policy name to the resources that attach it.
@@ -447,8 +463,8 @@ fn build_policy_refs(
 ///
 /// These are deliberately not fatal. With several sources feeding one store,
 /// a dangling reference is the normal steady state while the other source
-/// catches up — an ADS stream delivers listeners before clusters, and the
-/// Kubernetes controller may see a route before its backend. Rejecting the
+/// catches up — an ADS stream can deliver listeners before clusters or an
+/// agent route before its backend. Rejecting the
 /// update would deadlock convergence, so the store commits it and reports the
 /// gap through readiness instead; requests that hit the gap fail with 503.
 fn validate_references(

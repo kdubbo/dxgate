@@ -312,6 +312,7 @@ fn config(backends: Vec<(&str, SocketAddr, Option<&str>)>) -> RuntimeConfig {
                 }],
                 weighted_backends: weighted(&backends),
                 policies: vec![],
+                replace_prefix_match: None,
             },
             AgentRoute {
                 name: "a2a-card".into(),
@@ -327,6 +328,7 @@ fn config(backends: Vec<(&str, SocketAddr, Option<&str>)>) -> RuntimeConfig {
                 }],
                 weighted_backends: weighted(&backends),
                 policies: vec![],
+                replace_prefix_match: None,
             },
         ],
         policies: vec![],

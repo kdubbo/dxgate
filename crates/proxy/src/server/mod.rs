@@ -218,17 +218,27 @@ async fn forward(
     if is_grpc_request(req.headers()) {
         return forward_http(server, snapshot, req).await;
     }
-    let protocol = detect_agent_protocol(req.uri().path()).or_else(|| {
-        snapshot
-            .has_http_agent_route()
-            .then_some(AgentProtocol::Http)
-    });
-    if let Some(protocol) = protocol {
+    if detect_agent_protocol(req.uri().path()).is_some() || snapshot.has_agent_routes() {
         let (parts, body) = req.into_parts();
         let body_bytes = read_body_limited(&parts.headers, body, server.max_body_bytes).await?;
-        let context = AgentRequestContext::new(protocol, &parts, &body_bytes);
-        if let Some(route) = snapshot.agent_route_for(&context.input()).cloned() {
-            return forward_agent(server, snapshot, parts, body_bytes, context, route).await;
+        let detected = detect_agent_protocol(parts.uri.path());
+        let candidates: &[AgentProtocol] = match detected {
+            Some(AgentProtocol::Http) => &[AgentProtocol::Http],
+            Some(AgentProtocol::Llm) => &[AgentProtocol::Llm],
+            Some(AgentProtocol::Mcp) => &[AgentProtocol::Mcp],
+            Some(AgentProtocol::A2a) => &[AgentProtocol::A2a],
+            None => &[
+                AgentProtocol::Llm,
+                AgentProtocol::Mcp,
+                AgentProtocol::A2a,
+                AgentProtocol::Http,
+            ],
+        };
+        for protocol in candidates {
+            let context = AgentRequestContext::new(*protocol, &parts, &body_bytes);
+            if let Some(route) = snapshot.agent_route_for(&context.input()).cloned() {
+                return forward_agent(server, snapshot, parts, body_bytes, context, route).await;
+            }
         }
         req = Request::from_parts(parts, Body::from(body_bytes));
     }
@@ -570,6 +580,7 @@ async fn forward_agent(
     mut context: AgentRequestContext,
     route: Arc<AgentRoute>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    apply_agent_path_rewrite(&route, &mut context);
     // A backend-prefixed name minted by list federation ("mcp-b__search")
     // pins the request to that backend and is rewritten back to the upstream
     // name before matching or forwarding.
@@ -718,6 +729,35 @@ async fn forward_agent(
         return augment_initialize_response(&server, response).await;
     }
     Ok(response)
+}
+
+fn apply_agent_path_rewrite(route: &AgentRoute, context: &mut AgentRequestContext) {
+    let Some(replacement) = route.replace_prefix_match.as_deref() else {
+        return;
+    };
+    let input = context.input();
+    let Some(path_match) = route
+        .matches
+        .iter()
+        .find(|candidate| candidate.matches(&input))
+        .map(|candidate| &candidate.path)
+    else {
+        return;
+    };
+    let suffix = match path_match {
+        dxgate_core::PathMatch::Prefix(prefix) => context.path.strip_prefix(prefix),
+        dxgate_core::PathMatch::Exact(exact) if context.path == *exact => Some(""),
+        _ => None,
+    };
+    let Some(suffix) = suffix else {
+        return;
+    };
+    let query = context
+        .path_and_query
+        .strip_prefix(&context.path)
+        .unwrap_or_default();
+    context.path = format!("{replacement}{suffix}");
+    context.path_and_query = format!("{}{query}", context.path);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -973,7 +1013,10 @@ async fn request_agent_backend(
             );
         }
     }
-    apply_provider_headers(&mut headers, provider);
+    let provider_secret = provider
+        .and_then(|value| value.credential_ref.as_ref())
+        .and_then(|reference| server.state.credential(reference));
+    apply_provider_headers(&mut headers, provider, provider_secret.as_deref());
     headers.remove(http::header::HOST);
     // The agent path forwards a fully buffered body that may have been
     // rewritten (LLM translation, MCP alias/cursor pages); make the framing

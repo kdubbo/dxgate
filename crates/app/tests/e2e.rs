@@ -180,6 +180,7 @@ fn agent_config(upstream: SocketAddr) -> RuntimeConfig {
             weight: 100,
         }],
         policies: vec!["guard".into()],
+        replace_prefix_match: None,
     }];
     cfg.policies = vec![Policy {
         name: "guard".into(),
@@ -189,6 +190,7 @@ fn agent_config(upstream: SocketAddr) -> RuntimeConfig {
             header: "authorization".into(),
             values: vec!["Bearer e2e".into()],
             value_env: None,
+            secret_ref: None,
         }),
         rate_limit: Some(RateLimitPolicy {
             requests: 2,
@@ -212,6 +214,7 @@ fn llm_config(upstream: SocketAddr) -> RuntimeConfig {
         kind: ProviderKind::OpenAiCompatible,
         base_url: format!("http://127.0.0.1:{}", upstream.port()),
         api_key_env: None,
+        credential_ref: None,
         request_headers: vec![],
     }];
     cfg.backends = vec![Backend {
@@ -241,6 +244,7 @@ fn llm_config(upstream: SocketAddr) -> RuntimeConfig {
             weight: 100,
         }],
         policies: vec![],
+        replace_prefix_match: None,
     }];
     cfg
 }
@@ -288,6 +292,7 @@ fn mcp_config(upstream: SocketAddr) -> RuntimeConfig {
             },
         ],
         policies: vec![],
+        replace_prefix_match: None,
     }];
     cfg
 }
@@ -460,10 +465,8 @@ async fn llm_sse_response_streams_through_proxy_before_upstream_completes() {
     assert!(String::from_utf8_lossy(&rest).contains("[DONE]"));
 }
 
-/// The multi-source contract: xDS owns the Gateway API slice, the Kubernetes
-/// controller owns the agent slice, and neither erases the other. Before the
-/// store existed, whichever source published last wiped out the other's
-/// resources, which is why xDS and agent routing could not run together.
+/// Owner isolation used by offline tooling: a static fixture cannot erase
+/// resources already owned by the xDS control plane.
 #[tokio::test]
 async fn independent_sources_serve_disjoint_slices_of_one_store() {
     let release = Arc::new(Notify::new());
@@ -477,11 +480,11 @@ async fn independent_sources_serve_disjoint_slices_of_one_store() {
     let gateway = base_config(upstream);
     store.apply(SourceId::Xds, xds.reconcile(gateway.clone()));
 
-    // The Kubernetes slice: an HTTP agent route with its backend and policy.
-    let mut kubernetes = SourceState::new();
+    // An offline fixture with an HTTP agent route, backend, and policy.
+    let mut fixture = SourceState::new();
     let agent = agent_config(upstream);
     let agent_only = RuntimeConfig {
-        version: "crd-1".into(),
+        version: "fixture-1".into(),
         listeners: vec![],
         clusters: vec![],
         secrets: vec![],
@@ -490,10 +493,7 @@ async fn independent_sources_serve_disjoint_slices_of_one_store() {
         routes: agent.routes.clone(),
         policies: agent.policies.clone(),
     };
-    let outcome = store.apply(
-        SourceId::Kubernetes,
-        kubernetes.reconcile(agent_only.clone()),
-    );
+    let outcome = store.apply(SourceId::Static, fixture.reconcile(agent_only.clone()));
     assert!(outcome.rejected.is_empty(), "{:?}", outcome.rejected);
     assert!(outcome.ready, "{:?}", outcome.conflicts);
 
@@ -511,11 +511,11 @@ async fn independent_sources_serve_disjoint_slices_of_one_store() {
     assert_eq!(post_api(&client, addr).await, StatusCode::OK);
     assert_eq!(get_hello(&client, addr).await, StatusCode::OK);
 
-    // Retiring the agent route on the Kubernetes side leaves the gateway route
+    // Retiring the fixture agent route leaves the gateway route
     // intact, and the request now falls through to cluster routing.
     let mut without_route = agent_only;
     without_route.routes.clear();
-    store.apply(SourceId::Kubernetes, kubernetes.reconcile(without_route));
+    store.apply(SourceId::Static, fixture.reconcile(without_route));
     assert!(store.snapshot().agent_routes().is_empty());
     assert!(store.snapshot().cluster("upstream").is_some());
     assert_eq!(get_hello(&client, addr).await, StatusCode::OK);
@@ -528,7 +528,7 @@ async fn independent_sources_serve_disjoint_slices_of_one_store() {
     );
     assert_eq!(
         snapshot.owner(&ResourceKey::new(ResourceKind::Backend, "api")),
-        Some(SourceId::Kubernetes)
+        Some(SourceId::Static)
     );
 }
 
