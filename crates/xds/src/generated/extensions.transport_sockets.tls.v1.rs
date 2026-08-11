@@ -67,8 +67,6 @@ pub struct CommonTlsContext {
     >,
     #[prost(string, repeated, tag = "4")]
     pub alpn_protocols: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(message, optional, tag = "10")]
-    pub tls_params: ::core::option::Option<TlsParameters>,
     #[prost(oneof = "common_tls_context::ValidationContextType", tags = "8")]
     pub validation_context_type: ::core::option::Option<
         common_tls_context::ValidationContextType,
@@ -101,53 +99,5 @@ pub mod common_tls_context {
     pub enum ValidationContextType {
         #[prost(message, tag = "8")]
         CombinedValidationContext(CombinedCertificateValidationContext),
-    }
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TlsParameters {
-    #[prost(enumeration = "tls_parameters::TlsProtocol", tag = "1")]
-    pub min_protocol_version: i32,
-}
-/// Nested message and enum types in `TlsParameters`.
-pub mod tls_parameters {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
-    #[repr(i32)]
-    pub enum TlsProtocol {
-        TlsAuto = 0,
-        Tlsv12 = 1,
-        Tlsv13 = 2,
-    }
-    impl TlsProtocol {
-        /// String value of the enum field names used in the ProtoBuf definition.
-        ///
-        /// The values are not transformed in any way and thus are considered stable
-        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-        pub fn as_str_name(&self) -> &'static str {
-            match self {
-                TlsProtocol::TlsAuto => "TLS_AUTO",
-                TlsProtocol::Tlsv12 => "TLSV1_2",
-                TlsProtocol::Tlsv13 => "TLSV1_3",
-            }
-        }
-        /// Creates an enum from field names used in the ProtoBuf definition.
-        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-            match value {
-                "TLS_AUTO" => Some(Self::TlsAuto),
-                "TLSV1_2" => Some(Self::Tlsv12),
-                "TLSV1_3" => Some(Self::Tlsv13),
-                _ => None,
-            }
-        }
     }
 }

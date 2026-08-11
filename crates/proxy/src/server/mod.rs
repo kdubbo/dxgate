@@ -3,7 +3,7 @@ use crate::llm::{self, LlmDialect};
 use crate::mcp;
 use crate::ProxyState;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::{
     HeaderMap, HeaderValue as HttpHeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
@@ -102,7 +102,7 @@ impl ProxyServer {
             .fallback(any(proxy_request))
             .with_state(server);
         axum::Server::bind(&addr)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .serve(app.into_make_service())
             .with_graceful_shutdown(shutdown)
             .await
             .map_err(std::io::Error::other)
@@ -172,11 +172,7 @@ async fn read_body_limited(
     Ok(Bytes::from(buf))
 }
 
-async fn proxy_request(
-    State(server): State<ProxyServer>,
-    peer: Option<ConnectInfo<SocketAddr>>,
-    req: Request<Body>,
-) -> Response<Body> {
+async fn proxy_request(State(server): State<ProxyServer>, req: Request<Body>) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let parent_context = extract_trace_context(req.headers());
@@ -196,9 +192,7 @@ async fn proxy_request(
     // Held for the whole handler: a request denied by policy or rejected before
     // routing still occupied the gateway while it was being handled.
     let _in_flight = server.state.track_request();
-    let result = forward(server, req, peer.map(|value| value.0))
-        .instrument(span.clone())
-        .await;
+    let result = forward(server, req).instrument(span.clone()).await;
     match result {
         Ok(resp) => {
             span.record("http.status_code", resp.status().as_u16());
@@ -218,12 +212,11 @@ async fn proxy_request(
 async fn forward(
     server: ProxyServer,
     mut req: Request<Body>,
-    peer: Option<SocketAddr>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     // One atomic refcount bump gives the whole request a stable, indexed view of
     // the configuration; nothing is copied per request.
     let snapshot = server.state.snapshot();
-    enforce_listener_security(&server, &snapshot, &mut req, peer).await?;
+    enforce_listener_security(&server, &snapshot, &req).await?;
     // gRPC and Dubbo Triple require end-to-end HTTP/2 with streaming bodies and
     // trailer propagation; buffering the body here would break both, so they skip
     // the agent path and stream straight through cluster routing.
@@ -1554,7 +1547,6 @@ mod tests {
                     validation_provider: None,
                     alpn_protocols: vec!["h2".into()],
                     subject_alt_names: vec![],
-                    minimum_protocol_version: None,
                 },
                 false,
             )
@@ -1580,12 +1572,11 @@ mod tests {
             validation_provider: Some("roots".into()),
             alpn_protocols: vec!["h2".into(), "http/1.1".into()],
             subject_alt_names: vec!["spiffe://cluster.local/ns/app/sa/nginx".into()],
-            minimum_protocol_version: None,
         };
 
         assert_eq!(
             mtls_cache_key(&tls),
-            "nginx.app.svc.cluster.local|workload|roots|h2,http/1.1|spiffe://cluster.local/ns/app/sa/nginx|None"
+            "nginx.app.svc.cluster.local|workload|roots|h2,http/1.1|spiffe://cluster.local/ns/app/sa/nginx"
         );
     }
 
@@ -1598,7 +1589,6 @@ mod tests {
             validation_provider: None,
             alpn_protocols: vec![],
             subject_alt_names: vec![],
-            minimum_protocol_version: None,
         };
         let mutual = UpstreamTls {
             mode: UpstreamTlsMode::DubboMutual,
@@ -1607,7 +1597,6 @@ mod tests {
             validation_provider: None,
             alpn_protocols: vec![],
             subject_alt_names: vec![],
-            minimum_protocol_version: None,
         };
 
         assert_eq!(upstream_request_mode(None), UpstreamRequestMode::PlainHttp);
@@ -1789,7 +1778,6 @@ mod tests {
             validation_provider: None,
             alpn_protocols: vec![],
             subject_alt_names,
-            minimum_protocol_version: None,
         }
     }
 

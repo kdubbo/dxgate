@@ -12,40 +12,16 @@ message RBAC {
 
   Action action = 1;
   repeated Rule rules = 2;
-  bool shadow = 3;
-  string policy_name = 4;
 }
 
 message Rule {
   repeated Source sources = 1;
   repeated Condition when = 2;
-  repeated Operation operations = 3;
 }
 
 message Source {
   repeated string request_principals = 1;
   repeated string principals = 2;
-  repeated string not_principals = 3;
-  repeated string not_request_principals = 4;
-  repeated string namespaces = 5;
-  repeated string not_namespaces = 6;
-  repeated string service_accounts = 7;
-  repeated string not_service_accounts = 8;
-  repeated string ip_blocks = 9;
-  repeated string not_ip_blocks = 10;
-  repeated string remote_ip_blocks = 11;
-  repeated string not_remote_ip_blocks = 12;
-}
-
-message Operation {
-  repeated string hosts = 1;
-  repeated string not_hosts = 2;
-  repeated string ports = 3;
-  repeated string not_ports = 4;
-  repeated string methods = 5;
-  repeated string not_methods = 6;
-  repeated string paths = 7;
-  repeated string not_paths = 8;
 }
 
 message Condition {

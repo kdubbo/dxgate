@@ -14,7 +14,6 @@ use super::XdsError;
 use crate::proto::cluster::v1 as xds_cluster;
 use crate::proto::core::v1 as xds_core;
 use crate::proto::endpoint::v1 as xds_endpoint;
-use crate::proto::extensions::filters::http::ext_authz::v1 as xds_ext_authz;
 use crate::proto::extensions::filters::http::jwt_authn::v1 as xds_jwt;
 use crate::proto::extensions::filters::http::rbac::v1 as xds_rbac;
 use crate::proto::extensions::filters::network::http_connection_manager::v1 as xds_hcm;
@@ -24,14 +23,13 @@ use crate::proto::route::v1 as xds_route;
 use crate::proto::service::discovery::v1::DiscoveryResponse;
 use dxgate_core::{
     AgentProtocol, AgentRoute, AgentRouteMatch, AuthPolicy, AuthorizationAction,
-    AuthorizationCondition, AuthorizationOperation, AuthorizationPolicy, AuthorizationRule,
-    AuthorizationSource, Backend, BackendKind, CircuitBreakerConfig, ClaimToHeader, Cluster,
-    Collection, ConfigDelta, Endpoint as RuntimeEndpoint, ExternalAuthorization,
-    ExternalAuthorizationProtocol, HeaderMatch, HeaderTransform, HeaderValue, JwtHeader,
-    JwtProvider, Listener, ListenerProtocol, ListenerSecurity, MinimumTlsVersion,
-    OutlierDetectionConfig, PathMatch, Policy, PolicyAction, Provider, ProviderKind, RateLimitKey,
-    RateLimitPolicy, RetryPolicy, Route, RouteMatch, SecretKeyReference, SourceState,
-    TokenLimitPolicy, UpstreamTls, UpstreamTlsMode, VirtualHost, WeightedBackend, WeightedCluster,
+    AuthorizationCondition, AuthorizationPolicy, AuthorizationRule, AuthorizationSource, Backend,
+    BackendKind, CircuitBreakerConfig, Cluster, Collection, ConfigDelta,
+    Endpoint as RuntimeEndpoint, HeaderMatch, HeaderTransform, HeaderValue, JwtHeader, JwtProvider,
+    Listener, ListenerProtocol, ListenerSecurity, OutlierDetectionConfig, PathMatch, Policy,
+    PolicyAction, Provider, ProviderKind, RateLimitKey, RateLimitPolicy, RetryPolicy, Route,
+    RouteMatch, SecretKeyReference, SourceState, TokenLimitPolicy, UpstreamTls, UpstreamTlsMode,
+    VirtualHost, WeightedBackend, WeightedCluster,
 };
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -741,20 +739,7 @@ fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamT
             .map(|common| common.alpn_protocols.clone())
             .unwrap_or_default(),
         subject_alt_names: common.map(match_subject_alt_names).unwrap_or_default(),
-        minimum_protocol_version: common.and_then(minimum_tls_version),
     })
-}
-
-fn minimum_tls_version(common: &xds_tls::CommonTlsContext) -> Option<MinimumTlsVersion> {
-    let protocol = xds_tls::tls_parameters::TlsProtocol::try_from(
-        common.tls_params.as_ref()?.min_protocol_version,
-    )
-    .ok()?;
-    match protocol {
-        xds_tls::tls_parameters::TlsProtocol::Tlsv13 => Some(MinimumTlsVersion::Tls13),
-        xds_tls::tls_parameters::TlsProtocol::Tlsv12 => Some(MinimumTlsVersion::Tls12),
-        xds_tls::tls_parameters::TlsProtocol::TlsAuto => None,
-    }
 }
 
 fn match_subject_alt_names(common: &xds_tls::CommonTlsContext) -> Vec<String> {
@@ -910,20 +895,6 @@ fn security_from_hcm(hcm: &xds_hcm::HttpConnectionManager) -> Result<ListenerSec
                 .extend(config.providers.iter().map(convert_jwt_provider));
             continue;
         }
-        if filter.name.contains("ext_authz")
-            || any
-                .type_url
-                .ends_with("extensions.filters.http.ext_authz.v1.ExtAuthz")
-        {
-            let config: xds_ext_authz::ExtAuthz = decode_resource(
-                "type.googleapis.com/extensions.filters.http.ext_authz.v1.ExtAuthz",
-                any,
-            )?;
-            security
-                .external_authorization
-                .push(convert_external_authorization(&config));
-            continue;
-        }
         if filter.name.contains("rbac")
             || any
                 .type_url
@@ -942,9 +913,6 @@ fn security_from_hcm(hcm: &xds_hcm::HttpConnectionManager) -> Result<ListenerSec
 fn merge_listener_security(target: &mut ListenerSecurity, source: ListenerSecurity) {
     target.jwt_providers.extend(source.jwt_providers);
     target.authorization.extend(source.authorization);
-    target
-        .external_authorization
-        .extend(source.external_authorization);
 }
 
 fn convert_jwt_provider(provider: &xds_jwt::JwtProvider) -> JwtProvider {
@@ -962,112 +930,38 @@ fn convert_jwt_provider(provider: &xds_jwt::JwtProvider) -> JwtProvider {
             })
             .collect(),
         from_params: provider.from_params.clone(),
-        from_cookies: provider.from_cookies.clone(),
-        forward_original_token: provider.forward_original_token,
-        output_payload_to_header: provider.output_payload_to_header.clone(),
-        output_claim_to_headers: provider
-            .output_claim_to_headers
-            .iter()
-            .map(|mapping| ClaimToHeader {
-                claim: mapping.claim.clone(),
-                header: mapping.header.clone(),
-            })
-            .collect(),
     }
 }
 
 fn convert_authorization(config: &xds_rbac::Rbac) -> AuthorizationPolicy {
     AuthorizationPolicy {
-        name: config.policy_name.clone(),
         action: if config.action == xds_rbac::rbac::Action::Deny as i32 {
             AuthorizationAction::Deny
         } else {
             AuthorizationAction::Allow
         },
-        shadow: config.shadow,
         rules: config
             .rules
             .iter()
-            .map(convert_authorization_rule)
-            .collect(),
-    }
-}
-
-fn convert_authorization_rule(rule: &xds_rbac::Rule) -> AuthorizationRule {
-    AuthorizationRule {
-        sources: rule
-            .sources
-            .iter()
-            .map(convert_authorization_source)
-            .collect(),
-        operations: rule
-            .operations
-            .iter()
-            .map(convert_authorization_operation)
-            .collect(),
-        when: rule
-            .when
-            .iter()
-            .map(|condition| AuthorizationCondition {
-                key: condition.key.clone(),
-                values: condition.values.clone(),
-                not_values: condition.not_values.clone(),
+            .map(|rule| AuthorizationRule {
+                sources: rule
+                    .sources
+                    .iter()
+                    .map(|source| AuthorizationSource {
+                        request_principals: source.request_principals.clone(),
+                        principals: source.principals.clone(),
+                    })
+                    .collect(),
+                when: rule
+                    .when
+                    .iter()
+                    .map(|condition| AuthorizationCondition {
+                        key: condition.key.clone(),
+                        values: condition.values.clone(),
+                        not_values: condition.not_values.clone(),
+                    })
+                    .collect(),
             })
-            .collect(),
-    }
-}
-
-fn convert_authorization_source(source: &xds_rbac::Source) -> AuthorizationSource {
-    AuthorizationSource {
-        request_principals: source.request_principals.clone(),
-        principals: source.principals.clone(),
-        not_principals: source.not_principals.clone(),
-        not_request_principals: source.not_request_principals.clone(),
-        namespaces: source.namespaces.clone(),
-        not_namespaces: source.not_namespaces.clone(),
-        service_accounts: source.service_accounts.clone(),
-        not_service_accounts: source.not_service_accounts.clone(),
-        ip_blocks: source.ip_blocks.clone(),
-        not_ip_blocks: source.not_ip_blocks.clone(),
-        remote_ip_blocks: source.remote_ip_blocks.clone(),
-        not_remote_ip_blocks: source.not_remote_ip_blocks.clone(),
-    }
-}
-
-fn convert_authorization_operation(operation: &xds_rbac::Operation) -> AuthorizationOperation {
-    AuthorizationOperation {
-        hosts: operation.hosts.clone(),
-        not_hosts: operation.not_hosts.clone(),
-        ports: operation.ports.clone(),
-        not_ports: operation.not_ports.clone(),
-        methods: operation.methods.clone(),
-        not_methods: operation.not_methods.clone(),
-        paths: operation.paths.clone(),
-        not_paths: operation.not_paths.clone(),
-    }
-}
-
-fn convert_external_authorization(config: &xds_ext_authz::ExtAuthz) -> ExternalAuthorization {
-    ExternalAuthorization {
-        provider: config.provider.clone(),
-        protocol: if config.protocol == xds_ext_authz::ext_authz::Protocol::Grpc as i32 {
-            ExternalAuthorizationProtocol::Grpc
-        } else {
-            ExternalAuthorizationProtocol::Http
-        },
-        service: config.service.clone(),
-        port: config.port,
-        path_prefix: config.path_prefix.clone(),
-        include_request_headers_in_check: config.include_request_headers_in_check.clone(),
-        headers_to_upstream_on_allow: config.headers_to_upstream_on_allow.clone(),
-        headers_to_downstream_on_deny: config.headers_to_downstream_on_deny.clone(),
-        timeout_ms: config.timeout.as_ref().map(duration_millis).unwrap_or(0),
-        fail_open: config.fail_open,
-        shadow: config.shadow,
-        rules: config
-            .rules
-            .iter()
-            .map(convert_authorization_rule)
             .collect(),
     }
 }
@@ -1308,50 +1202,6 @@ mod tests {
                                 config_source: None,
                             }),
                         ),
-                        http_filters: vec![
-                            xds_hcm::HttpFilter {
-                                name: "filters.http.jwt_authn".into(),
-                                config_type: Some(
-                                    xds_hcm::http_filter::ConfigType::TypedConfig(any(
-                                        "type.googleapis.com/extensions.filters.http.jwt_authn.v1.JwtAuthentication",
-                                        xds_jwt::JwtAuthentication {
-                                            providers: vec![xds_jwt::JwtProvider {
-                                                issuer: "https://issuer.example".into(),
-                                                output_claim_to_headers: vec![
-                                                    xds_jwt::ClaimToHeader {
-                                                        claim: "group".into(),
-                                                        header: "x-jwt-group".into(),
-                                                    },
-                                                ],
-                                                ..xds_jwt::JwtProvider::default()
-                                            }],
-                                            allow_missing: true,
-                                        },
-                                    )),
-                                ),
-                            },
-                            xds_hcm::HttpFilter {
-                                name: "filters.http.rbac".into(),
-                                config_type: Some(
-                                    xds_hcm::http_filter::ConfigType::TypedConfig(any(
-                                        "type.googleapis.com/extensions.filters.http.rbac.v1.RBAC",
-                                        xds_rbac::Rbac {
-                                            action: xds_rbac::rbac::Action::Allow as i32,
-                                            rules: vec![xds_rbac::Rule {
-                                                operations: vec![xds_rbac::Operation {
-                                                    methods: vec!["GET".into()],
-                                                    paths: vec!["/orders/*".into()],
-                                                    ..xds_rbac::Operation::default()
-                                                }],
-                                                ..xds_rbac::Rule::default()
-                                            }],
-                                            shadow: false,
-                                            policy_name: "allow-orders".into(),
-                                        },
-                                    )),
-                                ),
-                            },
-                        ],
                         ..xds_hcm::HttpConnectionManager::default()
                     },
                 )),
@@ -1413,10 +1263,6 @@ mod tests {
                                     },
                                 ),
                             ),
-                            tls_params: Some(xds_tls::TlsParameters {
-                                min_protocol_version:
-                                    xds_tls::tls_parameters::TlsProtocol::Tlsv13 as i32,
-                            }),
                         }),
                     },
                 ))),
@@ -1478,18 +1324,6 @@ mod tests {
         assert_eq!(delta.version.as_deref(), Some("v1"));
         assert!(delta.removes.is_empty());
         assert_eq!(delta.listeners[0].bind, "0.0.0.0:80".parse().unwrap());
-        assert_eq!(
-            delta.listeners[0].security.jwt_providers[0].issuer,
-            "https://issuer.example"
-        );
-        assert_eq!(
-            delta.listeners[0].security.authorization[0].name,
-            "allow-orders"
-        );
-        assert_eq!(
-            delta.listeners[0].security.authorization[0].rules[0].operations[0].methods,
-            ["GET"]
-        );
         assert_eq!(
             delta.listeners[0].virtual_hosts[0].domains,
             ["orders.example.com"]
@@ -1820,7 +1654,6 @@ mod tests {
                     },
                 ),
             ),
-            tls_params: None,
         });
 
         let tls = upstream_tls_from_cluster(&cluster).expect("expected TLS config");
@@ -1973,6 +1806,45 @@ mod tests {
             headers: vec![],
         })
         .is_none());
+    }
+
+    #[test]
+    fn security_filters_preserve_required_jwt_and_identity_fields() {
+        let jwt = convert_jwt_provider(&xds_jwt::JwtProvider {
+            issuer: "https://issuer.example".into(),
+            audiences: vec!["dxgate".into()],
+            jwks_uri: "https://issuer.example/jwks".into(),
+            jwks: String::new(),
+            from_headers: vec![xds_jwt::JwtHeader {
+                name: "authorization".into(),
+                prefix: "Bearer ".into(),
+            }],
+            from_params: vec!["token".into()],
+        });
+        assert_eq!(jwt.issuer, "https://issuer.example");
+        assert_eq!(jwt.audiences, ["dxgate"]);
+
+        let authorization = convert_authorization(&xds_rbac::Rbac {
+            action: xds_rbac::rbac::Action::Allow as i32,
+            rules: vec![xds_rbac::Rule {
+                sources: vec![xds_rbac::Source {
+                    request_principals: vec!["https://issuer.example/alice".into()],
+                    principals: vec!["cluster.local/ns/default/sa/client".into()],
+                }],
+                when: vec![xds_rbac::Condition {
+                    key: "request.auth.claims[groups]".into(),
+                    values: vec!["orders".into()],
+                    not_values: vec![],
+                }],
+            }],
+        });
+        let source = &authorization.rules[0].sources[0];
+        assert_eq!(source.request_principals, ["https://issuer.example/alice"]);
+        assert_eq!(source.principals, ["cluster.local/ns/default/sa/client"]);
+        assert_eq!(
+            authorization.rules[0].when[0].key,
+            "request.auth.claims[groups]"
+        );
     }
 
     fn tls_cluster(common: xds_tls::CommonTlsContext) -> xds_cluster::Cluster {

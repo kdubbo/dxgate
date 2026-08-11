@@ -22,14 +22,6 @@ pub struct JwtProvider {
     pub from_headers: ::prost::alloc::vec::Vec<JwtHeader>,
     #[prost(string, repeated, tag = "6")]
     pub from_params: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "7")]
-    pub from_cookies: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag = "8")]
-    pub forward_original_token: bool,
-    #[prost(string, tag = "9")]
-    pub output_payload_to_header: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "10")]
-    pub output_claim_to_headers: ::prost::alloc::vec::Vec<ClaimToHeader>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -38,12 +30,4 @@ pub struct JwtHeader {
     pub name: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub prefix: ::prost::alloc::string::String,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ClaimToHeader {
-    #[prost(string, tag = "1")]
-    pub claim: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub header: ::prost::alloc::string::String,
 }

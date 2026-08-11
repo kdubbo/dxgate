@@ -6,10 +6,6 @@ pub struct Rbac {
     pub action: i32,
     #[prost(message, repeated, tag = "2")]
     pub rules: ::prost::alloc::vec::Vec<Rule>,
-    #[prost(bool, tag = "3")]
-    pub shadow: bool,
-    #[prost(string, tag = "4")]
-    pub policy_name: ::prost::alloc::string::String,
 }
 /// Nested message and enum types in `RBAC`.
 pub mod rbac {
@@ -57,8 +53,6 @@ pub struct Rule {
     pub sources: ::prost::alloc::vec::Vec<Source>,
     #[prost(message, repeated, tag = "2")]
     pub when: ::prost::alloc::vec::Vec<Condition>,
-    #[prost(message, repeated, tag = "3")]
-    pub operations: ::prost::alloc::vec::Vec<Operation>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -67,46 +61,6 @@ pub struct Source {
     pub request_principals: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "2")]
     pub principals: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "3")]
-    pub not_principals: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "4")]
-    pub not_request_principals: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "5")]
-    pub namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "6")]
-    pub not_namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "7")]
-    pub service_accounts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "8")]
-    pub not_service_accounts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "9")]
-    pub ip_blocks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "10")]
-    pub not_ip_blocks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "11")]
-    pub remote_ip_blocks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "12")]
-    pub not_remote_ip_blocks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Operation {
-    #[prost(string, repeated, tag = "1")]
-    pub hosts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "2")]
-    pub not_hosts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "3")]
-    pub ports: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "4")]
-    pub not_ports: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "5")]
-    pub methods: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "6")]
-    pub not_methods: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "7")]
-    pub paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "8")]
-    pub not_paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -52,16 +52,5 @@ message CommonTlsContext {
   oneof validation_context_type {
     CombinedCertificateValidationContext combined_validation_context = 8;
   }
-  TlsParameters tls_params = 10;
   reserved 5;
-}
-
-message TlsParameters {
-  enum TlsProtocol {
-    TLS_AUTO = 0;
-    TLSV1_2 = 1;
-    TLSV1_3 = 2;
-  }
-
-  TlsProtocol min_protocol_version = 1;
 }
