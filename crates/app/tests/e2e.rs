@@ -132,6 +132,7 @@ fn base_config(upstream: SocketAddr) -> RuntimeConfig {
                 }],
             }],
             tls_secret: None,
+            security: Default::default(),
         }],
         clusters: vec![Cluster {
             name: "upstream".into(),

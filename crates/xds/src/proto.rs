@@ -34,6 +34,27 @@ pub mod endpoint {
 pub mod extensions {
     pub mod filters {
         pub mod http {
+            pub mod ext_authz {
+                pub mod v1 {
+                    #![allow(dead_code)]
+                    tonic::include_proto!("extensions.filters.http.ext_authz.v1");
+                }
+            }
+
+            pub mod jwt_authn {
+                pub mod v1 {
+                    #![allow(dead_code)]
+                    tonic::include_proto!("extensions.filters.http.jwt_authn.v1");
+                }
+            }
+
+            pub mod rbac {
+                pub mod v1 {
+                    #![allow(dead_code)]
+                    tonic::include_proto!("extensions.filters.http.rbac.v1");
+                }
+            }
+
             pub mod router {
                 pub mod v1 {
                     #![allow(dead_code)]

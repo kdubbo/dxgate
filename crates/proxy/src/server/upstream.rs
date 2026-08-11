@@ -3,7 +3,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
-use dxgate_core::{Cluster, UpstreamTls};
+use dxgate_core::{Cluster, MinimumTlsVersion, UpstreamTls};
 use hyper::client::HttpConnector;
 use hyper::Client;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -211,8 +211,15 @@ impl MtlsClientPool {
             allowed_sans: tls.subject_alt_names.clone(),
             warned_unpinned: Once::new(),
         });
+        let versions = match tls.minimum_protocol_version {
+            Some(MinimumTlsVersion::Tls13) => &[&rustls::version::TLS13][..],
+            _ => rustls::DEFAULT_VERSIONS,
+        };
         ClientConfig::builder()
-            .with_safe_defaults()
+            .with_safe_default_cipher_suites()
+            .with_safe_default_kx_groups()
+            .with_protocol_versions(versions)
+            .map_err(|e| format!("select data-plane TLS versions: {e}"))?
             .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(certs, key)
             .map_err(|e| format!("build data-plane mTLS client config: {e}"))
@@ -264,12 +271,13 @@ pub(super) fn mtls_cache_key(tls: &UpstreamTls) -> String {
     // subject_alt_names is part of the key: it selects the verifier baked into the
     // cached client, so clusters pinning different peer identities must not share one.
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{:?}",
         tls.sni.as_deref().unwrap_or_default(),
         tls.certificate_provider.as_deref().unwrap_or("default"),
         tls.validation_provider.as_deref().unwrap_or("default"),
         tls.alpn_protocols.join(","),
-        tls.subject_alt_names.join(",")
+        tls.subject_alt_names.join(","),
+        tls.minimum_protocol_version
     )
 }
 

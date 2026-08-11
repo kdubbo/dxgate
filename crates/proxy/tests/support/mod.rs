@@ -160,6 +160,7 @@ fn runtime_config(backend_addr: SocketAddr) -> RuntimeConfig {
                 }],
             }],
             tls_secret: None,
+            security: Default::default(),
         }],
         clusters: vec![Cluster {
             name: "backend".into(),

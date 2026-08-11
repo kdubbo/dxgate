@@ -570,6 +570,7 @@ mod tests {
                 }],
             }],
             tls_secret: None,
+            security: crate::ListenerSecurity::default(),
         }
     }
 

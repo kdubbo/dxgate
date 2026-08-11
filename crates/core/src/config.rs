@@ -261,6 +261,169 @@ pub struct Listener {
     pub virtual_hosts: Vec<VirtualHost>,
     #[serde(default)]
     pub tls_secret: Option<String>,
+    #[serde(default)]
+    pub security: ListenerSecurity,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerSecurity {
+    #[serde(default)]
+    pub jwt_providers: Vec<JwtProvider>,
+    #[serde(default)]
+    pub authorization: Vec<AuthorizationPolicy>,
+    #[serde(default)]
+    pub external_authorization: Vec<ExternalAuthorization>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JwtProvider {
+    pub issuer: String,
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    #[serde(default)]
+    pub jwks_uri: String,
+    #[serde(default)]
+    pub jwks: String,
+    #[serde(default)]
+    pub from_headers: Vec<JwtHeader>,
+    #[serde(default)]
+    pub from_params: Vec<String>,
+    #[serde(default)]
+    pub from_cookies: Vec<String>,
+    #[serde(default)]
+    pub forward_original_token: bool,
+    #[serde(default)]
+    pub output_payload_to_header: String,
+    #[serde(default)]
+    pub output_claim_to_headers: Vec<ClaimToHeader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JwtHeader {
+    pub name: String,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimToHeader {
+    pub claim: String,
+    pub header: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationPolicy {
+    pub name: String,
+    pub action: AuthorizationAction,
+    #[serde(default)]
+    pub shadow: bool,
+    #[serde(default)]
+    pub rules: Vec<AuthorizationRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorizationAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationRule {
+    #[serde(default)]
+    pub sources: Vec<AuthorizationSource>,
+    #[serde(default)]
+    pub operations: Vec<AuthorizationOperation>,
+    #[serde(default)]
+    pub when: Vec<AuthorizationCondition>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationSource {
+    #[serde(default)]
+    pub request_principals: Vec<String>,
+    #[serde(default)]
+    pub principals: Vec<String>,
+    #[serde(default)]
+    pub not_principals: Vec<String>,
+    #[serde(default)]
+    pub not_request_principals: Vec<String>,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    #[serde(default)]
+    pub not_namespaces: Vec<String>,
+    #[serde(default)]
+    pub service_accounts: Vec<String>,
+    #[serde(default)]
+    pub not_service_accounts: Vec<String>,
+    #[serde(default)]
+    pub ip_blocks: Vec<String>,
+    #[serde(default)]
+    pub not_ip_blocks: Vec<String>,
+    #[serde(default)]
+    pub remote_ip_blocks: Vec<String>,
+    #[serde(default)]
+    pub not_remote_ip_blocks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationOperation {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub not_hosts: Vec<String>,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default)]
+    pub not_ports: Vec<String>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub not_methods: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub not_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationCondition {
+    pub key: String,
+    #[serde(default)]
+    pub values: Vec<String>,
+    #[serde(default)]
+    pub not_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalAuthorization {
+    pub provider: String,
+    pub protocol: ExternalAuthorizationProtocol,
+    pub service: String,
+    pub port: u32,
+    #[serde(default)]
+    pub path_prefix: String,
+    #[serde(default)]
+    pub include_request_headers_in_check: Vec<String>,
+    #[serde(default)]
+    pub headers_to_upstream_on_allow: Vec<String>,
+    #[serde(default)]
+    pub headers_to_downstream_on_deny: Vec<String>,
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub fail_open: bool,
+    #[serde(default)]
+    pub shadow: bool,
+    #[serde(default)]
+    pub rules: Vec<AuthorizationRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalAuthorizationProtocol {
+    Http,
+    Grpc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +606,15 @@ pub struct UpstreamTls {
     // peer identity, which the verifier warns about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_alt_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_protocol_version: Option<MinimumTlsVersion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MinimumTlsVersion {
+    Tls12,
+    Tls13,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -934,6 +1106,7 @@ mod tests {
                     protocol: ListenerProtocol::Http,
                     virtual_hosts: vec![],
                     tls_secret: None,
+                    security: ListenerSecurity::default(),
                 },
                 Listener {
                     name: "https".into(),
@@ -941,6 +1114,7 @@ mod tests {
                     protocol: ListenerProtocol::Https,
                     virtual_hosts: vec![],
                     tls_secret: Some("secret".into()),
+                    security: ListenerSecurity::default(),
                 },
             ],
             clusters: vec![],
@@ -978,6 +1152,7 @@ mod tests {
                     }],
                 }],
                 tls_secret: None,
+                security: ListenerSecurity::default(),
             }],
             clusters: vec![],
             secrets: vec![],
@@ -1031,6 +1206,7 @@ mod tests {
                     ],
                 }],
                 tls_secret: None,
+                security: ListenerSecurity::default(),
             }],
             clusters: vec![
                 Cluster {

@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package extensions.filters.http.jwt_authn.v1;
+
+option go_package = "github.com/kdubbo/xds-api/extensions/filters/v1/http/jwt_authn;jwt_authnv1";
+
+message JwtAuthentication {
+  repeated JwtProvider providers = 1;
+  bool allow_missing = 2;
+}
+
+message JwtProvider {
+  string issuer = 1;
+  repeated string audiences = 2;
+  string jwks_uri = 3;
+  string jwks = 4;
+  repeated JwtHeader from_headers = 5;
+  repeated string from_params = 6;
+  repeated string from_cookies = 7;
+  bool forward_original_token = 8;
+  string output_payload_to_header = 9;
+  repeated ClaimToHeader output_claim_to_headers = 10;
+}
+
+message JwtHeader {
+  string name = 1;
+  string prefix = 2;
+}
+
+message ClaimToHeader {
+  string claim = 1;
+  string header = 2;
+}

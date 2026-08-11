@@ -1225,6 +1225,7 @@ mod tests {
                     }],
                 }],
                 tls_secret: None,
+                security: dxgate_core::ListenerSecurity::default(),
             }],
             clusters: vec![Cluster {
                 name: "backend".into(),

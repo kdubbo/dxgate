@@ -183,6 +183,7 @@ fn runtime_config(upstream: SocketAddr, http2: bool) -> RuntimeConfig {
                 }],
             }],
             tls_secret: None,
+            security: Default::default(),
         }],
         clusters: vec![Cluster {
             name: "backend".into(),
