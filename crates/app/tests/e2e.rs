@@ -304,7 +304,7 @@ async fn http_route_proxies_to_upstream_and_reports_ui_state() {
     let (proxy_addr, state) = spawn_proxy(base_config(upstream)).await;
 
     let ui_addr = reserve_port();
-    tokio::spawn(UiServer::new(state, proxy_addr).serve(ui_addr));
+    tokio::spawn(UiServer::new(state, proxy_addr, true).serve(ui_addr));
     wait_until_accepting(ui_addr).await;
 
     let client = Client::new();

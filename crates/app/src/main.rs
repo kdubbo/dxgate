@@ -44,6 +44,9 @@ struct Args {
     #[arg(long, env = "DXGATE_UI_ADDR", default_value = "0.0.0.0:15021")]
     ui_addr: SocketAddr,
 
+    #[arg(long, env = "DXGATE_METRICS_ENABLED", default_value_t = true)]
+    metrics_enabled: bool,
+
     // Should be <= the pod's terminationGracePeriodSeconds, or Kubernetes SIGKILLs
     // the process mid-drain and the graceful shutdown buys nothing.
     #[arg(long, env = "DXGATE_DRAIN_TIMEOUT_SECONDS", default_value_t = 30)]
@@ -146,7 +149,7 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let proxy = ProxyServer::new(state.clone());
-    let ui = UiServer::new(state, args.http_addr);
+    let ui = UiServer::new(state, args.http_addr, args.metrics_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut proxy_task = tokio::spawn(
         proxy.serve_with_shutdown(args.http_addr, shutdown_requested(shutdown_rx.clone())),
@@ -413,6 +416,7 @@ mod tests {
             xds_enabled: None,
             http_addr: "0.0.0.0:80".parse().unwrap(),
             ui_addr: "0.0.0.0:15021".parse().unwrap(),
+            metrics_enabled: true,
             drain_timeout_seconds: 30,
             bootstrap: Some(PathBuf::from("/etc/dxgate/bootstrap.json")),
             otel_endpoint: None,

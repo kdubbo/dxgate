@@ -24,10 +24,11 @@ pub struct UiServer {
     state: ProxyState,
     build: BuildInfo,
     proxy_port: u16,
+    metrics_enabled: bool,
 }
 
 impl UiServer {
-    pub fn new(state: ProxyState, proxy_addr: SocketAddr) -> Self {
+    pub fn new(state: ProxyState, proxy_addr: SocketAddr, metrics_enabled: bool) -> Self {
         Self {
             state,
             build: BuildInfo {
@@ -35,6 +36,7 @@ impl UiServer {
                 version: env!("CARGO_PKG_VERSION"),
             },
             proxy_port: proxy_addr.port(),
+            metrics_enabled,
         }
     }
 
@@ -100,6 +102,9 @@ async fn readyz(State(ui): State<UiServer>) -> Response {
 }
 
 async fn metrics(State(ui): State<UiServer>) -> Response {
+    if !ui.metrics_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let readiness = ui.state.readiness();
     let proxy = ui.state.metrics();
     (
@@ -452,10 +457,12 @@ const UI_HTML: &str = include_str!("../../../ui/ui.html");
 
 #[cfg(test)]
 mod tests {
-    use super::{prometheus_metrics, ui_html};
+    use super::{metrics, prometheus_metrics, ui_html, UiServer};
+    use axum::extract::State;
+    use axum::http::StatusCode;
     use dxgate_proxy::{
         A2aMethodMetric, ConcurrencyMetric, HttpRouteConcurrencyMetric, HttpRouteMetric,
-        LatencyBucket, LlmUsageMetric, McpToolMetric, ProxyMetrics, Readiness,
+        LatencyBucket, LlmUsageMetric, McpToolMetric, ProxyMetrics, ProxyState, Readiness,
     };
 
     fn ready() -> Readiness {
@@ -483,6 +490,12 @@ mod tests {
             mcp_tools: vec![],
             a2a_methods: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_metrics_endpoint_returns_not_found() {
+        let ui = UiServer::new(ProxyState::new(), "127.0.0.1:8080".parse().unwrap(), false);
+        assert_eq!(metrics(State(ui)).await.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
