@@ -398,6 +398,20 @@ impl ConfigSnapshot {
         }
     }
 
+    /// A diagnostic configuration view that preserves resource topology while
+    /// removing TLS material. xDS/SDS delivers a workload private key into this
+    /// snapshot, so returning [`Self::to_runtime_config`] from an unauthenticated
+    /// debug endpoint would disclose credentials.
+    pub fn to_redacted_runtime_config(&self) -> RuntimeConfig {
+        let mut config = self.to_runtime_config();
+        for secret in &mut config.secrets {
+            secret.certificate_chain_pem.clear();
+            secret.private_key_pem.clear();
+            secret.trusted_ca_pem = None;
+        }
+        config
+    }
+
     /// Flattened `(listener, virtual host, domains, route)` view for the admin
     /// API. Not on the request path.
     pub fn route_table(&self) -> Vec<RouteTableEntry<'_>> {

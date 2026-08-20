@@ -373,7 +373,7 @@ fn prometheus_label_value(value: &str) -> String {
 }
 
 async fn debug_config(State(ui): State<UiServer>) -> Json<dxgate_core::RuntimeConfig> {
-    Json(ui.state.snapshot().to_runtime_config())
+    Json(ui.state.snapshot().to_redacted_runtime_config())
 }
 
 async fn debug_routes(State(ui): State<UiServer>) -> Json<serde_json::Value> {

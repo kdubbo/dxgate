@@ -843,4 +843,31 @@ mod tests {
         assert!(delta.removes.is_empty());
         assert_eq!(delta.listeners.len(), 1);
     }
+
+    #[test]
+    fn diagnostic_config_redacts_sds_private_material() {
+        let store = ConfigStore::new();
+        store.apply(
+            SourceId::Xds,
+            ConfigDelta::default().with_secrets(vec![TlsSecret {
+                name: "default".into(),
+                certificate_chain_pem: "certificate".into(),
+                private_key_pem: "private-key".into(),
+                trusted_ca_pem: Some("root-ca".into()),
+            }]),
+        );
+
+        let snapshot = store.snapshot();
+        let diagnostic = snapshot.to_redacted_runtime_config();
+        assert_eq!(diagnostic.secrets.len(), 1);
+        assert_eq!(diagnostic.secrets[0].name, "default");
+        assert!(diagnostic.secrets[0].certificate_chain_pem.is_empty());
+        assert!(diagnostic.secrets[0].private_key_pem.is_empty());
+        assert_eq!(diagnostic.secrets[0].trusted_ca_pem, None);
+        // Redacting the debug clone never changes the active mTLS snapshot.
+        assert_eq!(
+            snapshot.secret("default").unwrap().private_key_pem,
+            "private-key"
+        );
+    }
 }

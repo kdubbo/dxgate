@@ -540,7 +540,10 @@ async fn forward_http(
         (UpstreamRequestMode::SimpleTls, false) => server.clients.request_web(req).await,
         (UpstreamRequestMode::DubboMutual, h2) => {
             let tls = tls.expect("dubbo mutual request mode requires TLS config");
-            server.clients.request_mtls(&cluster, tls, req, h2).await
+            server
+                .clients
+                .request_mtls(&cluster, tls, &snapshot, req, h2)
+                .await
         }
     };
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1445,9 +1448,13 @@ fn current_trace_ids() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::access_log::AccessLogFormat;
-    use super::upstream::{mtls_cache_key, GrpcBootstrap, MtlsClientPool};
+    use super::upstream::{
+        mtls_cache_key, peer_identities, DynamicMtlsClientPool, GrpcBootstrap, MtlsClientPool,
+    };
     use super::*;
-    use dxgate_core::{UpstreamTls, UpstreamTlsMode};
+    use dxgate_core::{
+        ConfigDelta, ConfigStore, SourceId, TlsSecret, UpstreamTls, UpstreamTlsMode,
+    };
     use hyper::body;
     use rcgen::{
         BasicConstraints, Certificate as RcgenCertificate, CertificateParams, DistinguishedName,
@@ -1619,6 +1626,8 @@ mod tests {
                     sni: Some("nginx.app.svc.cluster.local".into()),
                     certificate_provider: None,
                     validation_provider: None,
+                    certificate_secret: None,
+                    validation_secret: None,
                     alpn_protocols: vec!["h2".into()],
                     subject_alt_names: vec![],
                 },
@@ -1644,6 +1653,8 @@ mod tests {
             sni: Some("nginx.app.svc.cluster.local".into()),
             certificate_provider: Some("workload".into()),
             validation_provider: Some("roots".into()),
+            certificate_secret: None,
+            validation_secret: None,
             alpn_protocols: vec!["h2".into(), "http/1.1".into()],
             subject_alt_names: vec!["spiffe://cluster.local/ns/app/sa/nginx".into()],
         };
@@ -1661,6 +1672,8 @@ mod tests {
             sni: Some("httpbin.org".into()),
             certificate_provider: None,
             validation_provider: None,
+            certificate_secret: None,
+            validation_secret: None,
             alpn_protocols: vec![],
             subject_alt_names: vec![],
         };
@@ -1669,6 +1682,8 @@ mod tests {
             sni: Some("nginx.app.svc.cluster.local".into()),
             certificate_provider: None,
             validation_provider: None,
+            certificate_secret: None,
+            validation_secret: None,
             alpn_protocols: vec![],
             subject_alt_names: vec![],
         };
@@ -1849,15 +1864,118 @@ mod tests {
         addr
     }
 
+    async fn spawn_tls_server_capturing_client(
+        ca: &RcgenCertificate,
+        cert: &RcgenCertificate,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(ca, cert)));
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let peer = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .unwrap()
+                .first()
+                .unwrap()
+                .0
+                .clone();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 256];
+                let count = stream.read(&mut buf).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            peer
+        });
+        (addr, task)
+    }
+
+    fn sds_delta(version: &str, ca: &RcgenCertificate, client: &RcgenCertificate) -> ConfigDelta {
+        ConfigDelta::default()
+            .with_version(version)
+            .with_secrets(vec![
+                TlsSecret {
+                    name: "default".into(),
+                    certificate_chain_pem: client.serialize_pem_with_signer(ca).unwrap(),
+                    private_key_pem: client.serialize_private_key_pem(),
+                    trusted_ca_pem: None,
+                },
+                TlsSecret {
+                    name: "ROOTCA".into(),
+                    certificate_chain_pem: String::new(),
+                    private_key_pem: String::new(),
+                    trusted_ca_pem: Some(ca.serialize_pem().unwrap()),
+                },
+            ])
+    }
+
     fn spiffe_tls(subject_alt_names: Vec<String>) -> UpstreamTls {
         UpstreamTls {
             mode: UpstreamTlsMode::DubboMutual,
             sni: Some("nginx.app.svc.cluster.local".into()),
             certificate_provider: None,
             validation_provider: None,
+            certificate_secret: None,
+            validation_secret: None,
             alpn_protocols: vec![],
             subject_alt_names,
         }
+    }
+
+    #[tokio::test]
+    async fn dynamic_sds_mtls_rotates_the_client_certificate() {
+        let ca = test_ca();
+        let first_client = spiffe_cert("spiffe://cluster.local/ns/default/sa/dxgate-one");
+        let second_client = spiffe_cert("spiffe://cluster.local/ns/default/sa/dxgate-two");
+        let upstream = signed_cert("nginx.app.svc.cluster.local");
+        let store = ConfigStore::new();
+        let mut pool = DynamicMtlsClientPool::default();
+        let mut tls = spiffe_tls(vec![]);
+        tls.certificate_secret = Some("default".into());
+        tls.validation_secret = Some("ROOTCA".into());
+
+        store.apply(SourceId::Xds, sds_delta("sds-1", &ca, &first_client));
+        let first_snapshot = store.snapshot();
+        let first = pool.client_for(&first_snapshot, &tls, false).unwrap();
+        let (first_addr, first_peer) = spawn_tls_server_capturing_client(&ca, &upstream).await;
+        let first_response = first
+            .get(format!("https://{first_addr}/").parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(
+            peer_identities(&first_peer.await.unwrap()).unwrap(),
+            ["spiffe://cluster.local/ns/default/sa/dxgate-one"]
+        );
+
+        store.apply(SourceId::Xds, sds_delta("sds-2", &ca, &second_client));
+        let second_snapshot = store.snapshot();
+        assert!(second_snapshot.revision() > first_snapshot.revision());
+        let second = pool.client_for(&second_snapshot, &tls, false).unwrap();
+        let (second_addr, second_peer) = spawn_tls_server_capturing_client(&ca, &upstream).await;
+        let second_response = second
+            .get(format!("https://{second_addr}/").parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(
+            peer_identities(&second_peer.await.unwrap()).unwrap(),
+            ["spiffe://cluster.local/ns/default/sa/dxgate-two"]
+        );
     }
 
     #[tokio::test]

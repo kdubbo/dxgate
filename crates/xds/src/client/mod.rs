@@ -16,13 +16,14 @@
 mod state;
 
 use crate::proto::core::v1 as xds_core;
+use crate::proto::google::rpc::Status as RpcStatus;
 use crate::proto::service::discovery::v1::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::proto::service::discovery::v1::{
     DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest,
 };
 use dxgate_core::{ConfigStore, RouterIdentity, SourceId};
 use prost_types::{value::Kind, Struct, Value};
-use state::{AdsState, LISTENER_TYPE};
+use state::{AdsState, LISTENER_TYPE, SECRET_TYPE};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +66,12 @@ pub enum XdsError {
         type_url: String,
         source: prost::DecodeError,
     },
+
+    /// A Secret response is NACKed before it reaches the config store. Keep the
+    /// reason structural only: certificate bytes and private-key material must
+    /// never be copied into a control-plane error or log line.
+    #[error("invalid TLS secret {name}: {reason}")]
+    InvalidSecret { name: String, reason: String },
 
     /// The control plane does not implement `DeltaAggregatedResources`. Handled
     /// internally by falling back to state-of-the-world ADS.
@@ -151,6 +158,15 @@ impl XdsClient {
         let mut stream_state = DeltaStream::new(request_tx, node);
 
         let listeners = state.begin_stream(self.cfg.listener_names.clone());
+        let secrets = state.subscription(SECRET_TYPE);
+        stream_state
+            .subscribe(
+                SECRET_TYPE,
+                secrets,
+                Vec::new(),
+                state.initial_resource_versions(SECRET_TYPE),
+            )
+            .await?;
         stream_state
             .subscribe(
                 LISTENER_TYPE,
@@ -217,7 +233,21 @@ impl XdsClient {
             removes = resp.removed_resources.len(),
             "received delta ADS response"
         );
-        state.apply_delta(&resp.type_url, &resources, &resp.removed_resources)?;
+        if let Err(err) = state.apply_delta(&resp.type_url, &resources, &resp.removed_resources) {
+            // State only mutates after every resource in the response decoded
+            // and validated. A NACK therefore leaves the last accepted TLS
+            // material live while telling dubbod exactly which update failed.
+            warn!(type_url = %resp.type_url, %err, "NACKing invalid xDS resource response");
+            stream_state
+                .nack(&resp.type_url, &resp.nonce, err.to_string())
+                .await?;
+            return Ok(());
+        }
+
+        // Make the immutable store snapshot visible before ACKing. A secret
+        // rotation is acknowledged only after every new request can acquire
+        // the fully validated replacement material atomically.
+        publish(store, state, &resp.system_version_info);
 
         // ACK: the nonce alone, no subscription change and no version replay.
         stream_state.ack(&resp.type_url, &resp.nonce).await?;
@@ -233,8 +263,6 @@ impl XdsClient {
                 )
                 .await?;
         }
-
-        publish(store, state, &resp.system_version_info);
         Ok(())
     }
 
@@ -247,6 +275,15 @@ impl XdsClient {
 
         let listeners = state.begin_stream(self.cfg.listener_names.clone());
         send_discovery_request(&request_tx, &node, LISTENER_TYPE, listeners, "", "").await?;
+        send_discovery_request(
+            &request_tx,
+            &node,
+            SECRET_TYPE,
+            state.subscription(SECRET_TYPE),
+            "",
+            "",
+        )
+        .await?;
         for change in state.refresh_subscriptions() {
             send_discovery_request(&request_tx, &node, change.type_url, change.desired, "", "")
                 .await?;
@@ -270,7 +307,25 @@ impl XdsClient {
             .await
             .map_err(|status| XdsError::StreamReceive(Box::new(status)))?
         {
-            state.apply_sotw(&resp)?;
+            if let Err(err) = state.apply_sotw(&resp) {
+                let last_accepted = state.accepted_sotw_version(&resp.type_url).to_string();
+                warn!(type_url = %resp.type_url, %err, "NACKing invalid xDS resource response");
+                send_discovery_request_with_error(
+                    &request_tx,
+                    &node,
+                    &resp.type_url,
+                    state.subscription(&resp.type_url),
+                    &last_accepted,
+                    &resp.nonce,
+                    err.to_string(),
+                )
+                .await?;
+                continue;
+            }
+
+            // Synchronously publish before the corresponding ACK. This keeps
+            // a rejected certificate rotation from becoming externally visible.
+            publish(store, state, &resp.version_info);
             send_discovery_request(
                 &request_tx,
                 &node,
@@ -285,8 +340,6 @@ impl XdsClient {
                 send_discovery_request(&request_tx, &node, change.type_url, change.desired, "", "")
                     .await?;
             }
-
-            publish(store, state, &resp.version_info);
         }
 
         Ok(())
@@ -399,6 +452,23 @@ impl DeltaStream {
         .await
     }
 
+    async fn nack(&mut self, type_url: &str, nonce: &str, message: String) -> Result<(), XdsError> {
+        self.send(DeltaDiscoveryRequest {
+            node: Some(self.node.clone()),
+            type_url: type_url.to_string(),
+            resource_names_subscribe: Vec::new(),
+            resource_names_unsubscribe: Vec::new(),
+            initial_resource_versions: HashMap::new(),
+            response_nonce: nonce.to_string(),
+            error_detail: Some(RpcStatus {
+                code: Code::InvalidArgument as i32,
+                message,
+                details: Vec::new(),
+            }),
+        })
+        .await
+    }
+
     async fn send(&self, request: DeltaDiscoveryRequest) -> Result<(), XdsError> {
         self.request_tx
             .send(request)
@@ -425,6 +495,27 @@ async fn send_discovery_request(
     version_info: &str,
     response_nonce: &str,
 ) -> Result<(), XdsError> {
+    send_discovery_request_with_error(
+        request_tx,
+        node,
+        type_url,
+        resource_names,
+        version_info,
+        response_nonce,
+        String::new(),
+    )
+    .await
+}
+
+async fn send_discovery_request_with_error(
+    request_tx: &mpsc::Sender<DiscoveryRequest>,
+    node: &xds_core::Node,
+    type_url: &str,
+    resource_names: Vec<String>,
+    version_info: &str,
+    response_nonce: &str,
+    error_message: String,
+) -> Result<(), XdsError> {
     request_tx
         .send(DiscoveryRequest {
             version_info: version_info.to_string(),
@@ -432,7 +523,11 @@ async fn send_discovery_request(
             resource_names,
             type_url: type_url.to_string(),
             response_nonce: response_nonce.to_string(),
-            error_detail: None,
+            error_detail: (!error_message.is_empty()).then_some(RpcStatus {
+                code: Code::InvalidArgument as i32,
+                message: error_message,
+                details: Vec::new(),
+            }),
         })
         .await
         .map_err(|_| XdsError::RequestChannelClosed)
@@ -505,5 +600,51 @@ mod tests {
         assert_eq!(ack.response_nonce, "nonce-7");
         assert!(ack.resource_names_subscribe.is_empty());
         assert!(ack.resource_names_unsubscribe.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nacks_carry_the_nonce_and_invalid_argument_detail() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stream = DeltaStream::new(tx, xds_core::Node::default());
+
+        stream
+            .nack(SECRET_TYPE, "nonce-8", "invalid PEM".into())
+            .await
+            .unwrap();
+
+        let nack = rx.recv().await.unwrap();
+        assert_eq!(nack.type_url, SECRET_TYPE);
+        assert_eq!(nack.response_nonce, "nonce-8");
+        let error = nack.error_detail.unwrap();
+        assert_eq!(error.code, Code::InvalidArgument as i32);
+        assert_eq!(error.message, "invalid PEM");
+    }
+
+    #[tokio::test]
+    async fn sotw_nack_retains_last_version_and_sets_error_detail() {
+        let (tx, mut rx) = mpsc::channel(4);
+        send_discovery_request_with_error(
+            &tx,
+            &xds_core::Node::default(),
+            SECRET_TYPE,
+            vec!["default".into(), "ROOTCA".into()],
+            "sds-1",
+            "nonce-9",
+            "invalid TLS Secret".into(),
+        )
+        .await
+        .unwrap();
+
+        let nack = rx.recv().await.unwrap();
+        assert_eq!(nack.version_info, "sds-1");
+        assert_eq!(nack.response_nonce, "nonce-9");
+        assert_eq!(
+            nack.resource_names,
+            ["default".to_string(), "ROOTCA".to_string()]
+        );
+        assert_eq!(
+            nack.error_detail.unwrap().code,
+            Code::InvalidArgument as i32
+        );
     }
 }

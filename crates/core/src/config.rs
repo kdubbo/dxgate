@@ -505,6 +505,19 @@ pub struct UpstreamTls {
     pub certificate_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_provider: Option<String>,
+    /// The SDS resource containing this gateway's client certificate and key.
+    ///
+    /// The provider identifies the certificate-provider implementation; the
+    /// certificate name identifies the concrete dynamic material that it
+    /// supplies. Keeping those two xDS concepts distinct lets file-watcher
+    /// bootstraps remain compatible while an ADS-delivered Secret takes
+    /// precedence when it is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_secret: Option<String>,
+    /// The SDS resource containing the trust bundle used to validate the
+    /// upstream peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn_protocols: Vec<String>,
     // Peer identities accepted from the upstream certificate (typically SPIFFE URIs
@@ -549,8 +562,16 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsSecret {
     pub name: String,
+    /// Empty for a validation-context-only SDS Secret.
+    #[serde(default)]
     pub certificate_chain_pem: String,
+    /// Empty for a validation-context-only SDS Secret.
+    #[serde(default)]
     pub private_key_pem: String,
+    /// PEM trust bundle from an SDS CertificateValidationContext. This remains
+    /// separate from the workload certificate: the two rotate independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

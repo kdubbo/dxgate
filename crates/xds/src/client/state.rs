@@ -28,17 +28,26 @@ use dxgate_core::{
     Endpoint as RuntimeEndpoint, HeaderMatch, HeaderTransform, HeaderValue, JwtHeader, JwtProvider,
     Listener, ListenerProtocol, ListenerSecurity, OutlierDetectionConfig, PathMatch, Policy,
     PolicyAction, Provider, ProviderKind, RateLimitKey, RateLimitPolicy, RetryPolicy, Route,
-    RouteMatch, SecretKeyReference, SourceState, TokenLimitPolicy, UpstreamTls, UpstreamTlsMode,
-    VirtualHost, WeightedBackend, WeightedCluster,
+    RouteMatch, SecretKeyReference, SourceState, TlsSecret, TokenLimitPolicy, UpstreamTls,
+    UpstreamTlsMode, VirtualHost, WeightedBackend, WeightedCluster,
 };
 use prost::Message;
+use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub(super) const CLUSTER_TYPE: &str = "type.googleapis.com/cluster.v1.Cluster";
 pub(super) const ENDPOINT_TYPE: &str = "type.googleapis.com/endpoint.v1.ClusterLoadAssignment";
 pub(super) const LISTENER_TYPE: &str = "type.googleapis.com/listener.v1.Listener";
 pub(super) const ROUTE_TYPE: &str = "type.googleapis.com/route.v1.RouteConfiguration";
+pub(super) const SECRET_TYPE: &str =
+    "type.googleapis.com/extensions.transport_sockets.tls.v1.Secret";
+
+/// These names are part of the mesh TLS contract emitted by dubbod's common
+/// TLS context. A gateway only receives the two resources it is authorized to
+/// read; it does not wildcard-subscribe to every Secret in the mesh.
+const SDS_SECRET_NAMES: [&str; 2] = ["default", "ROOTCA"];
 
 /// A change to what the client is subscribed to for one resource type.
 ///
@@ -66,10 +75,15 @@ pub(super) struct AdsState {
     routes: Collection<String, RouteSnapshot>,
     clusters: Collection<String, ClusterSnapshot>,
     endpoints: Collection<String, Vec<RuntimeEndpoint>>,
+    secrets: Collection<String, TlsSecret>,
     /// Per-type resource versions, replayed as a delta stream's
     /// `initial_resource_versions` after a reconnect so the control plane only
     /// resends what actually changed while the stream was down.
     versions: BTreeMap<String, BTreeMap<String, String>>,
+    /// The last known-good SotW version by resource type. On a NACK it is sent
+    /// back rather than the rejected response version, which is the xDS signal
+    /// that this client deliberately retained its prior material.
+    sotw_versions: BTreeMap<String, String>,
     /// Derived resource keys last published to the store, so removals can be
     /// computed even though a projection cannot say what it stopped producing.
     published: SourceState,
@@ -97,6 +111,13 @@ impl AdsState {
             .collect();
         let desired = names.iter().cloned().collect();
         self.subscriptions.insert(LISTENER_TYPE.to_string(), names);
+        self.subscriptions.insert(
+            SECRET_TYPE.to_string(),
+            SDS_SECRET_NAMES
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
         desired
     }
 
@@ -110,6 +131,16 @@ impl AdsState {
     /// Versions to replay on reconnect for one resource type.
     pub(super) fn initial_resource_versions(&self, type_url: &str) -> BTreeMap<String, String> {
         self.versions.get(type_url).cloned().unwrap_or_default()
+    }
+
+    /// Last version that was completely decoded and atomically published for a
+    /// SotW resource type. Used to NACK invalid certificate rotations without
+    /// accepting them into the cache.
+    pub(super) fn accepted_sotw_version(&self, type_url: &str) -> &str {
+        self.sotw_versions
+            .get(type_url)
+            .map(String::as_str)
+            .unwrap_or_default()
     }
 
     /// Applies a state-of-the-world response: the payload is the complete set
@@ -138,8 +169,17 @@ impl AdsState {
                 let received = decode_endpoints(&resp.resources)?;
                 replace_within_subscription(&mut self.endpoints, received, &requested);
             }
+            SECRET_TYPE => {
+                // Decode and validate the full response before replacing the
+                // cache. A malformed rotation must leave the last good cert
+                // and trust bundle intact for every in-flight and new request.
+                let received = decode_secrets(&resp.resources)?;
+                replace_within_subscription(&mut self.secrets, received, &requested);
+            }
             _ => {}
         }
+        self.sotw_versions
+            .insert(resp.type_url.clone(), resp.version_info.clone());
         Ok(())
     }
 
@@ -173,6 +213,14 @@ impl AdsState {
             ENDPOINT_TYPE => {
                 upsert_each(&mut self.endpoints, decode_endpoints(&payload)?);
                 remove_each(&mut self.endpoints, removed);
+            }
+            SECRET_TYPE => {
+                // `decode_secrets` validates every resource before any cache
+                // mutation, so a Delta response containing a bad replacement
+                // cannot partially publish a certificate rotation.
+                let decoded = decode_delta_secrets(resources)?;
+                upsert_each(&mut self.secrets, decoded);
+                remove_each(&mut self.secrets, removed);
             }
             _ => return Ok(()),
         }
@@ -285,6 +333,7 @@ impl AdsState {
             .with_version(if version.is_empty() { "ads" } else { version })
             .with_listeners(listeners)
             .with_clusters(clusters)
+            .with_secrets(self.secrets.values().cloned().collect())
             .with_providers(providers.into_values().collect())
             .with_backends(backends.into_values().collect())
             .with_agent_routes(agent_routes.into_values().collect())
@@ -415,6 +464,200 @@ fn decode_endpoints(
         ));
     }
     Ok(decoded)
+}
+
+/// Decodes SDS resources into the runtime's immutable configuration snapshot.
+///
+/// Dubbod emits PEM as `inline_bytes`. Accepting inline strings too keeps this
+/// client compatible with a standards-compliant xDS server, while rejecting
+/// filenames prevents the control plane from making a gateway read arbitrary
+/// local paths. Every certificate/key/trust bundle is parsed before it can
+/// replace an existing cache entry.
+fn decode_secrets(resources: &[prost_types::Any]) -> Result<Vec<(String, TlsSecret)>, XdsError> {
+    resources
+        .iter()
+        .map(|resource| {
+            let secret = decode_resource::<xds_tls::Secret>(SECRET_TYPE, resource)?;
+            secret_snapshot(secret)
+        })
+        .collect()
+}
+
+fn decode_delta_secrets(
+    resources: &[(String, String, prost_types::Any)],
+) -> Result<Vec<(String, TlsSecret)>, XdsError> {
+    resources
+        .iter()
+        .map(|(resource_name, _, resource)| {
+            let secret = decode_resource::<xds_tls::Secret>(SECRET_TYPE, resource)?;
+            let (secret_name, secret) = secret_snapshot(secret)?;
+            if resource_name != &secret_name {
+                return Err(invalid_secret(
+                    secret_name,
+                    "Delta resource name does not match the embedded Secret name",
+                ));
+            }
+            Ok((secret.name.clone(), secret))
+        })
+        .collect()
+}
+
+fn secret_snapshot(secret: xds_tls::Secret) -> Result<(String, TlsSecret), XdsError> {
+    let name = non_empty_secret_name(&secret.name)?;
+    let value = match secret.r#type {
+        Some(xds_tls::secret::Type::TlsCertificate(certificate)) => {
+            let certificate_chain_pem =
+                secret_pem(&name, "certificate_chain", certificate.certificate_chain)?;
+            let private_key_pem = secret_pem(&name, "private_key", certificate.private_key)?;
+            validate_client_certificate(&name, &certificate_chain_pem, &private_key_pem)?;
+            TlsSecret {
+                name: name.clone(),
+                certificate_chain_pem,
+                private_key_pem,
+                trusted_ca_pem: None,
+            }
+        }
+        Some(xds_tls::secret::Type::ValidationContext(context)) => {
+            let trusted_ca_pem = secret_pem(&name, "trusted_ca", context.trusted_ca)?;
+            validate_trust_bundle(&name, &trusted_ca_pem)?;
+            TlsSecret {
+                name: name.clone(),
+                certificate_chain_pem: String::new(),
+                private_key_pem: String::new(),
+                trusted_ca_pem: Some(trusted_ca_pem),
+            }
+        }
+        None => {
+            return Err(invalid_secret(
+                name,
+                "neither TLS certificate nor validation context is set",
+            ));
+        }
+    };
+    Ok((value.name.clone(), value))
+}
+
+fn non_empty_secret_name(name: &str) -> Result<String, XdsError> {
+    if name.trim().is_empty() {
+        return Err(invalid_secret("<unnamed>", "resource name is empty"));
+    }
+    Ok(name.to_string())
+}
+
+fn secret_pem(
+    name: &str,
+    field: &str,
+    source: Option<xds_core::DataSource>,
+) -> Result<String, XdsError> {
+    let Some(source) = source else {
+        return Err(invalid_secret(name, format!("{field} is missing")));
+    };
+    let bytes = match source.specifier {
+        Some(xds_core::data_source::Specifier::InlineBytes(value)) => value,
+        Some(xds_core::data_source::Specifier::InlineString(value)) => value.into_bytes(),
+        Some(xds_core::data_source::Specifier::Filename(_)) => {
+            return Err(invalid_secret(
+                name,
+                format!("{field} must be inline; file references are not permitted"),
+            ));
+        }
+        None => return Err(invalid_secret(name, format!("{field} has no data"))),
+    };
+    String::from_utf8(bytes).map_err(|_| invalid_secret(name, format!("{field} is not PEM UTF-8")))
+}
+
+fn validate_client_certificate(
+    name: &str,
+    certificate_chain_pem: &str,
+    private_key_pem: &str,
+) -> Result<(), XdsError> {
+    let certs = pem_certificates(name, "certificate_chain", certificate_chain_pem)?;
+    let key = pem_private_key(name, private_key_pem)?;
+    // rustls verifies that the public key in the certificate matches this
+    // private key. A deliberately empty root store is enough for that local
+    // cryptographic check; peer-chain validation is performed after the ROOTCA
+    // Secret is paired at connection setup.
+    ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(RootCertStore::empty())
+        .with_client_auth_cert(certs, key)
+        .map(|_| ())
+        .map_err(|error| {
+            invalid_secret(
+                name,
+                format!("certificate and private key do not form a valid pair: {error}"),
+            )
+        })
+}
+
+fn validate_trust_bundle(name: &str, trusted_ca_pem: &str) -> Result<(), XdsError> {
+    let certs = pem_certificates(name, "trusted_ca", trusted_ca_pem)?;
+    let mut roots = RootCertStore::empty();
+    for certificate in certs {
+        roots.add(&certificate).map_err(|error| {
+            invalid_secret(
+                name,
+                format!("trusted_ca is not a valid CA certificate: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn pem_certificates(name: &str, field: &str, pem: &str) -> Result<Vec<Certificate>, XdsError> {
+    let mut reader = Cursor::new(pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .map_err(|error| invalid_secret(name, format!("{field} PEM could not be parsed: {error}")))?
+        .into_iter()
+        .map(Certificate)
+        .collect::<Vec<_>>();
+    if certs.is_empty() {
+        return Err(invalid_secret(
+            name,
+            format!("{field} contains no certificates"),
+        ));
+    }
+    Ok(certs)
+}
+
+fn pem_private_key(name: &str, pem: &str) -> Result<PrivateKey, XdsError> {
+    let mut pkcs8_reader = Cursor::new(pem.as_bytes());
+    if let Some(key) = rustls_pemfile::pkcs8_private_keys(&mut pkcs8_reader)
+        .map_err(|error| {
+            invalid_secret(
+                name,
+                format!("private_key PEM could not be parsed: {error}"),
+            )
+        })?
+        .into_iter()
+        .next()
+    {
+        return Ok(PrivateKey(key));
+    }
+    let mut rsa_reader = Cursor::new(pem.as_bytes());
+    if let Some(key) = rustls_pemfile::rsa_private_keys(&mut rsa_reader)
+        .map_err(|error| {
+            invalid_secret(
+                name,
+                format!("private_key PEM could not be parsed: {error}"),
+            )
+        })?
+        .into_iter()
+        .next()
+    {
+        return Ok(PrivateKey(key));
+    }
+    Err(invalid_secret(
+        name,
+        "private_key contains no PKCS8 or RSA private key",
+    ))
+}
+
+fn invalid_secret(name: impl Into<String>, reason: impl Into<String>) -> XdsError {
+    XdsError::InvalidSecret {
+        name: name.into(),
+        reason: reason.into(),
+    }
 }
 
 fn upsert_each<V: PartialEq>(collection: &mut Collection<String, V>, decoded: Vec<(String, V)>) {
@@ -725,6 +968,8 @@ fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamT
     let common = tls.common_tls_context.as_ref();
     let certificate_provider = common.and_then(certificate_provider_name);
     let validation_provider = common.and_then(validation_provider_name);
+    let certificate_secret = common.and_then(certificate_secret_name);
+    let validation_secret = common.and_then(validation_secret_name);
     let mode = if certificate_provider.is_some() {
         UpstreamTlsMode::DubboMutual
     } else {
@@ -735,6 +980,8 @@ fn upstream_tls_from_cluster(cluster: &xds_cluster::Cluster) -> Option<UpstreamT
         sni: first_non_empty(tls.sni, cluster_authority(&cluster.name)),
         certificate_provider,
         validation_provider,
+        certificate_secret,
+        validation_secret,
         alpn_protocols: common
             .map(|common| common.alpn_protocols.clone())
             .unwrap_or_default(),
@@ -810,6 +1057,25 @@ fn validation_provider_name(common: &xds_tls::CommonTlsContext) -> Option<String
         .and_then(instance_name)
 }
 
+fn certificate_secret_name(common: &xds_tls::CommonTlsContext) -> Option<String> {
+    common
+        .tls_certificate_certificate_provider_instance
+        .as_ref()
+        .and_then(certificate_name)
+}
+
+fn validation_secret_name(common: &xds_tls::CommonTlsContext) -> Option<String> {
+    let combined = match common.validation_context_type.as_ref()? {
+        xds_tls::common_tls_context::ValidationContextType::CombinedValidationContext(combined) => {
+            combined
+        }
+    };
+    combined
+        .validation_context_certificate_provider_instance
+        .as_ref()
+        .and_then(certificate_name)
+}
+
 fn instance_name(
     instance: &xds_tls::common_tls_context::CertificateProviderInstance,
 ) -> Option<String> {
@@ -817,6 +1083,16 @@ fn instance_name(
         None
     } else {
         Some(instance.instance_name.clone())
+    }
+}
+
+fn certificate_name(
+    instance: &xds_tls::common_tls_context::CertificateProviderInstance,
+) -> Option<String> {
+    if instance.certificate_name.is_empty() {
+        None
+    } else {
+        Some(instance.certificate_name.clone())
     }
 }
 
@@ -1169,6 +1445,7 @@ mod tests {
     use crate::proto::core::v1::{address, socket_address, Address, SocketAddress};
     use dxgate_core::{ResourceKey, ResourceKind, RouterIdentity};
     use prost_types::Any;
+    use rcgen::{BasicConstraints, Certificate as RcgenCertificate, CertificateParams, IsCa};
     use std::collections::HashMap;
 
     #[test]
@@ -1334,6 +1611,8 @@ mod tests {
         assert_eq!(tls.mode, UpstreamTlsMode::DubboMutual);
         assert_eq!(tls.certificate_provider.as_deref(), Some("workload"));
         assert_eq!(tls.validation_provider.as_deref(), Some("roots"));
+        assert_eq!(tls.certificate_secret.as_deref(), Some("default"));
+        assert_eq!(tls.validation_secret.as_deref(), Some("ROOTCA"));
         assert_eq!(tls.alpn_protocols, ["h2"]);
 
         // Everything the projection produced is now attributed to this source,
@@ -1864,6 +2143,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ads_state_subscribes_only_to_gateway_sds_resources() {
+        let mut state = AdsState::default();
+        state.begin_stream(vec![]);
+
+        assert_eq!(
+            state.subscription(SECRET_TYPE),
+            ["ROOTCA".to_string(), "default".to_string()]
+        );
+    }
+
+    #[test]
+    fn invalid_delta_sds_rotation_keeps_last_good_material_and_version() {
+        let (certificate, root) = valid_sds_secrets();
+        let mut state = AdsState::default();
+        state.begin_stream(vec![]);
+        state
+            .apply_delta(
+                SECRET_TYPE,
+                &[
+                    ("default".into(), "1".into(), certificate),
+                    ("ROOTCA".into(), "1".into(), root),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        let before = state.config_delta("sds-1");
+        let certificate = before
+            .secrets
+            .iter()
+            .find(|secret| secret.name == "default")
+            .unwrap();
+        assert!(certificate
+            .certificate_chain_pem
+            .contains("BEGIN CERTIFICATE"));
+        assert!(state
+            .initial_resource_versions(SECRET_TYPE)
+            .contains_key("default"));
+
+        let rejected = any(
+            SECRET_TYPE,
+            xds_tls::Secret {
+                name: "default".into(),
+                r#type: Some(xds_tls::secret::Type::TlsCertificate(
+                    xds_tls::TlsCertificate {
+                        certificate_chain: Some(inline(b"not a certificate")),
+                        private_key: Some(inline(b"not a private key")),
+                    },
+                )),
+            },
+        );
+        assert!(matches!(
+            state.apply_delta(
+                SECRET_TYPE,
+                &[("default".into(), "2".into(), rejected)],
+                &[],
+            ),
+            Err(XdsError::InvalidSecret { .. })
+        ));
+
+        let after = state.config_delta("sds-2");
+        let certificate = after
+            .secrets
+            .iter()
+            .find(|secret| secret.name == "default")
+            .unwrap();
+        assert!(certificate
+            .certificate_chain_pem
+            .contains("BEGIN CERTIFICATE"));
+        assert_eq!(
+            state
+                .initial_resource_versions(SECRET_TYPE)
+                .get("default")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn invalid_sotw_sds_rotation_preserves_last_accepted_version() {
+        let (certificate, root) = valid_sds_secrets();
+        let mut state = AdsState::default();
+        state.begin_stream(vec![]);
+        state
+            .apply_sotw(&DiscoveryResponse {
+                version_info: "sds-1".into(),
+                resources: vec![certificate, root],
+                canary: false,
+                type_url: SECRET_TYPE.into(),
+                nonce: "nonce-1".into(),
+                control_plane: None,
+            })
+            .unwrap();
+        let _ = state.config_delta("sds-1");
+
+        let err = state
+            .apply_sotw(&DiscoveryResponse {
+                version_info: "sds-2".into(),
+                resources: vec![any(
+                    SECRET_TYPE,
+                    xds_tls::Secret {
+                        name: "ROOTCA".into(),
+                        r#type: Some(xds_tls::secret::Type::ValidationContext(
+                            xds_tls::CertificateValidationContext {
+                                match_subject_alt_names: vec![],
+                                trusted_ca: Some(inline(b"not a certificate")),
+                            },
+                        )),
+                    },
+                )],
+                canary: false,
+                type_url: SECRET_TYPE.into(),
+                nonce: "nonce-2".into(),
+                control_plane: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, XdsError::InvalidSecret { .. }));
+        assert_eq!(state.accepted_sotw_version(SECRET_TYPE), "sds-1");
+        let after = state.config_delta("sds-1");
+        assert_eq!(after.secrets.len(), 2);
+        assert!(after
+            .secrets
+            .iter()
+            .any(|secret| secret.name == "default" && !secret.private_key_pem.is_empty()));
+    }
+
     fn lb_endpoint(
         address: &str,
         port: u32,
@@ -1895,6 +2302,52 @@ mod tests {
         Any {
             type_url: type_url.into(),
             value: message.encode_to_vec(),
+        }
+    }
+
+    fn valid_sds_secrets() -> (Any, Any) {
+        let mut ca_params = CertificateParams::new(vec!["mesh.test".into()]);
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = RcgenCertificate::from_params(ca_params).unwrap();
+        let certificate =
+            RcgenCertificate::from_params(CertificateParams::new(vec!["dxgate.mesh.test".into()]))
+                .unwrap();
+        let certificate_pem = certificate.serialize_pem_with_signer(&ca).unwrap();
+        let private_key_pem = certificate.serialize_private_key_pem();
+        let root_pem = ca.serialize_pem().unwrap();
+        (
+            any(
+                SECRET_TYPE,
+                xds_tls::Secret {
+                    name: "default".into(),
+                    r#type: Some(xds_tls::secret::Type::TlsCertificate(
+                        xds_tls::TlsCertificate {
+                            certificate_chain: Some(inline(certificate_pem.as_bytes())),
+                            private_key: Some(inline(private_key_pem.as_bytes())),
+                        },
+                    )),
+                },
+            ),
+            any(
+                SECRET_TYPE,
+                xds_tls::Secret {
+                    name: "ROOTCA".into(),
+                    r#type: Some(xds_tls::secret::Type::ValidationContext(
+                        xds_tls::CertificateValidationContext {
+                            match_subject_alt_names: vec![],
+                            trusted_ca: Some(inline(root_pem.as_bytes())),
+                        },
+                    )),
+                },
+            ),
+        )
+    }
+
+    fn inline(value: &[u8]) -> xds_core::DataSource {
+        xds_core::DataSource {
+            specifier: Some(xds_core::data_source::Specifier::InlineBytes(
+                value.to_vec(),
+            )),
         }
     }
 
