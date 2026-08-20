@@ -32,6 +32,7 @@ mod context;
 mod detect;
 mod headers;
 mod llm_flow;
+mod otel_log;
 mod policy;
 mod routing;
 mod security;
@@ -46,6 +47,7 @@ use headers::{
     remove_connection_headers,
 };
 use llm_flow::{finalize_llm_response, prepare_llm_exchange, usage_sink};
+use otel_log::OtelAccessLogExporter;
 use policy::{evaluate_policies, PolicyDefault, PolicyRuntime};
 use routing::{
     backend_matches_protocol, backend_provider, compose_upstream_uri, endpoint_authority,
@@ -65,6 +67,7 @@ pub struct ProxyServer {
     policy_default: PolicyDefault,
     metrics_identity: MetricsIdentity,
     access_log: AccessLogConfig,
+    otel_access_log: Option<OtelAccessLogExporter>,
     max_body_bytes: usize,
     listener_port: u16,
     jwt_key_cache: JwtKeyCache,
@@ -72,15 +75,40 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     pub fn new(state: ProxyState) -> Self {
+        let access_log = AccessLogConfig::from_env();
+        for warning in access_log.warnings() {
+            warn!(%warning, "invalid access-log Telemetry setting");
+        }
+        let otel_access_log = match access_log.otlp_endpoint.as_deref() {
+            Some(endpoint) => match OtelAccessLogExporter::new(endpoint) {
+                Ok(exporter) => Some(exporter),
+                Err(err) => {
+                    warn!(%err, endpoint, "failed initializing OTLP access-log exporter");
+                    None
+                }
+            },
+            None => None,
+        };
         Self {
             state,
             clients: UpstreamClients::from_env(),
             policy_default: PolicyDefault::from_env(),
             metrics_identity: MetricsIdentity::from_env(),
-            access_log: AccessLogConfig::from_env(),
+            access_log,
+            otel_access_log,
             max_body_bytes: parse_max_body_bytes(env::var("DXGATE_MAX_BODY_BYTES").ok().as_deref()),
             listener_port: HTTP_LISTENER_PORT,
             jwt_key_cache: JwtKeyCache::default(),
+        }
+    }
+
+    /// Flushes the separate OTLP log signal after listener shutdown. The app's
+    /// tracing provider has its own shutdown path, so it must not own this.
+    pub async fn shutdown_access_logs(&self) {
+        if let Some(exporter) = self.otel_access_log.clone() {
+            if let Err(err) = tokio::task::spawn_blocking(move || exporter.shutdown()).await {
+                warn!(%err, "OTLP access-log exporter shutdown task failed");
+            }
         }
     }
 
@@ -242,7 +270,44 @@ async fn forward(
         for protocol in candidates {
             let context = AgentRequestContext::new(*protocol, &parts, &body_bytes);
             if let Some(route) = snapshot.agent_route_for(&context.input()).cloned() {
-                return forward_agent(server, snapshot, parts, body_bytes, context, route).await;
+                // Agent routes may retry or federate internally, but access logs
+                // represent the single request the client sent to the gateway.
+                let method = context.method.as_str().to_string();
+                let host = context.host.clone();
+                let path = context.path_and_query.clone();
+                let protocol = protocol_name(context.protocol);
+                let route_name = route.name.clone();
+                let started = Instant::now();
+                let result =
+                    forward_agent(server.clone(), snapshot, parts, body_bytes, context, route)
+                        .await;
+                let status_code = result
+                    .as_ref()
+                    .map(|response| response.status().as_u16())
+                    .unwrap_or_else(|(status, _)| status.as_u16());
+                let (trace_id, span_id) = current_trace_ids();
+                emit_access_log(
+                    &server,
+                    &AccessLogEvent {
+                        namespace: &server.metrics_identity.namespace,
+                        gateway: &server.metrics_identity.gateway,
+                        route: &route_name,
+                        cluster: "agent",
+                        protocol,
+                        // A route can deliberately select/federate multiple
+                        // backends. Avoid claiming an individual backend here.
+                        backend: "multiple",
+                        method: &method,
+                        host: &host,
+                        path: &path,
+                        status_code,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        upstream: "agent",
+                        trace_id: &trace_id,
+                        span_id: &span_id,
+                    },
+                );
+                return result;
             }
         }
         req = Request::from_parts(parts, Body::from(body_bytes));
@@ -1333,15 +1398,14 @@ fn backend_supports_llm_request(
 }
 
 fn emit_http_access_log(server: &ProxyServer, observation: &HttpObservation<'_>) {
-    if !server.access_log.enabled {
-        return;
-    }
     let (trace_id, span_id) = current_trace_ids();
     let event = AccessLogEvent {
         namespace: &server.metrics_identity.namespace,
         gateway: &server.metrics_identity.gateway,
         route: observation.route,
         cluster: observation.cluster,
+        protocol: "http",
+        backend: observation.cluster,
         method: observation.method,
         host: observation.host,
         path: observation.path,
@@ -1351,8 +1415,18 @@ fn emit_http_access_log(server: &ProxyServer, observation: &HttpObservation<'_>)
         trace_id: &trace_id,
         span_id: &span_id,
     };
-    let line = access_log_line(server.access_log.format, &event);
+    emit_access_log(server, &event);
+}
+
+fn emit_access_log(server: &ProxyServer, event: &AccessLogEvent<'_>) {
+    if !server.access_log.allows(event) {
+        return;
+    }
+    let line = access_log_line(server.access_log.format, event, &server.access_log.tags);
     info!(target: "dxgate.access", "{}", line);
+    if let Some(exporter) = &server.otel_access_log {
+        exporter.emit(event, &server.access_log.tags);
+    }
 }
 
 fn current_trace_ids() -> (String, String) {
@@ -1634,15 +1708,17 @@ mod tests {
 
     #[test]
     fn access_log_config_parses_defaults_and_overrides() {
-        let default = AccessLogConfig::from_values(None, None);
+        let default = AccessLogConfig::from_options(None, None, None, None, None, None);
         assert!(default.enabled);
         assert_eq!(default.format, AccessLogFormat::Text);
 
-        let disabled = AccessLogConfig::from_values(Some("false"), Some("json"));
+        let disabled =
+            AccessLogConfig::from_options(Some("false"), Some("json"), None, None, None, None);
         assert!(!disabled.enabled);
         assert_eq!(disabled.format, AccessLogFormat::Json);
 
-        let invalid_format = AccessLogConfig::from_values(Some("true"), Some("yaml"));
+        let invalid_format =
+            AccessLogConfig::from_options(Some("true"), Some("yaml"), None, None, None, None);
         assert!(invalid_format.enabled);
         assert_eq!(invalid_format.format, AccessLogFormat::Text);
     }
@@ -1654,6 +1730,8 @@ mod tests {
             gateway: "edge",
             route: "httpbin",
             cluster: "httpbin-v1",
+            protocol: "http",
+            backend: "httpbin-v1",
             method: "GET",
             host: "httpbin.example",
             path: "/status/502",
@@ -1664,12 +1742,13 @@ mod tests {
             span_id: "00f067aa0ba902b7",
         };
 
-        let text = access_log_line(AccessLogFormat::Text, &event);
+        let tags = std::collections::BTreeMap::new();
+        let text = access_log_line(AccessLogFormat::Text, &event, &tags);
         assert!(text.contains("route=httpbin"));
         assert!(text.contains("status_code=502"));
         assert!(text.contains("trace_id=4bf92f3577b34da6a3ce929d0e0e4736"));
 
-        let json = access_log_line(AccessLogFormat::Json, &event);
+        let json = access_log_line(AccessLogFormat::Json, &event, &tags);
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["namespace"], "default");
         assert_eq!(value["gateway"], "edge");

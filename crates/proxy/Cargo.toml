@@ -16,6 +16,8 @@ hyper.workspace = true
 hyper-rustls.workspace = true
 jsonwebtoken.workspace = true
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 x509-parser.workspace = true
@@ -34,3 +36,4 @@ tokio-rustls = "0.24"
 tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true
 tonic-health = "0.11"
+opentelemetry-proto = { version = "0.6", features = ["gen-tonic", "logs"] }

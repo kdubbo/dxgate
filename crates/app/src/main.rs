@@ -149,6 +149,7 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let proxy = ProxyServer::new(state.clone());
+    let access_log_proxy = proxy.clone();
     let ui = UiServer::new(state, args.http_addr, args.metrics_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut proxy_task = tokio::spawn(
@@ -177,6 +178,8 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    access_log_proxy.shutdown_access_logs().await;
 
     if otel_enabled {
         opentelemetry::global::shutdown_tracer_provider();
