@@ -618,7 +618,7 @@ mod tests {
         store.apply(
             SourceId::Xds,
             ConfigDelta::default()
-                .with_listeners(vec![listener("gateway", 15080, "payment")])
+                .with_listeners(vec![listener("gateway", 25080, "payment")])
                 .with_clusters(vec![cluster("payment")]),
         );
         let headers = [];
@@ -641,7 +641,7 @@ mod tests {
             SourceId::Xds,
             ConfigDelta::default()
                 .with_listeners(vec![
-                    listener("gateway-a", 15080, "payment"),
+                    listener("gateway-a", 25080, "payment"),
                     listener("gateway-b", 16080, "payment"),
                 ])
                 .with_clusters(vec![cluster("payment")]),
